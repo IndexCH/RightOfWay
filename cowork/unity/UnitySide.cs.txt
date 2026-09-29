@@ -1,0 +1,508 @@
+// 在 Unity 编辑器里运行的代码。通过现成的 Unity MCP（Unity AI Assistant 的 Unity_RunCommand）发进去，
+// Unity 和它的 MCP 都不用改。运行时（Python）每次调用时填入函数名、参数和 AI 的代码三处占位符。
+//
+// 面（face）完全来自 Unity 自己的序列化：一个对象的每个顶层序列化属性就是一个面
+// （Transform 的 m_LocalPosition、MeshRenderer 的 m_Materials、材质的 m_SavedProperties……）。
+// 指纹用 SerializedProperty.contentHash；按面恢复用 SerializedObject.CopyFromSerializedProperty。
+// 这里没有任何针对某种组件的代码。
+// 面的值（告诉 AI"原来是多少、现在是多少"）按 SerializedPropertyType 写成文字，同样不认识任何组件。
+// 注意：Unity_RunCommand 编译时只引用了很少的程序集，所以这里不用 HashSet、Stopwatch、MD5 这些类。
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+using System.Text;
+using UnityEngine;
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine.SceneManagement;
+
+internal class CommandScript : IRunCommand
+{
+    const string FN = "__FN__";
+    const string ARGS = @"__ARGS__";
+    const string MARKER = "__cowork_experiment_scene__";
+    static Scene TARGET;
+
+    public void Execute(ExecutionResult result)
+    {
+        object output;
+        try
+        {
+            var args = (Dictionary<string, object>)J.Parse(ARGS);
+            switch (FN)
+            {
+                case "setup": output = Setup(args); break;
+                case "poll": output = Poll(args); break;
+                case "exec": output = Exec(args, result); break;
+                case "run_agent": output = RunAgent(args, result); break;
+                default: throw new Exception("unknown fn " + FN);
+            }
+        }
+        catch (Exception e)
+        {
+            output = new Dictionary<string, object> { { "status", "error" }, { "error", e.ToString() } };
+        }
+        result.Log("{0}", "<<<COWORK_JSON>>>" + J.Write(output) + "<<<COWORK_END>>>");
+    }
+
+    // ---------------- AI 的代码（run_agent / exec 时填入）----------------
+    void AgentCode(ExecutionResult result)
+    {
+__AGENT__
+    }
+
+    // ---------------- 场景 ----------------
+    static Scene TargetScene(Dictionary<string, object> args)
+    {
+        string handle = Convert.ToString(args["scene_handle"], CultureInfo.InvariantCulture);   // Unity 6 起 handle 不一定是 int，统一按字符串比较
+        for (int i = 0; i < SceneManager.sceneCount; i++)
+        {
+            var s = SceneManager.GetSceneAt(i);
+            if (s.handle.ToString() == handle) return s;
+        }
+        throw new Exception("找不到实验场景（可能已被关闭），请重新运行实验");
+    }
+
+    static object Setup(Dictionary<string, object> args)
+    {
+        int closed = 0;
+        for (int i = SceneManager.sceneCount - 1; i >= 0; i--)
+        {
+            var s = SceneManager.GetSceneAt(i);
+            if (s.isLoaded && s.GetRootGameObjects().Any(g => g.name == MARKER) && SceneManager.sceneCount > 1)
+            {
+                EditorSceneManager.CloseScene(s, true);
+                closed++;
+            }
+        }
+        var ns = EditorSceneManager.NewScene(NewSceneSetup.EmptyScene, NewSceneMode.Additive);
+        var marker = new GameObject(MARKER);
+        marker.hideFlags = HideFlags.HideInHierarchy | HideFlags.DontSave;
+        SceneManager.MoveGameObjectToScene(marker, ns);
+        SceneManager.SetActiveScene(ns);
+        return new Dictionary<string, object> { { "scene_handle", ns.handle.ToString() }, { "closed", closed } };
+    }
+
+    static IEnumerable<GameObject> AllGameObjects(Scene s)
+    {
+        foreach (var root in s.GetRootGameObjects())
+        {
+            if (root.name == MARKER) continue;
+            foreach (var t in root.GetComponentsInChildren<Transform>(true)) yield return t.gameObject;
+        }
+    }
+
+    // 追踪的对象：场景里的每个 GameObject、它的每个组件，以及渲染器引用到的材质（Unity 自己的对象划分）
+    static List<UnityEngine.Object> Tracked(Scene s)
+    {
+        var list = new List<UnityEngine.Object>();
+        var mats = new List<Material>();
+        foreach (var go in AllGameObjects(s))
+        {
+            list.Add(go);
+            foreach (var c in go.GetComponents<Component>())
+            {
+                if (c == null) continue;
+                list.Add(c);
+                var r = c as Renderer;
+                if (r != null)
+                    foreach (var m in r.sharedMaterials)
+                        if (m != null && !mats.Contains(m)) { mats.Add(m); list.Add(m); }
+            }
+        }
+        return list;
+    }
+
+    static string Id(UnityEngine.Object o) { return "u" + o.GetInstanceID().ToString(CultureInfo.InvariantCulture); }
+
+    static string NameOf(UnityEngine.Object o)
+    {
+        var c = o as Component;
+        if (c != null) return c.gameObject.name + "/" + o.GetType().Name;
+        if (o is Material) return "Material:" + o.name;
+        return o.name;
+    }
+
+    static Dictionary<string, object> Faces(UnityEngine.Object o, Dictionary<string, object> labels)
+    {
+        return Faces(o, labels, null, null);
+    }
+
+    // values 不为空时，把和 known 里不一样的面（known 为空时是全部）的值写进 values
+    static Dictionary<string, object> Faces(UnityEngine.Object o, Dictionary<string, object> labels,
+                                            Dictionary<string, object> values, Dictionary<string, object> known)
+    {
+        var faces = new Dictionary<string, object>();
+        var so = new SerializedObject(o);
+        var it = so.GetIterator();
+        bool enter = true;
+        while (it.Next(enter))
+        {
+            enter = false;
+            string h = it.contentHash.ToString("x8");
+            faces[it.propertyPath] = h;
+            if (labels != null && !labels.ContainsKey(it.propertyPath)) labels[it.propertyPath] = it.displayName;
+            if (values != null && (known == null || !known.ContainsKey(it.propertyPath) || (string)known[it.propertyPath] != h))
+            {
+                string v = Show(it.Copy());
+                if (v != null) values[it.propertyPath] = v.Length <= 60 ? v : v.Substring(0, 60) + "…";
+            }
+        }
+        return faces;
+    }
+
+    static string F(float x) { return x.ToString("0.###", CultureInfo.InvariantCulture); }
+
+    // 一个面的值写成文字：只看 SerializedPropertyType，不看属性名
+    static string Show(SerializedProperty p)
+    {
+        switch (p.propertyType)
+        {
+            case SerializedPropertyType.Integer: return p.intValue.ToString(CultureInfo.InvariantCulture);
+            case SerializedPropertyType.Boolean: return p.boolValue ? "是" : "否";
+            case SerializedPropertyType.Float: return F(p.floatValue);
+            case SerializedPropertyType.String: return p.stringValue;
+            case SerializedPropertyType.Color: { var c = p.colorValue; return "(" + F(c.r) + ", " + F(c.g) + ", " + F(c.b) + ", " + F(c.a) + ")"; }
+            case SerializedPropertyType.ObjectReference: return p.objectReferenceValue != null ? p.objectReferenceValue.name : "无";
+            case SerializedPropertyType.Enum:
+                return p.enumValueIndex >= 0 && p.enumValueIndex < p.enumDisplayNames.Length ? p.enumDisplayNames[p.enumValueIndex] : p.intValue.ToString(CultureInfo.InvariantCulture);
+            case SerializedPropertyType.Vector2: { var v = p.vector2Value; return "(" + F(v.x) + ", " + F(v.y) + ")"; }
+            case SerializedPropertyType.Vector3: { var v = p.vector3Value; return "(" + F(v.x) + ", " + F(v.y) + ", " + F(v.z) + ")"; }
+            case SerializedPropertyType.Vector4: { var v = p.vector4Value; return "(" + F(v.x) + ", " + F(v.y) + ", " + F(v.z) + ", " + F(v.w) + ")"; }
+            case SerializedPropertyType.Quaternion: { var e = p.quaternionValue.eulerAngles; return "(" + F(e.x) + "°, " + F(e.y) + "°, " + F(e.z) + "°)"; }
+            case SerializedPropertyType.Vector2Int: { var v = p.vector2IntValue; return "(" + v.x + ", " + v.y + ")"; }
+            case SerializedPropertyType.Vector3Int: { var v = p.vector3IntValue; return "(" + v.x + ", " + v.y + ", " + v.z + ")"; }
+            case SerializedPropertyType.LayerMask: return p.intValue.ToString(CultureInfo.InvariantCulture);
+        }
+        if (p.isArray && p.propertyType != SerializedPropertyType.String)
+        {
+            var names = new List<string>();
+            for (int i = 0; i < p.arraySize && i < 5; i++)
+            {
+                var e = p.GetArrayElementAtIndex(i);
+                if (e.propertyType == SerializedPropertyType.ObjectReference) names.Add(e.objectReferenceValue != null ? e.objectReferenceValue.name : "无");
+            }
+            return p.arraySize + " 项" + (names.Count > 0 ? "：" + string.Join("、", names.ToArray()) + (p.arraySize > 5 ? "…" : "") : "");
+        }
+        return null;                                        // 嵌套结构：只说"变了"
+    }
+
+    static string Hash(string s)
+    {
+        ulong h = 14695981039346656037UL;                 // FNV-1a 64 位
+        foreach (char ch in s) { h ^= ch; h *= 1099511628211UL; }
+        return h.ToString("x16");
+    }
+
+    static string Join(Dictionary<string, object> faces, bool withName)
+    {
+        return string.Join("|", faces.Where(kv => withName || kv.Key != "m_Name")
+                                     .OrderBy(kv => kv.Key, StringComparer.Ordinal)
+                                     .Select(kv => kv.Key + "=" + kv.Value));
+    }
+
+    static bool Selected(UnityEngine.Object o, List<int> sel)
+    {
+        var c = o as Component;
+        var go = c != null ? c.gameObject : o as GameObject;
+        return go != null && sel.Contains(go.GetInstanceID());
+    }
+
+    // withValues：null 不带值；known 为 {编号: {面: 指纹}}（上次看到的）时只带变了的面的值，新对象带全部
+    static Dictionary<string, object> Record(UnityEngine.Object o, Dictionary<string, object> labels,
+                                             bool withValues, Dictionary<string, object> knownFaces, List<int> sel)
+    {
+        var values = withValues ? new Dictionary<string, object>() : null;
+        var faces = Faces(o, labels, values, knownFaces);
+        var c = o as Component;
+        var go = o as GameObject;
+        string parent = c != null ? Id(c.gameObject)
+                      : (go != null && go.transform.parent != null ? Id(go.transform.parent.gameObject) : null);
+        var rec = new Dictionary<string, object> {
+            { "id", Id(o) }, { "name", NameOf(o) }, { "type", o.GetType().Name },
+            { "cfp", Hash(Join(faces, false)) }, { "fp", Hash(Join(faces, true)) }, { "aspects", faces },
+            { "parent", parent }, { "collections", new List<object>() }, { "editing", false },
+            { "selected", sel != null && Selected(o, sel) } };
+        if (values != null && values.Count > 0) rec["values"] = values;
+        return rec;
+    }
+
+    static Dictionary<string, object> Records(Scene s, Dictionary<string, object> labels, Dictionary<string, UnityEngine.Object> objs)
+    {
+        return Records(s, labels, objs, null, false);
+    }
+
+    static Dictionary<string, object> Records(Scene s, Dictionary<string, object> labels, Dictionary<string, UnityEngine.Object> objs,
+                                              Dictionary<string, object> known, bool withValues)
+    {
+        var recs = new Dictionary<string, object>();
+        var sel = new List<int>(Selection.instanceIDs);
+        foreach (var o in Tracked(s))
+        {
+            string id = Id(o);
+            Dictionary<string, object> kf = null;
+            if (known != null && known.ContainsKey(id)) kf = (Dictionary<string, object>)known[id];
+            recs[id] = Record(o, labels, withValues, kf, sel);
+            if (objs != null) objs[id] = o;
+        }
+        return recs;
+    }
+
+    // 上次看到的 {编号: {fp, aspects}} 或 {编号: {面: 指纹}} → {编号: {面: 指纹}}
+    static Dictionary<string, object> KnownFaces(Dictionary<string, object> known)
+    {
+        var d = new Dictionary<string, object>();
+        foreach (var kv in known)
+        {
+            var v = (Dictionary<string, object>)kv.Value;
+            var asp = v.ContainsKey("aspects") ? v["aspects"] as Dictionary<string, object> : null;
+            d[kv.Key] = asp != null ? asp : v;
+        }
+        return d;
+    }
+
+    static Dictionary<string, object> FacesOf(Dictionary<string, object> recs)
+    {
+        var d = new Dictionary<string, object>();
+        foreach (var kv in recs) d[kv.Key] = ((Dictionary<string, object>)kv.Value)["aspects"];
+        return d;
+    }
+
+    // 其他已打开场景里的对象（名字 → 指纹），用来发现 AI 改到了实验场景以外的东西
+    static Dictionary<string, string> Outside(Scene target)
+    {
+        var d = new Dictionary<string, string>();
+        for (int i = 0; i < SceneManager.sceneCount; i++)
+        {
+            var s = SceneManager.GetSceneAt(i);
+            if (s.handle.ToString() == target.handle.ToString() || !s.isLoaded) continue;
+            foreach (var o in Tracked(s))
+            {
+                string key = s.name + ":" + NameOf(o) + "#" + Id(o);
+                d[key] = Hash(Join(Faces(o, null), true));
+            }
+        }
+        return d;
+    }
+
+    // ---------------- 入口 ----------------
+    static object Poll(Dictionary<string, object> args)
+    {
+        var labels = new Dictionary<string, object>();
+        var knownArg = args.ContainsKey("known") ? args["known"] as Dictionary<string, object> : null;
+        var known = knownArg != null ? KnownFaces(knownArg) : null;
+        return new Dictionary<string, object> { { "records", Records(TargetScene(args), labels, null, known, true) }, { "labels", labels } };
+    }
+
+    object Exec(Dictionary<string, object> args, ExecutionResult result)
+    {
+        TARGET = TargetScene(args);
+        string error = null;
+        try { AgentCode(result); } catch (Exception e) { error = e.ToString(); }
+        return new Dictionary<string, object> { { "status", "ok" }, { "error", error } };
+    }
+
+    object RunAgent(Dictionary<string, object> args, ExecutionResult result)
+    {
+        double t0 = EditorApplication.timeSinceStartup;
+        var scene = TargetScene(args);
+        TARGET = scene;
+        var labels = new Dictionary<string, object>();
+        var objs = new Dictionary<string, UnityEngine.Object>();
+        var known = (Dictionary<string, object>)args["known"];
+        var before = Records(scene, labels, objs, KnownFaces(known), true);
+        bool byObject = (string)args["granularity"] == "object";
+        var prot = new Dictionary<string, List<string>>();
+        foreach (var kv in (Dictionary<string, object>)args["protected"])
+            prot[kv.Key] = ((List<object>)kv.Value).Cast<string>().ToList();
+        var selected = new List<object>();
+        foreach (var kv in before)
+            if ((bool)((Dictionary<string, object>)kv.Value)["selected"]) selected.Add(kv.Key);
+        if (args.ContainsKey("protect_selected") && (bool)args["protect_selected"])
+            foreach (string id in selected) prot[id] = new List<string> { "*" };
+        var humanSince = new List<object>();
+        foreach (var kv in before)
+        {
+            var rec = (Dictionary<string, object>)kv.Value;
+            if (!known.ContainsKey(kv.Key)) { prot[kv.Key] = new List<string> { "*" }; humanSince.Add(kv.Key); continue; }
+            var k = (Dictionary<string, object>)known[kv.Key];
+            if ((string)k["fp"] == (string)rec["fp"]) continue;
+            humanSince.Add(kv.Key);
+            if (!prot.ContainsKey(kv.Key)) prot[kv.Key] = new List<string>();
+            var pl = prot[kv.Key];
+            if (byObject) { if (!pl.Contains("*")) pl.Add("*"); continue; }
+            var kf = (Dictionary<string, object>)k["aspects"];
+            foreach (var f in (Dictionary<string, object>)rec["aspects"])
+                if ((!kf.ContainsKey(f.Key) || (string)kf[f.Key] != (string)f.Value) && !pl.Contains(f.Key)) pl.Add(f.Key);
+        }
+        bool protect = (bool)args["protect"];
+        var selBefore = Selection.objects;
+        var activeBefore = Selection.activeObject;
+        // 快照：SerializedObject 会缓存创建时的序列化数据，不调用 Update 就不会变
+        var snaps = new Dictionary<string, SerializedObject>();
+        if (protect)
+            foreach (var id in prot.Keys)
+                if (objs.ContainsKey(id)) snaps[id] = new SerializedObject(objs[id]);
+        bool watch = !args.ContainsKey("watch_outside") || (bool)args["watch_outside"];
+        var outsideBefore = watch ? Outside(scene) : null;
+
+        string error = null;
+        try { AgentCode(result); } catch (Exception e) { error = e.ToString(); }
+
+        var beforeFaces = FacesOf(before);
+        var afterRaw = Records(scene, labels, null, beforeFaces, true);
+        var restored = new List<object>();
+        var merged = new Dictionary<string, object>();
+        var fallback = new List<object>();
+        var lost = new List<object>();
+        foreach (var kv in prot)
+        {
+            string id = kv.Key;
+            if (!snaps.ContainsKey(id)) continue;
+            var bf = (Dictionary<string, object>)((Dictionary<string, object>)before[id])["aspects"];
+            if (!afterRaw.ContainsKey(id)) { lost.Add(id); continue; }       // AI 删掉了受保护的对象：没有通用的办法恢复
+            var af = (Dictionary<string, object>)((Dictionary<string, object>)afterRaw[id])["aspects"];
+            var changed = bf.Keys.Where(f => !af.ContainsKey(f) || (string)af[f] != (string)bf[f]).ToList();
+            var want = kv.Value;
+            var conflict = want.Contains("*") ? changed : changed.Where(f => want.Contains(f)).ToList();
+            if (conflict.Count == 0) continue;
+            var obj = objs[id];
+            var dst = new SerializedObject(obj);
+            foreach (var f in conflict)
+            {
+                var sp = snaps[id].FindProperty(f);
+                if (sp != null) dst.CopyFromSerializedProperty(sp);
+            }
+            dst.ApplyModifiedPropertiesWithoutUndo();
+            var now = Faces(obj, null);
+            var left = conflict.Where(f => !now.ContainsKey(f) || (string)now[f] != (string)bf[f]).OrderBy(x => x).Cast<object>().ToList();
+            if (left.Count > 0) { fallback.Add(new Dictionary<string, object> { { "id", id }, { "faces", left } }); restored.Add(id); continue; }
+            if (conflict.Count == changed.Count) restored.Add(id);
+            else merged[id] = new Dictionary<string, object> {
+                { "restored", conflict.OrderBy(x => x).Cast<object>().ToList() },
+                { "kept", changed.Except(conflict).OrderBy(x => x).Cast<object>().ToList() } };
+        }
+        bool restoreSel = !args.ContainsKey("restore_selection") || (bool)args["restore_selection"];
+        if (protect && restoreSel)                         // 选中状态是人的界面状态：AI 的代码改了就还原
+        {
+            Selection.objects = selBefore.Where(x => x != null).ToArray();
+            if (activeBefore != null) Selection.activeObject = activeBefore;
+        }
+        var after = Records(scene, labels, null, beforeFaces, true);
+        var inexact = restored.Where(id => !after.ContainsKey((string)id) ||
+            (string)((Dictionary<string, object>)after[(string)id])["cfp"] != (string)((Dictionary<string, object>)before[(string)id])["cfp"]).ToList();
+        inexact.AddRange(lost);
+        var outside = new Dictionary<string, object>();
+        if (watch)
+        {
+            var oa = Outside(scene);
+            outside["created"] = oa.Keys.Except(outsideBefore.Keys).Cast<object>().ToList();
+            outside["deleted"] = outsideBefore.Keys.Except(oa.Keys).Cast<object>().ToList();
+            outside["modified"] = oa.Keys.Intersect(outsideBefore.Keys).Where(k => oa[k] != outsideBefore[k]).Cast<object>().ToList();
+        }
+        return new Dictionary<string, object> {
+            { "status", "ok" }, { "before", before }, { "after_raw", afterRaw }, { "after", after },
+            { "human_since", humanSince }, { "selected", selected }, { "restored", restored }, { "merged", merged }, { "fallback", fallback },
+            { "inexact", inexact }, { "lost", lost }, { "renamed", new List<object>() }, { "dangling", new List<object>() },
+            { "candidates", new List<object>() }, { "outside", outside }, { "ai_created", new List<object>() },
+            { "error", error }, { "stdout", "" }, { "undo_pushed", false },
+            { "seconds", EditorApplication.timeSinceStartup - t0 }, { "labels", labels } };
+    }
+}
+
+// 很小的 JSON 读写（Unity 自带的 JsonUtility 不能处理任意字典）
+static class J
+{
+    public static object Parse(string s) { int i = 0; return Val(s, ref i); }
+    static void Ws(string s, ref int i) { while (i < s.Length && char.IsWhiteSpace(s[i])) i++; }
+    static bool At(string s, int i, string w) { return string.CompareOrdinal(s, i, w, 0, w.Length) == 0; }
+    static object Val(string s, ref int i)
+    {
+        Ws(s, ref i);
+        char c = s[i];
+        if (c == '{')
+        {
+            i++; var d = new Dictionary<string, object>(); Ws(s, ref i);
+            if (s[i] == '}') { i++; return d; }
+            while (true)
+            {
+                Ws(s, ref i); string k = Str(s, ref i); Ws(s, ref i); i++;
+                d[k] = Val(s, ref i); Ws(s, ref i);
+                if (s[i] == ',') { i++; continue; }
+                i++; return d;
+            }
+        }
+        if (c == '[')
+        {
+            i++; var l = new List<object>(); Ws(s, ref i);
+            if (s[i] == ']') { i++; return l; }
+            while (true)
+            {
+                l.Add(Val(s, ref i)); Ws(s, ref i);
+                if (s[i] == ',') { i++; continue; }
+                i++; return l;
+            }
+        }
+        if (c == '"') return Str(s, ref i);
+        if (At(s, i, "true")) { i += 4; return true; }
+        if (At(s, i, "false")) { i += 5; return false; }
+        if (At(s, i, "null")) { i += 4; return null; }
+        int st = i;
+        while (i < s.Length && "+-0123456789.eE".IndexOf(s[i]) >= 0) i++;
+        return double.Parse(s.Substring(st, i - st), CultureInfo.InvariantCulture);
+    }
+    static string Str(string s, ref int i)
+    {
+        i++; var sb = new StringBuilder();
+        while (s[i] != '"')
+        {
+            if (s[i] == '\\')
+            {
+                i++; char e = s[i];
+                if (e == 'n') sb.Append('\n'); else if (e == 't') sb.Append('\t'); else if (e == 'r') sb.Append('\r');
+                else if (e == 'b') sb.Append('\b'); else if (e == 'f') sb.Append('\f');
+                else if (e == 'u') { sb.Append((char)Convert.ToInt32(s.Substring(i + 1, 4), 16)); i += 4; }
+                else sb.Append(e);
+            }
+            else sb.Append(s[i]);
+            i++;
+        }
+        i++; return sb.ToString();
+    }
+    public static string Write(object o) { var sb = new StringBuilder(); W(sb, o); return sb.ToString(); }
+    static void W(StringBuilder sb, object o)
+    {
+        if (o == null) { sb.Append("null"); return; }
+        var str = o as string;
+        if (str != null)
+        {
+            sb.Append('"');
+            foreach (char ch in str)
+            {
+                if (ch == '"') sb.Append("\\\""); else if (ch == '\\') sb.Append("\\\\");
+                else if (ch < 32 || ch > 126) sb.Append("\\u").Append(((int)ch).ToString("x4"));
+                else sb.Append(ch);
+            }
+            sb.Append('"'); return;
+        }
+        if (o is bool) { sb.Append((bool)o ? "true" : "false"); return; }
+        var dict = o as IDictionary;
+        if (dict != null)
+        {
+            sb.Append('{'); bool first = true;
+            foreach (DictionaryEntry kv in dict) { if (!first) sb.Append(','); first = false; W(sb, kv.Key.ToString()); sb.Append(':'); W(sb, kv.Value); }
+            sb.Append('}'); return;
+        }
+        var list = o as IEnumerable;
+        if (list != null)
+        {
+            sb.Append('['); bool first = true;
+            foreach (var x in list) { if (!first) sb.Append(','); first = false; W(sb, x); }
+            sb.Append(']'); return;
+        }
+        if (o is double || o is float || o is int || o is long || o is uint) { sb.Append(Convert.ToString(o, CultureInfo.InvariantCulture)); return; }
+        W(sb, o.ToString());
+    }
+}

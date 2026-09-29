@@ -1,0 +1,7 @@
+# 统一用 LF 换行，避免 Windows 和 Linux 之间整份文件显示为已修改
+* text=auto eol=lf
+*.blend binary
+*.png binary
+*.jpg binary
+*.gif binary
+*.zip binary

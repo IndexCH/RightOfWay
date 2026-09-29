@@ -1,0 +1,10 @@
+{
+  // Windows 下虚拟环境里的 Python；macOS / Linux 改成 ${workspaceFolder}/.venv/bin/python
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/Scripts/python.exe",
+  "python.testing.pytestEnabled": true,
+  "python.testing.unittestEnabled": false,
+  "python.testing.pytestArgs": ["tests"],
+  "python.analysis.extraPaths": ["tests"],
+  "files.encoding": "utf8",
+  "terminal.integrated.env.windows": { "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1" }
+}

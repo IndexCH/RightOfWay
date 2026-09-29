@@ -1,0 +1,276 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "重跑全部实验（模拟人）",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "experiments.run_all",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1"
+      }
+    },
+    {
+      "name": "重跑全部实验（真人）",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "experiments.run_all",
+      "args": [
+        "--human",
+        "real"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1"
+      }
+    },
+    {
+      "name": "运行演示：游戏素材流程",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/examples/demo_game_assets.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1"
+      }
+    },
+    {
+      "name": "运行全部测试",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pytest",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1"
+      }
+    },
+    {
+      "name": "调试当前打开的测试文件",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pytest",
+      "args": [
+        "${file}"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": true,
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1"
+      }
+    },
+    {
+      "name": "实验 A：同一份（模拟人，先用它检查能否连上 Blender）",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "experiments.exp_a_shared",
+      "args": [
+        "--human",
+        "sim"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1"
+      }
+    },
+    {
+      "name": "实验 A：同一份（真人）",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "experiments.exp_a_shared",
+      "args": [],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1"
+      }
+    },
+    {
+      "name": "实验 A：按整个对象保护（和按面对比，真人）",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "experiments.exp_a_shared",
+      "args": [
+        "--granularity",
+        "object"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1"
+      }
+    },
+    {
+      "name": "实验 A：对照组，没有保护（真人）",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "experiments.exp_a_shared",
+      "args": [
+        "--no-protocol"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1"
+      }
+    },
+    {
+      "name": "实验 A：选中即占用（真人）",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "experiments.exp_a_shared",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1"
+      },
+      "args": [
+        "--occupy-selection"
+      ]
+    },
+    {
+      "name": "实验 D：两个 AI + 人（模拟人）",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "experiments.exp_d_multi",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1"
+      },
+      "args": [
+        "--human",
+        "sim"
+      ]
+    },
+    {
+      "name": "实验 D：两个 AI + 人（真人）",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "experiments.exp_d_multi",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1"
+      }
+    },
+    {
+      "name": "实验 B：各自一个窗口，实时同步（模拟人，需要两个 Blender）",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "experiments.exp_b_live",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1"
+      },
+      "args": [
+        "--human",
+        "sim"
+      ]
+    },
+    {
+      "name": "实验 B：各自一个窗口，实时同步（真人，需要两个 Blender）",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "experiments.exp_b_live",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1"
+      }
+    },
+    {
+      "name": "实验 B 文件兜底：存盘合并（模拟人）",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "experiments.exp_b_files",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1"
+      },
+      "args": [
+        "--human",
+        "sim"
+      ]
+    },
+    {
+      "name": "实验 B 文件兜底：存盘合并（真人）",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "experiments.exp_b_files",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1"
+      }
+    },
+    {
+      "name": "实验 C：Unity（模拟人）",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "experiments.exp_c_unity",
+      "args": [
+        "--human",
+        "sim"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1"
+      }
+    },
+    {
+      "name": "实验 C：Unity（真人）",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "experiments.exp_c_unity",
+      "args": [],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1"
+      }
+    },
+    {
+      "name": "实验 C：Unity 对照组，没有保护（真人）",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "experiments.exp_c_unity",
+      "args": [
+        "--no-protocol"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1"
+      }
+    }
+  ]
+}

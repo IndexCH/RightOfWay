@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cowork-runtime"
+version = "0.4.0"
+description = "人机同时协作协议（Cowork Protocol）的参考实现"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+# 可选：在本进程里运行 Blender 代码（自动测试、无界面模拟）。bpy 只支持特定的 Python 版本，4.2–4.5 需要 Python 3.11
+blender = ["bpy>=4.2; python_version == '3.11'"]
+# 可选：实验 C 需要作为 MCP 客户端连接 Unity 的 MCP 中继
+unity = ["mcp>=1.2"]
+
+[tool.setuptools.packages.find]
+include = ["cowork*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "tests"]
+addopts = "-v"
+
+[tool.setuptools.package-data]
+"cowork.unity" = ["*.cs.txt"]

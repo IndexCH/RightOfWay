@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+experiments/work_b/
+*.blend1
+
+# 本机实验结果和实验时生成的文件，不上传
+experiments/results/
+.cowork/
+*.zip
