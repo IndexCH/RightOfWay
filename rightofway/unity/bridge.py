@@ -2,7 +2,7 @@
 
 Unity 和它的 MCP 都不用改。运行时把 UnitySide.cs.txt 填好参数，作为一段 C# 交给 Unity_RunCommand 执行，
 再从执行日志里取出结果。接口和 Blender 那边一样：call(函数名, 参数) → 结果 dict，
-所以 cowork.blender.shared_session.SharedSession 可以原样用在 Unity 上。
+所以 rightofway.blender.shared_session.SharedSession 可以原样用在 Unity 上。
 
 传话的方式（transport）有两种：
 - RelayTransport：自己启动 Unity 的 MCP 中继（relay_win.exe --mcp），作为 MCP 客户端调用。需要 pip install mcp。
@@ -22,8 +22,8 @@ from pathlib import Path
 from typing import Callable, Optional
 
 TEMPLATE_PATH = Path(__file__).with_name("UnitySide.cs.txt")
-MARK_BEGIN = "<<<COWORK_JSON>>>"
-MARK_END = "<<<COWORK_END>>>"
+MARK_BEGIN = "<<<RIGHTOFWAY_JSON>>>"
+MARK_END = "<<<RIGHTOFWAY_END>>>"
 
 
 class UnityError(RuntimeError):
@@ -153,7 +153,7 @@ class RelayTransport:
                             break
                         code, fut = item
                         try:
-                            res = await session.call_tool(self.tool, {"Code": code, "Title": "Cowork"})
+                            res = await session.call_tool(self.tool, {"Code": code, "Title": "RightOfWay"})
                             fut.set_result("\n".join(getattr(c, "text", "") for c in res.content))
                         except BaseException as e:   # noqa: BLE001
                             fut.set_exception(e)

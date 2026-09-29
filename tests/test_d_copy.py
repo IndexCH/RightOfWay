@@ -1,5 +1,5 @@
 """D 类：复制与来源（复制产生新对象；副本由人创建，属于人碰过）。"""
-from cowork import OpStatus
+from rightofway import OpStatus
 from helpers import AGENT, HUMAN, make_runtime, submit
 
 

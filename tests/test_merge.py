@@ -1,5 +1,5 @@
 """三方合并小工具的单元测试。"""
-from cowork.merge import three_way_merge
+from rightofway.merge import three_way_merge
 
 BASE = "一\n\n二\n\n三"
 

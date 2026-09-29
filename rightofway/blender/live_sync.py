@@ -264,7 +264,7 @@ class LiveSyncSession:
                     items[c]["record"] = ex["records"].get(c, a[c])
             res = hs.bridge.call("apply_sync", hs._args(
                 items=list(items.values()), known=hs._known(h), undo_push=True,
-                undo_message="Cowork: AI 的修改", **source))
+                undo_message="RightOfWay: AI 的修改", **source))
             h_applied = res["records"]
             rep.undo_pushed = res.get("undo_pushed", False)
             skipped_ids = {s["id"]: s["reason"] for s in res["skipped"]}

@@ -5,8 +5,8 @@ AI 必须在自己的屏幕上打开自己的一份。只要文件能被解析�
 
 文件布局（以 scene.blend 为例）：
     scene.blend                       人那一份（人在 Blender 里打开它）
-    .cowork/ai/scene.blend            AI 那一份（AI 在自己的屏幕上打开它）
-    .cowork/history/v0000.blend ...   每次合并的结果
+    .rightofway/ai/scene.blend            AI 那一份（AI 在自己的屏幕上打开它）
+    .rightofway/history/v0000.blend ...   每次合并的结果
 
 合并规则（和运行时规则一致），以"单元"为单位——按对象（granularity="object"），或按对象的面（"aspect"，默认）：
     - 人的修改总是保留（R5）。人改过的单元，AI 的版本不采用；运行时策略为"留作候选"时把 AI 的整个对象放进候选集合（R6）。
@@ -246,7 +246,7 @@ def _mtime(path: Path) -> float:
 
 def _atomic_copy(src: Path, dst: Path) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dst.with_name(dst.name + ".cowork-tmp")
+    tmp = dst.with_name(dst.name + ".rightofway-tmp")
     shutil.copyfile(src, tmp)
     os.replace(tmp, dst)
 
@@ -259,7 +259,7 @@ class FileMergeSession:
         self.rt, self.runner = runtime, runner
         self.granularity = granularity
         self.human_path = Path(human_path).resolve()
-        self.work = Path(work_dir).resolve() if work_dir else self.human_path.parent / ".cowork"
+        self.work = Path(work_dir).resolve() if work_dir else self.human_path.parent / ".rightofway"
         self.ai_path = self.work / "ai" / self.human_path.name
         self.human, self.agent, self.scene = human, agent, scene
         self.history: list[MergeVersion] = []
@@ -483,7 +483,7 @@ class FileMergeSession:
                 for n, p in sorted(rep.partial.items())))
         if rep.rejected:
             human.append("你改过、所以没采用 AI 版本的：" + "、".join(rep.rejected)
-                         + ("（AI 的版本放在 Cowork_AI候选 集合里）" if rep.candidates else ""))
+                         + ("（AI 的版本放在 RightOfWay_AI候选 集合里）" if rep.candidates else ""))
         if rep.human_stale:
             human.append("你存盘的是较早的版本，里面没改过的部分没有覆盖 AI 的新内容。")
         if rep.overridden_ai:

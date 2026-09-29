@@ -14,7 +14,7 @@ def run_command(Code: str, Title: str = "") -> str:
     payload = {"setup": {"scene_handle": "42", "closed": 0},
                "poll": {"records": {}, "labels": {}}}.get(fn, {"status": "ok"})
     payload["echo_fn"] = fn
-    logs = "[Log] [<<<COWORK_JSON>>>" + json.dumps(payload) + "<<<COWORK_END>>>]"
+    logs = "[Log] [<<<RIGHTOFWAY_JSON>>>" + json.dumps(payload) + "<<<RIGHTOFWAY_END>>>]"
     return json.dumps({"success": True, "message": "Command executed successfully.",
                        "data": {"isCompilationSuccessful": True, "isExecutionSuccessful": True,
                                 "compilationLogs": "", "executionLogs": logs}})

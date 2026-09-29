@@ -36,9 +36,9 @@ AI_BUILD = _HELPERS + r'''
             m.color = c;
             return m;
         }
-        var bark = Mat("Cowork_Bark", new Color(0.35f, 0.2f, 0.1f));
-        var leaf = Mat("Cowork_Leaf", new Color(0.2f, 0.6f, 0.2f));
-        var stone = Mat("Cowork_Stone", new Color(0.5f, 0.5f, 0.5f));
+        var bark = Mat("RightOfWay_Bark", new Color(0.35f, 0.2f, 0.1f));
+        var leaf = Mat("RightOfWay_Leaf", new Color(0.2f, 0.6f, 0.2f));
+        var stone = Mat("RightOfWay_Stone", new Color(0.5f, 0.5f, 0.5f));
         Make("Ground", PrimitiveType.Plane, Vector3.zero, new Vector3(2, 1, 2), null);
         Make("Trunk", PrimitiveType.Cylinder, new Vector3(0, 1.2f, 0), new Vector3(0.6f, 1.2f, 0.6f), bark);
         for (int i = 0; i < 5; i++)
@@ -91,7 +91,7 @@ _AI_ADJUST = _HELPERS + r'''
         foreach (var r in TARGET.GetRootGameObjects())                       // 其他散落的物体放到地面上
         {
             if (r.name == "Ground" || r.name == "Trunk" || r.name == "Sun" || r.name.StartsWith("Rock_")
-                || r.name.StartsWith("Leaf_") || r.name.StartsWith("__cowork")) continue;
+                || r.name.StartsWith("Leaf_") || r.name.StartsWith("__rightofway")) continue;
             result.RegisterObjectModification(r.transform);
             var p = r.transform.localPosition; p.y = 0.5f; r.transform.localPosition = p;
         }

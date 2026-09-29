@@ -1,5 +1,5 @@
 """C 类：认领与分工（R11）。"""
-from cowork import OpStatus, StepState
+from rightofway import OpStatus, StepState
 from helpers import AGENT, HUMAN, make_runtime, submit
 
 

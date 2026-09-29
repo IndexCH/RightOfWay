@@ -20,11 +20,11 @@ import argparse
 import threading
 import time
 
-from cowork.blender.evaluate import evaluate
-from cowork.blender.records import label
-from cowork.blender.shared_session import SharedSession
-from cowork.runtime import POLICY_DISCARD, Runtime
-from cowork.unity.bridge import NeedResponse, RelayTransport, ReplayTransport, UnityBridge, UnityError
+from rightofway.blender.evaluate import evaluate
+from rightofway.blender.records import label
+from rightofway.blender.shared_session import SharedSession
+from rightofway.runtime import POLICY_DISCARD, Runtime
+from rightofway.unity.bridge import NeedResponse, RelayTransport, ReplayTransport, UnityBridge, UnityError
 from experiments import scenario_unity as su
 from experiments.common import banner, say, use_utf8_console, wait_for_human, write_row
 

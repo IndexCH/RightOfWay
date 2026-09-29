@@ -1,7 +1,7 @@
 """B 类：占用与释放（R8、R9、R10）。"""
 import pytest
 
-from cowork import OpStatus, ProtocolError, StepState
+from rightofway import OpStatus, ProtocolError, StepState
 from helpers import AGENT, HUMAN, HUMAN2, make_runtime, submit
 
 

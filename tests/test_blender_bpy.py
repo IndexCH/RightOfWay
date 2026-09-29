@@ -10,11 +10,11 @@ import pytest
 
 bpy = pytest.importorskip("bpy")
 
-from cowork.blender.bridge import InProcessBridge, SubprocessBlender  # noqa: E402
-from cowork.blender.evaluate import evaluate  # noqa: E402
-from cowork.blender.filemerge import FileMergeSession  # noqa: E402
-from cowork.blender.shared_session import SharedSession  # noqa: E402
-from cowork.runtime import POLICY_CANDIDATE, Runtime  # noqa: E402
+from rightofway.blender.bridge import InProcessBridge, SubprocessBlender  # noqa: E402
+from rightofway.blender.evaluate import evaluate  # noqa: E402
+from rightofway.blender.filemerge import FileMergeSession  # noqa: E402
+from rightofway.blender.shared_session import SharedSession  # noqa: E402
+from rightofway.runtime import POLICY_CANDIDATE, Runtime  # noqa: E402
 from experiments import exp_a_shared, exp_b_files  # noqa: E402
 from experiments import scenario_tree as sc  # noqa: E402
 
@@ -62,7 +62,7 @@ def test_fingerprint_sees_transform_mesh_material_modifier(br):
     e = poll(br)
     assert len({by_name(x, "Rock_1")["fp"] for x in (c, d, e)}) == 3
     # 共用材质变了：所有用它的石头都变
-    bpy.data.materials["Cowork_Stone"].node_tree.nodes["Principled BSDF"].inputs["Base Color"].default_value = (1, 0, 0, 1)
+    bpy.data.materials["RightOfWay_Stone"].node_tree.nodes["Principled BSDF"].inputs["Base Color"].default_value = (1, 0, 0, 1)
     f = poll(br)
     assert by_name(f, "Rock_2")["fp"] != by_name(e, "Rock_2")["fp"]
     assert by_name(f, "Trunk")["fp"] == by_name(e, "Trunk")["fp"]
@@ -72,7 +72,7 @@ def test_duplicate_gets_new_id_original_keeps_old(br):
     br.execute(sc.ai_build())
     a = poll(br)
     rock = bpy.data.objects["Rock_1"]
-    dup = rock.copy()                                   # 和 Shift+D 一样，会把 cowork_id 一起复制
+    dup = rock.copy()                                   # 和 Shift+D 一样，会把 rightofway_id 一起复制
     bpy.context.scene.collection.objects.link(dup)
     b = poll(br)
     assert by_name(b, "Rock_1")["id"] == by_name(a, "Rock_1")["id"]
@@ -120,7 +120,7 @@ def test_candidate_policy_keeps_ai_version_out_of_scene(br):
     s.poll()
     rep = s.run_agent("import bpy\nbpy.data.objects['Rock_1'].location.z = 0")
     assert bpy.data.objects["Rock_1"].location.z == 3
-    cand = bpy.data.collections["Cowork_AI候选"]
+    cand = bpy.data.collections["RightOfWay_AI候选"]
     assert [o.name for o in cand.objects] == ["Rock_1 [AI候选]"] and cand.hide_viewport
     assert all(r["name"] != "Rock_1 [AI候选]" for r in poll(br).values())
     assert rep.candidates
@@ -274,10 +274,10 @@ def test_outside_scene_changes_are_reported(br):
 def test_old_experiment_scenes_do_not_interfere(br):
     """你遇到的情况：之前实验的场景里有同名对象。先清理旧场景，新实验里名字不再带 .001；
     即使不清理，AI 的脚本也只改当前场景。"""
-    for name in ("Cowork实验_1", "Cowork实验_2"):
+    for name in ("RightOfWay实验_1", "RightOfWay实验_2"):
         sc_ = bpy.data.scenes.new(name)
         br.execute(sc.ai_build(name))
-    res = br.call("cleanup_scenes", {"prefix": "Cowork实验_"})
+    res = br.call("cleanup_scenes", {"prefix": "RightOfWay实验_"})
     assert len(res["scenes"]) == 2 and res["objects"] == 22
     assert "Leaf_1" not in bpy.data.objects
     # 不清理的情况
@@ -290,7 +290,7 @@ def test_old_experiment_scenes_do_not_interfere(br):
     s.run_agent(sc.ai_build("New"))
     rep = s.run_agent(sc.ai_adjust("New"))
     assert tuple(bpy.data.objects["Trunk"].scale) == (1, 1, 1)          # 旧场景的 Trunk 没被动
-    # 但材质名是全局的，旧场景的叶子和新场景共用 Cowork_Leaf：AI 改颜色时旧场景的叶子也变了。
+    # 但材质名是全局的，旧场景的叶子和新场景共用 RightOfWay_Leaf：AI 改颜色时旧场景的叶子也变了。
     # 运行时不追踪旧场景，但把这件事报告出来，而不是静默漏掉（R18）
     assert rep.outside["modified"] == ["Leaf_1", "Leaf_2", "Leaf_3", "Leaf_4", "Leaf_5"]
     assert rep.outside["created"] == [] and rep.outside["deleted"] == []

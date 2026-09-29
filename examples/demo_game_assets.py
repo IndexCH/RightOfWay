@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # 没安装包时也能直接运行
 
-from cowork import ActorKind, CapabilityMeta, Event, Operation, Runtime, Target  # noqa: E402
+from rightofway import ActorKind, CapabilityMeta, Event, Operation, Runtime, Target  # noqa: E402
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")

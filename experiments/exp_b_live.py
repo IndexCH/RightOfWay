@@ -28,11 +28,11 @@ import argparse
 import threading
 import time
 
-from cowork.blender import local_server
-from cowork.blender.bridge import BridgeError, SocketBridge
-from cowork.blender.evaluate import evaluate
-from cowork.blender.live_sync import LiveSyncSession
-from cowork.runtime import POLICY_DISCARD, Runtime
+from rightofway.blender import local_server
+from rightofway.blender.bridge import BridgeError, SocketBridge
+from rightofway.blender.evaluate import evaluate
+from rightofway.blender.live_sync import LiveSyncSession
+from rightofway.runtime import POLICY_DISCARD, Runtime
 from experiments import scenario_tree as sc
 from experiments.common import banner, say, use_utf8_console, wait_for_human, write_row
 from experiments.exp_a_shared import _SETUP
@@ -74,9 +74,9 @@ def main(argv=None) -> None:
 
 def _run(args, protect: bool) -> None:
     hb, ab = SocketBridge(args.host, args.human_port), SocketBridge(args.host, args.ai_port)
-    scene = "Cowork实验_同步_" + time.strftime("%H%M%S")
+    scene = "RightOfWay实验_同步_" + time.strftime("%H%M%S")
     for who, br in (("你", hb), ("AI", ab)):
-        old = br.call("cleanup_scenes", {"prefix": "Cowork实验_"})
+        old = br.call("cleanup_scenes", {"prefix": "RightOfWay实验_"})
         if old["scenes"]:
             print(f"{who}的 Blender：已删除之前实验留下的 {len(old['scenes'])} 个场景。")
         br.execute(_SETUP.format(name=scene))

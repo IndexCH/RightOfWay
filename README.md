@@ -93,7 +93,7 @@ Each experiment needs its application ready (Blender with the [Blender MCP add-o
 ## Repository layout
 
 ```
-cowork/                  runtime (the Python package is still called `cowork`; it will be renamed)
+rightofway/              runtime (Python package)
 ├── runtime.py           protocol rules R1–R21
 ├── blender/             Blender integration: no changes to Blender or its MCP add-on
 │   ├── blender_side.py  code that runs inside Blender (ids, fingerprints, values, protect/restore, sync, merge)
@@ -134,7 +134,7 @@ This is early. Issues describing where an agent overwrote your work (which tool,
 
 ## License
 
-Not chosen yet. The plan is Apache-2.0 for the code and CC BY 4.0 for the spec text. Until a license file is added, all rights are reserved.
+The code is licensed under the [Apache License 2.0](LICENSE). The specification and other documents under `spec/` and `docs/` are licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
 
 ## Author
 

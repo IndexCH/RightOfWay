@@ -1,5 +1,5 @@
 """H 类：确认与暂停（R5、R16、R17）。"""
-from cowork import CapabilityMeta, OpStatus
+from rightofway import CapabilityMeta, OpStatus
 from helpers import AGENT, HUMAN, agent_op, make_runtime, submit
 
 

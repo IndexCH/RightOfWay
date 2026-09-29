@@ -116,12 +116,12 @@ def check(group: str, args) -> str:
             return "" if Path(args.blender).exists() else f"找不到 {args.blender}"
         if _can_import("bpy"):
             return ""
-        from cowork.blender.bridge import find_blender
+        from rightofway.blender.bridge import find_blender
         return "" if find_blender() else "找不到 Blender：用 --blender 指定 blender.exe，或设置环境变量 BLENDER_EXE"
     if group == "C":
         if not _can_import("mcp"):
             return '没有装 MCP 客户端：pip install -e ".[unity]"'
-        from cowork.unity.bridge import default_relay_path
+        from rightofway.unity.bridge import default_relay_path
         relay = args.relay or default_relay_path()
         return "" if Path(relay).exists() else f"找不到 Unity MCP 中继：{relay}（Unity 6 + AI Assistant，并在 Unity 里启用过 MCP）"
     return ""

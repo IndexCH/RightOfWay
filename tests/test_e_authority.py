@@ -1,7 +1,7 @@
 """E 类：副本与权威、观察（R2、R18、R21）。"""
 import pytest
 
-from cowork import (Authority, AuthorityKind, CapabilityMeta, Channel, ObservationError, OpStatus,
+from rightofway import (Authority, AuthorityKind, CapabilityMeta, Channel, ObservationError, OpStatus,
                     StepState)
 from helpers import AGENT, HUMAN, make_runtime, run_agent_step, submit
 

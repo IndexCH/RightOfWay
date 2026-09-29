@@ -22,7 +22,7 @@ internal class CommandScript : IRunCommand
 {
     const string FN = "__FN__";
     const string ARGS = @"__ARGS__";
-    const string MARKER = "__cowork_experiment_scene__";
+    const string MARKER = "__rightofway_experiment_scene__";
     static Scene TARGET;
 
     public void Execute(ExecutionResult result)
@@ -44,7 +44,7 @@ internal class CommandScript : IRunCommand
         {
             output = new Dictionary<string, object> { { "status", "error" }, { "error", e.ToString() } };
         }
-        result.Log("{0}", "<<<COWORK_JSON>>>" + J.Write(output) + "<<<COWORK_END>>>");
+        result.Log("{0}", "<<<RIGHTOFWAY_JSON>>>" + J.Write(output) + "<<<RIGHTOFWAY_END>>>");
     }
 
     // ---------------- AI 的代码（run_agent / exec 时填入）----------------

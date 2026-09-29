@@ -85,7 +85,7 @@ Photoshop：没有找到能多人同时编辑 PSD 的功能（Adobe 的说明页
 **要注意的**：
 
 - **AIS 的作者团队**已经把问题说得很清楚，下一篇很可能就是实现；TClone 加上按对象合并也会和方式二重合。**越早把实现和真人实验放出来越好**。
-- **名字冲突**："Cowork" 和 Anthropic 的产品 Claude Cowork 同名，GitHub 上还有一个无关的 "COWORK Protocol"（kamesh231/cowork-protocol）。**正式发布前应该改名**（规范未决问题 6）。
+- **名字冲突**（已处理）：原暂名 "Cowork" 和 Anthropic 的产品 Claude Cowork 同名，GitHub 上还有一个无关的 "COWORK Protocol"（kamesh231/cowork-protocol）。项目已改名为 RightOfWay。
 - STORM / S-Bus 的实验方法（同一个任务，对比有无冲突检测）和评估指标可以借鉴到我们的真人实验里；"Guard Precision"（arXiv 2609.29522）报告只看版本新旧的检查会误拦 92–95% 其实无害的并发，这正好支持我们按面判断的做法。
 
 ## 5 核对情况

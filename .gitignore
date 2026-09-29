@@ -10,5 +10,5 @@ experiments/work_b/
 
 # 本机实验结果和实验时生成的文件，不上传
 experiments/results/
-.cowork/
+.rightofway/
 *.zip

@@ -67,7 +67,7 @@ python -m experiments.exp_c_unity --human sim      # 实验 C：Unity
 
 去掉 `--human sim` 就是真人操作；加 `--no-protocol` 是对照组；加 `--granularity object` 是按整个对象判断。
 
-- 实验 A、D、B 会在 Blender 里**新建一个场景**"Cowork实验_…"，不影响原来的场景。开始前会删掉之前实验留下的"Cowork实验_"场景（实验 A 加 `--keep-old-scenes` 可以保留）。
+- 实验 A、D、B 会在 Blender 里**新建一个场景**"RightOfWay实验_…"，不影响原来的场景。开始前会删掉之前实验留下的"RightOfWay实验_"场景（实验 A 加 `--keep-old-scenes` 可以保留）。
 - 实验 C 会在 Unity 里**追加**一个空场景，原来的场景不受影响，也不保存任何东西。程序会自己启动 Unity 的 MCP 中继；连不上时，先把其他正在使用 Unity MCP 的客户端（例如 Claude Desktop）停掉再试。
 - 实验 C 每次检查人的修改都要在 Unity 里编译一段 C#，所以默认 2 秒检查一次。
 

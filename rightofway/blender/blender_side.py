@@ -1,6 +1,6 @@
 """在 Blender 里运行的代码。
 
-这个文件有两种用法，所以它只能 import bpy 和 Python 标准库，不能 import cowork 包里的任何东西：
+这个文件有两种用法，所以它只能 import bpy 和 Python 标准库，不能 import rightofway 包里的任何东西：
 
 1. 方式一（同一份，实时）：整个文件的源码通过现成 Blender MCP 插件的 execute_code 发进
    正在运行的 Blender，末尾再加一行调用（见 bridge.py 的 build_call）。
@@ -17,7 +17,7 @@
     dump_file(args)   打开一个 .blend，列出对象和指纹                方式二
     edit_file(args)   打开一个 .blend，执行一段脚本，保存（模拟 AI 用 computer use 改自己的副本）
     merge_file(args)  打开人的 .blend，按合并计划换入/删除对象，保存到新路径   方式二
-结果用 _cowork_out() 打印在两个标记之间，调用方从标准输出里取出来。
+结果用 _rightofway_out() 打印在两个标记之间，调用方从标准输出里取出来。
 """
 import array
 import base64
@@ -35,12 +35,12 @@ import uuid
 
 import bpy
 
-ID_KEY = "cowork_id"                 # 对象的系统 ID，存在对象的自定义属性里
-UID_KEY = "cowork_uid"               # 盖章时的 session_uid，用来区分复制出来的对象（Shift+D 会连自定义属性一起复制）
-CANDIDATE_KEY = "cowork_candidate"   # AI 候选版本：不参与追踪
-CANDIDATE_COLLECTION = "Cowork_AI候选"
-MARK_BEGIN = "<<<COWORK_JSON>>>"
-MARK_END = "<<<COWORK_END>>>"
+ID_KEY = "rightofway_id"                 # 对象的系统 ID，存在对象的自定义属性里
+UID_KEY = "rightofway_uid"               # 盖章时的 session_uid，用来区分复制出来的对象（Shift+D 会连自定义属性一起复制）
+CANDIDATE_KEY = "rightofway_candidate"   # AI 候选版本：不参与追踪
+CANDIDATE_COLLECTION = "RightOfWay_AI候选"
+MARK_BEGIN = "<<<RIGHTOFWAY_JSON>>>"
+MARK_END = "<<<RIGHTOFWAY_END>>>"
 DIGITS = 5                           # 浮点数保留的小数位，避免无意义的微小差别
 
 # ---------------------------------------------------------------------------
@@ -195,7 +195,7 @@ def _walk_struct(s, depth, cache, in_object):
             continue      # 数据块里的"引用列表"（例如网格的材质列表）在拥有它的对象那一面上已经算过
         out[p.identifier] = _walk(v, depth, cache, in_object)
     try:
-        keys = [k for k in s.keys() if not k.startswith("cowork_")]      # 自定义属性（几何节点的输入也在这里）
+        keys = [k for k in s.keys() if not k.startswith("rightofway_")]      # 自定义属性（几何节点的输入也在这里）
         if keys:
             out["[props]"] = sorted((k, repr(s[k].to_dict() if hasattr(s[k], "to_dict") else
                                             s[k].to_list() if hasattr(s[k], "to_list") else s[k])) for k in keys)
@@ -560,10 +560,10 @@ def _copy_struct(dst, src, scene, depth=0):
         except Exception:
             pass
     try:
-        for k in [k for k in dst.keys() if not k.startswith("cowork_")]:
+        for k in [k for k in dst.keys() if not k.startswith("rightofway_")]:
             del dst[k]
         for k in src.keys():
-            if not k.startswith("cowork_"):
+            if not k.startswith("rightofway_"):
                 dst[k] = src[k]
     except Exception:
         pass
@@ -773,7 +773,7 @@ def run_agent(args):
     do_protect = args.get("protect", True)
     snap_path = None
     if protected and do_protect:
-        snap_path = os.path.join(tempfile.gettempdir(), f"cowork_snap_{uuid.uuid4().hex[:8]}.blend")
+        snap_path = os.path.join(tempfile.gettempdir(), f"rightofway_snap_{uuid.uuid4().hex[:8]}.blend")
         bpy.data.libraries.write(snap_path, set(o for o in _tracked(scene) if o.get(ID_KEY) in protected),
                                  fake_user=False)
     outside_before = _other_objects(scene) if args.get("watch_outside", True) else None
@@ -784,7 +784,7 @@ def run_agent(args):
     error = None
     try:
         with contextlib.redirect_stdout(out):
-            exec(args["code"], {"bpy": bpy, "__name__": "__cowork_agent__"})
+            exec(args["code"], {"bpy": bpy, "__name__": "__rightofway_agent__"})
     except Exception:
         error = traceback.format_exc(limit=3)
     ai_created = ensure_ids(scene, prefix="a-")
@@ -863,7 +863,7 @@ def run_agent(args):
                    "deleted": sorted(set(outside_before) - set(outside_after)),
                    "modified": sorted(n for n in set(outside_before) & set(outside_after)
                                       if outside_before[n] != outside_after[n])}
-    undo_pushed = _try_undo_push("Cowork: AI 脚本") if args.get("undo_push", True) else False
+    undo_pushed = _try_undo_push("RightOfWay: AI 脚本") if args.get("undo_push", True) else False
     return {
         "status": "ok", "before": before, "after_raw": after, "after": final,
         "human_since": sorted(human_since), "protected": {k: sorted(v) for k, v in protected.items()},
@@ -935,7 +935,7 @@ def export_objects(args):
     ids = set(args["ids"])
     objs = [o for o in _tracked(scene) if o.get(ID_KEY) in ids]
     recs = records(scene, only=ids)
-    path = os.path.join(tempfile.gettempdir(), f"cowork_x_{uuid.uuid4().hex[:10]}.blend")
+    path = os.path.join(tempfile.gettempdir(), f"rightofway_x_{uuid.uuid4().hex[:10]}.blend")
     inline = bool(args.get("inline"))
     bpy.data.libraries.write(path, set(objs), fake_user=False, compress=inline)
     out = {"records": recs, "names": {o.get(ID_KEY): o.name for o in objs}}
@@ -963,7 +963,7 @@ def apply_sync(args):
     ensure_ids(scene, prefix=args.get("prefix", "h-"))
     path, tmp = args.get("path"), None
     if args.get("data"):
-        tmp = path = os.path.join(tempfile.gettempdir(), f"cowork_in_{uuid.uuid4().hex[:10]}.blend")
+        tmp = path = os.path.join(tempfile.gettempdir(), f"rightofway_in_{uuid.uuid4().hex[:10]}.blend")
         with open(tmp, "wb") as f:
             f.write(base64.b64decode(args["data"]))
     cur = records(scene)
@@ -1036,7 +1036,7 @@ def apply_sync(args):
             os.remove(args["path"])
         except OSError:
             pass
-    undo_pushed = _try_undo_push(args.get("undo_message", "Cowork: 同步")) if args.get("undo_push") and applied else False
+    undo_pushed = _try_undo_push(args.get("undo_message", "RightOfWay: 同步")) if args.get("undo_push") and applied else False
     known = args.get("known")
     return {"applied": applied, "skipped": skipped, "face_errors": face_errors,
             "dangling": report.get("dangling", []), "undo_pushed": undo_pushed,
@@ -1057,7 +1057,7 @@ def new_file(args):
     return {"path": args["path"]}
 
 
-STAMP_KEY = "cowork_base"          # 方式二文件兜底：这份内容是从第几版合并结果打开的（跟着内容走）
+STAMP_KEY = "rightofway_base"          # 方式二文件兜底：这份内容是从第几版合并结果打开的（跟着内容走）
 
 
 def dump_file(args):
@@ -1077,7 +1077,7 @@ def edit_file(args):
     out = io.StringIO()
     try:
         with contextlib.redirect_stdout(out):
-            exec(args["code"], {"bpy": bpy, "__name__": "__cowork_agent__"})
+            exec(args["code"], {"bpy": bpy, "__name__": "__rightofway_agent__"})
     except Exception:
         error = traceback.format_exc(limit=3)
     bpy.ops.wm.save_as_mainfile(filepath=args.get("save_to", args["path"]), check_existing=False)
@@ -1172,6 +1172,6 @@ def merge_file(args):
             "labels": face_labels()}
 
 
-def _cowork_out(result):
+def _rightofway_out(result):
     # 只输出 ASCII（中文转成 \uXXXX），避免 Windows 上 Blender 的标准输出编码问题
     print(MARK_BEGIN + json.dumps(result, ensure_ascii=True, default=str) + MARK_END)

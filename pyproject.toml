@@ -3,9 +3,12 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "cowork-runtime"
+name = "rightofway"
 version = "0.4.0"
-description = "人机同时协作协议（Cowork Protocol）的参考实现"
+description = "RightOfWay: a runtime that keeps AI agents from overwriting human edits"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+authors = [{name = "Yuan"}]
 requires-python = ">=3.10"
 dependencies = []
 
@@ -17,7 +20,7 @@ blender = ["bpy>=4.2; python_version == '3.11'"]
 unity = ["mcp>=1.2"]
 
 [tool.setuptools.packages.find]
-include = ["cowork*"]
+include = ["rightofway*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -25,4 +28,4 @@ pythonpath = [".", "tests"]
 addopts = "-v"
 
 [tool.setuptools.package-data]
-"cowork.unity" = ["*.cs.txt"]
+"rightofway.unity" = ["*.cs.txt"]

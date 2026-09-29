@@ -27,11 +27,11 @@ import argparse
 import threading
 import time
 
-from cowork.blender.bridge import BridgeError, InProcessBridge, SocketBridge
-from cowork.blender.evaluate import evaluate
-from cowork.blender.records import label
-from cowork.blender.shared_session import SharedSession
-from cowork.runtime import POLICY_CANDIDATE, POLICY_DISCARD, Runtime
+from rightofway.blender.bridge import BridgeError, InProcessBridge, SocketBridge
+from rightofway.blender.evaluate import evaluate
+from rightofway.blender.records import label
+from rightofway.blender.shared_session import SharedSession
+from rightofway.runtime import POLICY_CANDIDATE, POLICY_DISCARD, Runtime
 from experiments import scenario_tree as sc
 from experiments.common import banner, say, use_utf8_console, wait_for_human, write_row
 
@@ -65,10 +65,10 @@ def main(argv=None) -> None:
 
     if args.backend == "socket":
         bridge = SocketBridge(args.host, args.port)
-        scene = "Cowork实验_" + time.strftime("%H%M%S")
+        scene = "RightOfWay实验_" + time.strftime("%H%M%S")
         try:
             if not args.keep_old_scenes:
-                old = bridge.call("cleanup_scenes", {"prefix": "Cowork实验_"})
+                old = bridge.call("cleanup_scenes", {"prefix": "RightOfWay实验_"})
                 if old["scenes"]:
                     print(f"已删除之前实验留下的 {len(old['scenes'])} 个场景和 {old['objects']} 个对象"
                           "（避免同名对象变成 .001、.002）。不想删除可以加 --keep-old-scenes。")

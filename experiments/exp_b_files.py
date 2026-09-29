@@ -27,11 +27,11 @@ import shutil
 import time
 from pathlib import Path
 
-from cowork.blender.bridge import BridgeError, make_file_runner
-from cowork.blender.evaluate import evaluate
-from cowork.blender.filemerge import FileMergeSession
-from cowork.blender.records import label
-from cowork.runtime import POLICY_CANDIDATE, POLICY_DISCARD, Runtime
+from rightofway.blender.bridge import BridgeError, make_file_runner
+from rightofway.blender.evaluate import evaluate
+from rightofway.blender.filemerge import FileMergeSession
+from rightofway.blender.records import label
+from rightofway.runtime import POLICY_CANDIDATE, POLICY_DISCARD, Runtime
 from experiments import scenario_tree as sc
 from experiments.common import banner, say, use_utf8_console, wait_for_human, write_row
 
@@ -62,8 +62,8 @@ def main(argv=None) -> None:
     s = FileMergeSession(rt, runner, work / "scene.blend", granularity=args.granularity)
     gran = "按面" if args.granularity == "aspect" else "按对象"
     s.start()
-    ai_memory = work / ".cowork" / "ai_memory.blend"          # AI 的 Blender 内存里的状态
-    human_memory = work / ".cowork" / "human_memory.blend"    # 模拟人没有重新打开文件时内存里的状态
+    ai_memory = work / ".rightofway" / "ai_memory.blend"          # AI 的 Blender 内存里的状态
+    human_memory = work / ".rightofway" / "human_memory.blend"    # 模拟人没有重新打开文件时内存里的状态
     real = args.human == "real"
 
     banner(f"实验 B：各自一份，存盘合并（{gran}，人：{'真人' if real else '模拟'}）")

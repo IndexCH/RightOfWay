@@ -1,7 +1,7 @@
 """I 类：观察与追溯（R19、R20），以及身份（R1）。"""
 import pytest
 
-from cowork import ActorKind, OpStatus, ProtocolError
+from rightofway import ActorKind, OpStatus, ProtocolError
 from helpers import AGENT, HUMAN, agent_op, make_runtime, submit
 
 

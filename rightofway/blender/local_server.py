@@ -6,7 +6,7 @@
 用途：在没有 Blender 界面的地方（云端、自动测试）跑需要两个 Blender 的实验（实验 B 实时同步版）。
 每个进程是一个独立的 Blender，互相看不到对方的数据，和真的开两个 Blender 一样。需要 Python 3.11 + pip install bpy。
 
-    python -m cowork.blender.local_server --port 9877
+    python -m rightofway.blender.local_server --port 9877
 """
 from __future__ import annotations
 
@@ -61,7 +61,7 @@ def serve(port: int, host: str = "127.0.0.1") -> None:
 
 def spawn(port: int, timeout: float = 60.0) -> subprocess.Popen:
     """在后台起一个本地 Blender（bpy）进程，等它准备好。"""
-    proc = subprocess.Popen([sys.executable, "-m", "cowork.blender.local_server", "--port", str(port)],
+    proc = subprocess.Popen([sys.executable, "-m", "rightofway.blender.local_server", "--port", str(port)],
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8")
     t0 = time.time()
     while time.time() - t0 < timeout:

@@ -69,10 +69,10 @@ def mesh_object(name, kind, size, location, mat=None, parent=None):
 
 _AI_BUILD = r'''
 # AI 第一步：布置场景
-# 材质名加 Cowork_ 前缀，避免改到你自己项目里同名的材质
-bark = material("Cowork_Bark", (0.35, 0.2, 0.1, 1))
-leaf = material("Cowork_Leaf", (0.2, 0.6, 0.2, 1))
-stone = material("Cowork_Stone", (0.5, 0.5, 0.5, 1))
+# 材质名加 RightOfWay_ 前缀，避免改到你自己项目里同名的材质
+bark = material("RightOfWay_Bark", (0.35, 0.2, 0.1, 1))
+leaf = material("RightOfWay_Leaf", (0.2, 0.6, 0.2, 1))
+stone = material("RightOfWay_Stone", (0.5, 0.5, 0.5, 1))
 mesh_object("Ground", "plane", 10, (0, 0, 0))
 trunk = mesh_object("Trunk", "cylinder", 0.3, (0, 0, 1.2), bark)
 for i in range(5):
@@ -90,8 +90,8 @@ print("布置完成：地面、树干、5 片树叶、3 块石头、太阳光")
 
 _AI_ADJUST = r'''
 # AI 第二步：按自己之前看到的场景整体调整（它不知道人中途改了什么）
-material("Cowork_Leaf", (0.8, 0.45, 0.1, 1))     # 秋天：叶子变橙色（所有叶子共用这个材质）
-stone = material("Cowork_Stone", (0.5, 0.5, 0.5, 1))
+material("RightOfWay_Leaf", (0.8, 0.45, 0.1, 1))     # 秋天：叶子变橙色（所有叶子共用这个材质）
+stone = material("RightOfWay_Stone", (0.5, 0.5, 0.5, 1))
 obj("Trunk").scale = (1.3, 1.3, 1.3)               # 树干加粗
 for i in range(5):                                 # 叶子统一抬高到同一高度
     o = obj(f"Leaf_{i + 1}")
@@ -179,7 +179,7 @@ for i in range(5):
     o = obj(f"Leaf_{i + 1}")
     if o is not None:
         o.location.z = 1.6
-stone = material("Cowork_Stone", (0.5, 0.5, 0.5, 1))
+stone = material("RightOfWay_Stone", (0.5, 0.5, 0.5, 1))
 for i in range(3):
     name = f"Rock_{i + 1}"
     o = obj(name)
@@ -197,7 +197,7 @@ for o in list(scene.objects):
 
 _AI_LOOK = r'''
 # AI「材质」：按它第一次看到的场景做"秋天"的效果（它不知道布局 AI 和人后来改了什么）
-material("Cowork_Leaf", (0.8, 0.45, 0.1, 1))       # 叶子变橙色
+material("RightOfWay_Leaf", (0.8, 0.45, 0.1, 1))       # 叶子变橙色
 obj("Trunk").scale = (1.1, 1.1, 1.1)                # 顺手把树干调细一点——但布局 AI 已经改过树干了
 r1 = obj("Rock_1")
 if r1 is not None:

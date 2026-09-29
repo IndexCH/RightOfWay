@@ -1,5 +1,5 @@
 """F 类：失效范围与重跑（R12、R13）。"""
-from cowork import StepState, apply_collection_plan, plan_collection_update
+from rightofway import StepState, apply_collection_plan, plan_collection_update
 from helpers import AGENT, HUMAN, make_runtime, run_agent_step
 
 

@@ -1,5 +1,5 @@
 """A 类：过时结果与覆盖（R3、R4、R6、R7）。"""
-from cowork import OpStatus, POLICY_CANDIDATE, POLICY_MERGE, StepState
+from rightofway import OpStatus, POLICY_CANDIDATE, POLICY_MERGE, StepState
 from helpers import AGENT, HUMAN, agent_op, make_runtime, run_agent_step, submit
 
 

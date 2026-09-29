@@ -2,10 +2,11 @@
 
 | 项 | 内容 |
 |---|---|
-| 名称 | 暂名 Cowork Protocol |
+| 名称 | RightOfWay（v0.4 起；原暂名 Cowork Protocol） |
 | 版本 | 0.4-draft |
-| 状态 | 草案，已有参考实现（`cowork/`）、Blender 接入（`cowork/blender/`）和 Unity 接入（`cowork/unity/`），96 个自动测试全部通过 |
+| 状态 | 草案，已有参考实现（`rightofway/`）、Blender 接入（`rightofway/blender/`）和 Unity 接入（`rightofway/unity/`），96 个自动测试全部通过 |
 | 作者 | Yuan |
+| 许可 | 本规范文本采用 CC BY 4.0；参考实现采用 Apache-2.0 |
 | 日期 | 2026-09-28 |
 | 配套文件 | `scenarios/scenarios_v0.md`（一致性测试场景） |
 
@@ -567,13 +568,13 @@ Agent 用 computer use 时要点鼠标，必须有自己的屏幕，所以 MUST 
 
 愿意提供更好支持的应用 MAY 实现下面的扩展，用来提供实时变化通知和带基准版本的写入：
 
-- **扩展标识**：`io.github.<用户名>/cowork`，发布前确定。
+- **扩展标识**：`io.github.<用户名>/rightofway`，发布前确定。
 - **协商**：适配器在 `server/discover` 返回的 `capabilities.extensions` 里声明：
   ```json
-  "extensions": { "io.github.<用户名>/cowork": { "events": true, "baseVersionWrites": true, "granularity": "document" } }
+  "extensions": { "io.github.<用户名>/rightofway": { "events": true, "baseVersionWrites": true, "granularity": "document" } }
   ```
-- **能力元数据**：放在工具描述的 `_meta["io.github.<用户名>/cowork"]` 中（见 5.4）。它 SHOULD 与 MCP 已有的工具注解（只读、破坏性、幂等）保持一致。
-- **对象变化**：适配器用扩展定义的通知 `notifications/cowork/object_changed` 报告，字段与 `object/changed` 相同。是否改用 MCP 核心的资源订阅机制，还要对照 2026-07-28 版规范确认。
+- **能力元数据**：放在工具描述的 `_meta["io.github.<用户名>/rightofway"]` 中（见 5.4）。它 SHOULD 与 MCP 已有的工具注解（只读、破坏性、幂等）保持一致。
+- **对象变化**：适配器用扩展定义的通知 `notifications/rightofway/object_changed` 报告，字段与 `object/changed` 相同。是否改用 MCP 核心的资源订阅机制，还要对照 2026-07-28 版规范确认。
 - **带基准版本的写入**：运行时调用写入类工具时，在请求的 `_meta` 中带上 `baseVersion`。适配器如果发现会话里的实际版本与之不同，MUST 拒绝。这是权威在会话一侧时的第二道检查。
 - **长操作**：使用 MCP Tasks 扩展。任务状态和第 8.1 节的对应关系：
 
@@ -590,7 +591,7 @@ Agent 用 computer use 时要点鼠标，必须有自己的屏幕，所以 MUST 
 **运行时 → 界面：**
 - 步骤开始、结束：用 `StepStarted`、`StepFinished`。
 - 对象状态：用 `StateSnapshot`、`StateDelta`。状态中的每个对象都带 `version`、`occupancy`、`humanTouched`。
-- 占用、释放、结果作废、违反契约：用 `Custom` 事件，分别命名为 `cowork.occupancy_acquired`、`cowork.occupancy_released`、`cowork.result_discarded`、`cowork.contract_violation`。
+- 占用、释放、结果作废、违反契约：用 `Custom` 事件，分别命名为 `rightofway.occupancy_acquired`、`rightofway.occupancy_released`、`rightofway.result_discarded`、`rightofway.contract_violation`。
 - 副作用等级 3 的确认：用中断，`reason` 为 `confirmation`。
 
 **界面 → 运行时：**
@@ -604,7 +605,7 @@ Agent 用 computer use 时要点鼠标，必须有自己的屏幕，所以 MUST 
 - **应用有现成的执行代码或读取接口**：Agent 通过接口操作时用方式一，对象级（按面），实时；Agent 用 computer use 时用方式二，两边实时同步。
 - **应用没有接口，但文件能解析**：文件兜底，对象级，存盘时合并。
 - **文件也不能解析**：文件兜底，按整个文件比较。人改过的文件，Agent 的版本不采用或留作候选。
-- **界面不认识 `cowork.*` 事件**：MUST 仍能显示 AG-UI 的标准步骤和消息。规则照常由运行时执行，只是用户看不到占用等状态。
+- **界面不认识 `rightofway.*` 事件**：MUST 仍能显示 AG-UI 的标准步骤和消息。规则照常由运行时执行，只是用户看不到占用等状态。
 - **Agent 不了解本协议**：只要它的工具全部由运行时提供（R2），规则照样生效；它只会收到更多"被拒绝""没有生效"的结果。
 
 ---
@@ -677,7 +678,7 @@ Agent 用 computer use 时要点鼠标，必须有自己的屏幕，所以 MUST 
 3. **MCP 里对象变化用什么通知**：用扩展自定义的通知，还是用核心的资源订阅机制。
 4. **AG-UI 里用户发起的事件怎么走**：自建接口，还是推动 AG-UI 增加扩展。
 5. **"人碰过"标记何时自动清除**：除了交还和撤回，是否在工作结束时统一清除。
-6. **协议名称和扩展标识**。"Cowork"和 Anthropic 的产品 Claude Cowork 同名，GitHub 上也有一个无关的 COWORK Protocol，正式发布前应该改名。
+6. **协议名称和扩展标识**。名称已确定（v0.4）：原暂名 Cowork 和 Anthropic 的产品 Claude Cowork 同名，GitHub 上也有一个无关的 COWORK Protocol，现改名为 RightOfWay。MCP 扩展标识在提交到 MCP 社区前确定。
 7. **已解决（v0.4）**：~~方式二里"人故意改回旧版本"和"没有重新打开就存盘"无法区分~~。实时同步不需要判断；文件兜底优先读写进文件的起点编号。只有放不了编号的文件格式仍有这个问题。
 8. **Agent 新建与人删掉的对象同名的对象**：运行时只能提示，不能判断是不是"同一个东西"。
 9. **共用的数据被 Agent 改了**（例如几个对象共用的材质）：人碰过的对象恢复后会得到一份私有副本，和其他对象不再共用。
@@ -695,11 +696,11 @@ Agent 用 computer use 时要点鼠标，必须有自己的屏幕，所以 MUST 
 
 ## 16 参考实现
 
-参考实现位于本仓库的 `cowork/` 目录，纯 Python，核心部分无第三方依赖：
+参考实现位于本仓库的 `rightofway/` 目录，纯 Python，核心部分无第三方依赖：
 
-- `cowork/runtime.py` 实现第 6 节的 R1–R21；R22、R23 在接入层（`cowork/blender/shared_session.py`）实现。`tests/` 下共 96 个测试，其中 40 个覆盖 `scenarios_v0.md` 中 A–I 类场景。
-- `cowork/unity/` 是 Unity 接入，不需要修改 Unity 或它的 MCP：`UnitySide.cs.txt` 是在 Unity 里运行的 C#，通过 Unity AI Assistant 的 `Unity_RunCommand` 执行；`bridge.py` 负责生成代码、解析结果、连接 Unity 的 MCP 中继。运行时一侧直接复用 Blender 的 `SharedSession`。
-- `cowork/blender/` 是 Blender 接入，不需要修改 Blender 或它的 MCP 插件：
+- `rightofway/runtime.py` 实现第 6 节的 R1–R21；R22、R23 在接入层（`rightofway/blender/shared_session.py`）实现。`tests/` 下共 96 个测试，其中 40 个覆盖 `scenarios_v0.md` 中 A–I 类场景。
+- `rightofway/unity/` 是 Unity 接入，不需要修改 Unity 或它的 MCP：`UnitySide.cs.txt` 是在 Unity 里运行的 C#，通过 Unity AI Assistant 的 `Unity_RunCommand` 执行；`bridge.py` 负责生成代码、解析结果、连接 Unity 的 MCP 中继。运行时一侧直接复用 Blender 的 `SharedSession`。
+- `rightofway/blender/` 是 Blender 接入，不需要修改 Blender 或它的 MCP 插件：
   - `blender_side.py`：在 Blender 里运行的代码（编号、指纹、保护/恢复、合并）。方式一、方式二通过现成 Blender MCP 插件的 `execute_code` 发进去，文件兜底在无界面 Blender 里执行。
   - `shared_session.py`：方式一（9.3），包括每个 Agent 的视图、告知（R22）、多个 Agent 和预留（R23）、选中即占用。
   - `live_sync.py`：方式二，实时同步（9.4）。

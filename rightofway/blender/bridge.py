@@ -24,8 +24,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 SOURCE_PATH = Path(__file__).with_name("blender_side.py")
-MARK_BEGIN = "<<<COWORK_JSON>>>"
-MARK_END = "<<<COWORK_END>>>"
+MARK_BEGIN = "<<<RIGHTOFWAY_JSON>>>"
+MARK_END = "<<<RIGHTOFWAY_END>>>"
 
 
 class BridgeError(RuntimeError):
@@ -39,7 +39,7 @@ def blender_source() -> str:
 def build_call(fn: str, args: dict) -> str:
     """blender_side.py 的全部源码，末尾加一行调用。参数先转成 JSON 字符串再嵌进去。"""
     payload = json.dumps(json.dumps(args, ensure_ascii=True))   # 纯 ASCII，路径和中文都转义
-    return blender_source() + f"\n\n_cowork_out({fn}(json.loads({payload})))\n"
+    return blender_source() + f"\n\n_rightofway_out({fn}(json.loads({payload})))\n"
 
 
 def parse_output(text: str) -> dict:

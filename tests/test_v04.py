@@ -10,8 +10,8 @@ import socket
 
 import pytest
 
-from cowork.blender.changes import describe_changes
-from cowork.blender.records import unit_id
+from rightofway.blender.changes import describe_changes
+from rightofway.blender.records import unit_id
 
 
 # ---------------------------------------------------------------------------
@@ -40,13 +40,13 @@ def test_describe_changes_with_values():
 # ---------------------------------------------------------------------------
 bpy = pytest.importorskip("bpy")
 
-from cowork.blender import local_server  # noqa: E402
-from cowork.blender.bridge import InProcessBridge, SocketBridge  # noqa: E402
-from cowork.blender.evaluate import evaluate  # noqa: E402
-from cowork.blender.filemerge import FileMergeSession  # noqa: E402
-from cowork.blender.live_sync import LiveSyncSession  # noqa: E402
-from cowork.blender.shared_session import R_OTHER_AI, R_RESERVED, R_SELECTED, SharedSession  # noqa: E402
-from cowork.runtime import Runtime  # noqa: E402
+from rightofway.blender import local_server  # noqa: E402
+from rightofway.blender.bridge import InProcessBridge, SocketBridge  # noqa: E402
+from rightofway.blender.evaluate import evaluate  # noqa: E402
+from rightofway.blender.filemerge import FileMergeSession  # noqa: E402
+from rightofway.blender.live_sync import LiveSyncSession  # noqa: E402
+from rightofway.blender.shared_session import R_OTHER_AI, R_RESERVED, R_SELECTED, SharedSession  # noqa: E402
+from rightofway.runtime import Runtime  # noqa: E402
 from experiments import scenario_tree as sc  # noqa: E402
 
 
@@ -214,7 +214,7 @@ def test_file_stamp_distinguishes_deliberate_revert(br, tmp_path):
     assert r2.ai_base_from == "编号"
     shutil.copyfile(s.history[1].path, s.human_path)                  # 人的文件内容回到第 1 版的样子……
     br.call("edit_file", {"path": str(s.human_path),
-                          "code": f'import bpy\nbpy.context.scene["cowork_base"] = "{s.session_id}:2"'})   # ……但它是从第 2 版打开的
+                          "code": f'import bpy\nbpy.context.scene["rightofway_base"] = "{s.session_id}:2"'})   # ……但它是从第 2 版打开的
     r3 = s.sync()
     assert (r3.human_base, r3.human_base_from) == (2, "编号")
     trunk = by_name(r3.final, "Trunk")

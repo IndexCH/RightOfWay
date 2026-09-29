@@ -6,15 +6,15 @@ import threading
 
 import pytest
 
-from cowork.blender.bridge import MARK_BEGIN, MARK_END, BridgeError, SocketBridge
-from cowork.blender.filemerge import MergeVersion, check_result, infer_base, plan_merge
-from cowork.blender.records import diff_records, units
+from rightofway.blender.bridge import MARK_BEGIN, MARK_END, BridgeError, SocketBridge
+from rightofway.blender.filemerge import MergeVersion, check_result, infer_base, plan_merge
+from rightofway.blender.records import diff_records, units
 
 # 面的名字由观察那一层决定，运行时不认识任何一个。这里随便取几个，和 Blender 的属性名一样
 FACES = ("location", "scale", "data", "material_slots", "modifiers", "name")
-from cowork.blender.shared_session import SharedSession
-from cowork.model import OpStatus
-from cowork.runtime import Runtime
+from rightofway.blender.shared_session import SharedSession
+from rightofway.model import OpStatus
+from rightofway.runtime import Runtime
 
 
 def rec(cid, name, cfp, **aspects):
@@ -216,7 +216,7 @@ def test_socket_bridge_roundtrip():
     res = SocketBridge(port=port, timeout=5).call("poll", {})
     assert res == {"records": {}}
     assert got["request"]["type"] == "execute_code"
-    assert "_cowork_out(poll(" in got["request"]["params"]["code"]
+    assert "_rightofway_out(poll(" in got["request"]["params"]["code"]
 
 
 def test_socket_bridge_error_status():

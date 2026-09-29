@@ -6,15 +6,15 @@ from pathlib import Path
 
 import pytest
 
-from cowork.unity.bridge import (NeedResponse, ReplayTransport, UnityBridge, UnityError, build_command,
+from rightofway.unity.bridge import (NeedResponse, ReplayTransport, UnityBridge, UnityError, build_command,
                                  parse_tool_output)
-from cowork.unity.selftest import build_selftest
+from rightofway.unity.selftest import build_selftest
 from experiments import scenario_unity as su
 
 # 真实 Unity 6.4 返回的格式（内容缩短）
 REAL = json.dumps({"success": True, "message": "Command executed successfully.", "data": {
     "isCompilationSuccessful": True, "isExecutionSuccessful": True, "executionId": 1, "compilationLogs": "",
-    "executionLogs": "[Log] [<<<COWORK_JSON>>>{\"records\":{},\"labels\":{\"m_Name\":\"Name\"}}<<<COWORK_END>>>]"}})
+    "executionLogs": "[Log] [<<<RIGHTOFWAY_JSON>>>{\"records\":{},\"labels\":{\"m_Name\":\"Name\"}}<<<RIGHTOFWAY_END>>>]"}})
 COMPILE_FAIL = json.dumps({"success": False, "error": "COMPILATION_FAILED: Code failed to compile.", "data": {
     "isCompilationSuccessful": False, "isExecutionSuccessful": False,
     "compilationLogs": "- Error Error CS0019: Operator '==' cannot be applied (Line: 542)"}})
@@ -30,7 +30,7 @@ def test_parse_compile_failure():
 
 
 def test_parse_error_status():
-    logs = "[Log] [<<<COWORK_JSON>>>{\"status\":\"error\",\"error\":\"boom\"}<<<COWORK_END>>>]"
+    logs = "[Log] [<<<RIGHTOFWAY_JSON>>>{\"status\":\"error\",\"error\":\"boom\"}<<<RIGHTOFWAY_END>>>]"
     with pytest.raises(UnityError, match="boom"):
         parse_tool_output(json.dumps({"data": {"isCompilationSuccessful": True, "executionLogs": logs}}))
 
@@ -86,7 +86,7 @@ def test_replay_transport(tmp_path):
 
 def test_relay_transport_with_fake_mcp_server():
     pytest.importorskip("mcp")
-    from cowork.unity.bridge import RelayTransport
+    from rightofway.unity.bridge import RelayTransport
     server = Path(__file__).parent / "fixtures" / "fake_unity_mcp.py"
     t = RelayTransport(command=[sys.executable, str(server)], timeout=60)
     try:

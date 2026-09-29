@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Iterable, Optional
 
-from cowork import ActorKind, CapabilityMeta, Operation, Runtime, Target
+from rightofway import ActorKind, CapabilityMeta, Operation, Runtime, Target
 
 HUMAN = "yuan"
 HUMAN2 = "bob"

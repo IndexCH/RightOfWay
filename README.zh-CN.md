@@ -93,7 +93,7 @@ python -m experiments.run_all --human real  # 由你在 Blender / Unity 里做�
 ## 目录
 
 ```
-cowork/                  运行时（Python 包名暂时还叫 cowork，之后会改）
+rightofway/              运行时（Python 包）
 ├── runtime.py           协议规则 R1–R21
 ├── blender/             Blender 接入：不修改 Blender，也不修改它的 MCP 插件
 │   ├── blender_side.py  在 Blender 里运行的代码（编号、指纹、值、保护/恢复、同步、合并）
@@ -135,7 +135,7 @@ docs/experiments.md      实验的详细步骤
 
 ## 许可证
 
-还没定。计划代码用 Apache-2.0，规范文本用 CC BY 4.0。在加上许可证文件之前，保留所有权利。
+代码采用 [Apache License 2.0](LICENSE)。`spec/` 和 `docs/` 下的规范和文档采用 [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/deed.zh-hans)。
 
 ## 作者
 
