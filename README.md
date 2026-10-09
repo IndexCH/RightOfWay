@@ -6,7 +6,7 @@ RightOfWay is a protocol and reference runtime for humans and AI agents editing 
 
 It needs no changes to the application. It works through what the application already offers: existing MCP servers (Blender MCP, Unity MCP) or plain files.
 
-> **Status: research preview.** The rules, the runtime, and the Blender/Unity integrations work and are tested. The MCP proxy that puts RightOfWay in front of Claude Desktop or any MCP client works too, and has been run against the real BlenderMCP server. The agents in the experiments are still scripted, not real LLMs. The spec is currently written in Chinese; an English version is planned.
+> **Status: research preview.** The rules, the runtime, and the Blender integration work and are tested. The MCP proxy that puts RightOfWay in front of Claude Desktop or any MCP client works too, and has been run against the real BlenderMCP server. The v0.4 Unity integration ran in Unity; the v0.5 changes to it haven't been verified in Unity yet. The agents in the experiments are still scripted, not real LLMs. The spec is currently written in Chinese; an English version is planned.
 >
 > 中文说明见 [README.zh-CN.md](README.zh-CN.md)。
 
@@ -54,19 +54,71 @@ Behind all of them: the rules are decided in one place, the runtime. The full li
 
 ## How it works
 
-```
- agent ──► RightOfWay (MCP proxy + runtime) ──► existing MCP server ──► app (Blender, Unity, …)
-                 ▲                                          │
-                 └────────── observes human edits ◄─────────┘
+```mermaid
+flowchart LR
+    AI["AI client<br/>Claude Desktop etc."] -- MCP --> P["RightOfWay proxy<br/>session layer + runtime"]
+    P -- MCP --> S["the app's existing MCP server<br/>e.g. BlenderMCP"]
+    S --> A["the app's add-on<br/>runs the integration code sent in"]
+    H["Human"] -- edits directly in the app --> A
 ```
 
-Every agent action goes through the runtime. Inside the app, in one atomic step, the runtime snapshots whatever is protected, runs the agent's code, compares before and after, and restores only the protected faces the agent touched. Human edits are found by fingerprinting each face of each object and comparing over time. What an integration can do (restore a face, restore a deletion, how the app renames duplicates…) isn't hand-declared: it is measured at connection time in a throwaway scene, and calls whose effect can't be undone are refused before they run.
+RightOfWay's code runs in two places:
+
+- **In the proxy process.** The AI client connects only here. The session layer (`rightofway/proxy`, `blender/shared_session.py`) routes each tool call into the pipeline below and writes the feedback for the agent. The runtime (`runtime.py`) holds the ledger and the rules, and is the only place that decides.
+- **Inside the app.** The integration code (`blender/blender_side.py` plus `identity.py`) carries out the permit and reports the actual state. It isn't installed: it is sent in with every call through the app's existing code-execution tool, so neither the app nor its add-on changes.
+
+Here is one code-execution call, using the story from the experiments: the human moves Leaf_3 and deletes Rock_2, then the agent clears and rebuilds the scene without looking first.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant AI as AI client
+    participant P as Proxy (session layer)
+    participant R as Runtime
+    participant A as App (add-on + integration code)
+    actor H as Human
+    H->>A: moves Leaf_3, deletes Rock_2
+    AI->>P: execute code (clear and rebuild)
+    P->>R: admit
+    R-->>P: permit
+    P->>A: run_agent (permit + expected fingerprints)
+    A-->>P: fingerprints differ, nothing run, current state returned
+    P->>R: record the human's edits, admit again
+    R-->>P: new permit (keep Leaf_3's location, Trunk can't be deleted, tombstone Rock_2, re-identification rule)
+    P->>A: run_agent (new permit)
+    Note over A: snapshot what must be kept, run the code atomically,<br/>re-identify deleted-and-recreated objects,<br/>restore the human's faces, remove the recreated Rock_2
+    A-->>P: before, after and final state + re-identification
+    P->>R: settle
+    Note over R: recompute re-identification, classify each face<br/>as applied, kept or breach, record the final state<br/>(ledger = scene), count repeated refusals
+    R-->>P: settlement
+    P-->>AI: feedback (what didn't land, current values as the new target) + isError
+    opt breach, re-identification mismatch, or a loop
+        P->>A: notify
+        A-->>H: alert shown in the app
+    end
+```
+
+- **How your edits reach the ledger (steps 5–8).** The proxy doesn't poll in the background. Every execution carries the fingerprints the runtime expects; if they don't match, nothing runs and the current state comes back (optimistic concurrency). The session layer records the difference as your edits and asks for a new permit, up to 3 retries. Reading the scene (read-only tools, `rightofway_observe`) also picks up your edits.
+- **The permit (step 8)** lists the faces to keep (edited by you, or recently changed by or reserved for another agent), the ancestors that can't be deleted, tombstones (objects you deleted that this agent hasn't seen deleted yet), and the re-identification rule.
+- **Execution (steps 9–10)** runs in one go on the app's main thread, so you can't interleave with it and every change in between is the agent's.
+- **Settlement (steps 11–12)** looks only at the actual state, never at what the permit hoped for. A face that had to be kept and is unchanged is kept; one that changed is a breach, recorded as it happened, and you are alerted and the agent is paused. Every other face is committed from the final state. The ledger's unit is a face: each property of each object, plus each property of the materials, meshes and other data blocks it uses. The integration pairs re-identified objects; the runtime recomputes the pairing with the same rule from `identity.py` and checks it.
+- **Feedback (steps 13–15)** is generated only from the settlement: text for the model in `content`, the structured result in `_meta.rightofway`, and `isError=true` whenever part of the call didn't land.
+
+Besides code execution, the proxy handles two other kinds of call:
+
+- **The app MCP server's other tools.** The proxy can't know which faces such a tool changes, so object names appearing in its arguments are taken as its targets. The call is prechecked per object and refused up front if a whole object has to be kept or the app couldn't undo the call afterwards; otherwise it runs between the integration's `begin_agent` and `finish_agent` and is settled the same way. This path isn't atomic.
+- **The proxy's own small tools** (`rightofway_set_property`, `rightofway_create_object`, `rightofway_delete_object`) are checked per face before they run, with forbidden faces dropped, then compiled into a script and sent through the same `run_agent`. `rightofway_observe` tells the agent what it missed and what it can't change right now.
+
+What an integration can do (restore a face, restore a deletion, wrap a tool call, how duplicates are renamed) isn't hand-declared: at connection time it is tried in a throwaway scene with the same code used for real calls. The runtime uses the result to decide whether to re-identify and which calls to refuse up front.
 
 | | Mode 1: shared copy | Mode 2: separate windows, live sync | File fallback |
 |---|---|---|---|
 | Agent works through | scripts / MCP tools | computer use (mouse and keyboard) | computer use; app has no interface |
 | Rules applied | on every agent action | on every sync (after each agent step) | on every save |
 | What the human has to do | nothing | nothing | save, then reopen the file |
+| Uses the pipeline above | yes | not yet: per-unit submit, per object | not yet: per-unit submit, per object |
+
+Design details are in [spec/design_v0.5.md](spec/design_v0.5.md), and a plain-language walkthrough of the protocol in [docs/overview.md](docs/overview.md) (both in Chinese).
 
 ## Results so far
 
@@ -88,7 +140,7 @@ Same task in experiments A–D: the agent builds a small scene (tree, leaves, ro
 
 **Invariants:** every protected run of A, B, D, E and P passes all three. In E with the simulated Unity integration the leaf is lost, because that integration can't undo a deletion; the runtime records it as a breach, tells the agent and you, and pauses the agent. The file fallback is not covered by the invariant checks yet.
 
-The Unity integration was checked in a real Unity 6.4 editor through Unity's own MCP: the human's leaf height survived, the agent's autumn colour applied, a selected object was left alone, and nothing outside the experiment scene changed (57 tracked objects, about 0.07 s per agent step).
+The v0.4 Unity integration was checked in a real Unity 6.4 editor through Unity's own MCP: the human's leaf height survived, the agent's autumn colour applied, a selected object was left alone, and nothing outside the experiment scene changed (57 tracked objects, about 0.07 s per agent step). The Unity integration code changed in v0.5 (executing the runtime's permit, the connection self-test) hasn't been run in Unity yet; only its C# syntax is checked.
 
 ### Realistic agent habits (experiment H)
 
@@ -105,13 +157,13 @@ When you delete an object and the agent's step would put it back (3 of 11 deleti
 
 ### Known issues
 
-- **Unity can't restore an object the agent deleted yet.** This is reported truthfully: the runtime records the deletion as it actually happened, marks it as a breach, alerts you, and pauses the agent until you resume it. A hidden-backup restore for Unity is the next step. The Unity side also lacks re-identification, wrapping of typed tool calls and in-app alerts; those work in Blender and the simulated apps, and Unity's self-test reports truthfully that it doesn't have them.
+- **Unity can't restore an object the agent deleted yet.** This is reported truthfully: the runtime records the deletion as it actually happened, marks it as a breach, alerts you, and pauses the agent until you resume it. A hidden-backup restore for Unity is the next step. The Unity side also lacks re-identification, wrapping of typed tool calls and in-app alerts; those work in Blender and the simulated apps. Unity's connection self-test is written to report that it lacks them, but like the rest of the v0.5 Unity changes it hasn't been run in Unity yet.
 - **The MCP proxy's handling of the app's own typed tools is not atomic.** It checks before and after the call, so anything you change in the app in between is attributed to the agent. Code-execution tools and the proxy's own small tools (`rightofway_set_property` etc.) are atomic.
 - **Derived changes and intent conflicts are reported, not fixed.** If a leaf is restored to the height you set, a bird the agent placed above it may float in mid-air: the agent is told to treat the leaf's current height as the target and recheck, but the runtime doesn't move the bird.
 
 Fixed on 2026-10-09: clear-and-rebuild breaking object identity (re-identification, on by default); agents rebuilding objects you deleted (blocked); deleting the parent of an object you edited (ancestors can't be deleted); a shared material split into a private copy per object (shared data blocks are units of their own). Fixed in v0.5 step 3: deleting an object you touched is judged for the whole object, so the agent is no longer told the deletion partly took effect.
 
-**Not verified yet:** real LLM agents, a real computer-use agent, live sync between two Blender GUIs, edit mode and Ctrl+Z in the Blender GUI, and large scenes.
+**Not verified yet:** the v0.5 Unity integration code (experiments C and E need rerunning in Unity), real LLM agents, a real computer-use agent, live sync between two Blender GUIs, edit mode and Ctrl+Z in the Blender GUI, and large scenes.
 
 ## Quick start
 
@@ -156,8 +208,8 @@ rightofway/              runtime (Python package)
 ├── fakeapp.py           an in-memory app speaking the same protocol (code or typed commands), for tests without Blender or Unity
 ├── proxy/               MCP proxy: python -m rightofway.proxy -- <command that starts the app's MCP server>
 ├── blender/             Blender integration: no changes to Blender or its MCP add-on
-│   ├── blender_side.py  code that runs inside Blender (ids, fingerprints, values, protect/restore, sync, merge)
-│   ├── shared_session.py  mode 1: per-agent views, "what you missed" (R22), multiple agents (R23)
+│   ├── blender_side.py  integration code sent into Blender with each call: carries out the permit, re-identifies, restores, reports the actual state; also sync and merge
+│   ├── shared_session.py  session layer (mode 1): runs each call through the pipeline; per-agent views, "what you missed" (R22), multiple agents (R23)
 │   ├── commands.py      typed commands compiled into Blender scripts (for the proxy's small tools)
 │   ├── live_sync.py     mode 2: separate windows, live sync
 │   ├── filemerge.py     file fallback: per-object three-way merge
@@ -186,7 +238,7 @@ Details and sources are in [spec/related_work.md](spec/related_work.md).
 
 ## Roadmap
 
-0. **v0.5 architecture** ([design](spec/design_v0.5.md)): every operation goes through one pipeline (permit → execute → verify → commit → report), with invariant checks that the scene, the record and the feedback agree. Steps 1–3 are done, and so is the hardening suggested by the survey of similar systems (re-identification, blocking recreations, protected ancestors, shared data blocks, feedback with the new targets, loop detection, capability probing; section 13). Next is the Unity side: hidden-backup restore and re-identification.
+0. **v0.5 architecture** ([design](spec/design_v0.5.md)): every operation goes through one pipeline (permit → execute → verify → commit → report), with invariant checks that the scene, the record and the feedback agree. Steps 1–3 are done, and so is the hardening suggested by the survey of similar systems (re-identification, blocking recreations, protected ancestors, shared data blocks, feedback with the new targets, loop detection, capability probing; section 13). Next is the Unity side: rerun experiments C and E in Unity to verify the v0.5 changes, then hidden-backup restore and re-identification.
 1. **MCP proxy**: done (`python -m rightofway.proxy`). Next: real LLM agents through Claude Desktop, compared against prompt-only protection.
 2. Shadow execution (trialled: same outcomes, 4–5× slower per step) is kept for apps that can't undo changes.
 3. A real computer-use agent on its own desktop, connected to live sync.
