@@ -33,7 +33,8 @@ from rightofway.blender.records import label
 from rightofway.blender.shared_session import SharedSession
 from rightofway.runtime import POLICY_CANDIDATE, POLICY_DISCARD, Runtime
 from experiments import scenario_tree as sc
-from experiments.common import banner, say, use_utf8_console, wait_for_human, write_row
+from experiments.common import (InvariantLog, banner, breach_objects, say, say_alert, use_utf8_console,
+                                wait_for_human, write_row)
 
 _SETUP = '''
 import bpy
@@ -85,6 +86,7 @@ def main(argv=None) -> None:
     session = SharedSession(rt, bridge, scene=scene, granularity=args.granularity,
                             occupy_selection=args.occupy_selection)
     session.start()
+    inv = InvariantLog(protect)
 
     gran = "按面" if args.granularity == "aspect" else "按对象"
     variant = (f"有保护（{gran}）" if protect else "对照组：没有保护") + \
@@ -95,6 +97,7 @@ def main(argv=None) -> None:
     say("ai", "第 1 步：布置场景")
     r1 = session.run_agent(sc.ai_build(scene), "build", protect=protect)
     say("rt", r1.text)
+    inv.after_run(session, r1)
 
     # 2. 人修改
     detect_seconds = None
@@ -139,15 +142,20 @@ def main(argv=None) -> None:
         say("rt", r2.text)
         return
     say("rt", "回给 AI 的说明：\n" + r2.text)
+    say_alert(r2)
+    inv.after_run(session, r2)
 
     # 4. 检查
-    final = bridge.call("poll", {"scene": scene} if scene else {})["records"]
+    inv.at_end(session)
+    final = session.scene_records()
     ev = evaluate(rt, final, session.human, granularity=args.granularity, labels=session.labels)
     errors = len(r2.inexact) + len(r2.dangling)
     outside = sum(len(v) for v in r2.outside.values())
     banner("结果")
     say("info", ev.summary())
-    say("info", f"AI 新建的对象和人删掉的对象同名：{len(r2.resurrections)} 个 {r2.resurrections or ''}")
+    say("info", inv.summary())
+    say("info", f"AI 新建的对象和人删掉的对象同名：{len(r2.resurrections)} 个 {r2.resurrections or ''}"
+                + (f"；补回人删掉的对象被拦下：{'、'.join(r2.recreate_blocked)}" if r2.recreate_blocked else ""))
     undo = "已推送（能不能单独撤掉这一段，要在 Blender 界面里按 Ctrl+Z 确认）" if r2.undo_pushed else "没有推送（无界面模式或失败）"
     say("info", f"恢复出错：{errors} 处；AI 候选：{len(r2.candidates)} 个；Ctrl+Z 撤销步：{undo}")
     if r2.partial and protect:
@@ -163,11 +171,13 @@ def main(argv=None) -> None:
             "实验": "A 同一份", "做法": variant,
             "人": "真人" if args.human == "real" else "模拟",
             "人的修改被覆盖": len(ev.human_overwritten), "AI的修改丢失": len(ev.ai_lost),
-            "被删对象被AI重建": len(r2.resurrections), "恢复或合并出错": errors,
+            "被删对象被AI重建": len(r2.resurrections), "恢复或合并出错": errors, "不变量违反": inv.column(),
+            "违规": breach_objects([r1, r2]) if protect else "—",
             "AI候选": len(r2.candidates), "AI修改生效": len(r2.committed), "AI修改未采用": len(r2.skipped),
             "人看到AI结果要等(秒)": r2.seconds,
             "备注": (f"发现人的修改用时 {detect_seconds} 秒" if detect_seconds is not None else f"轮询间隔 {args.poll} 秒")
             + (f"；部分生效 {len(r2.partial)} 个对象" if r2.partial else "")
+            + (f"；补回人删掉的对象被拦下 {len(r2.recreate_blocked)} 个" if r2.recreate_blocked else "")
             + (f"；改到场景外 {outside} 个对象" if outside else ""),
         })
         say("info", f"结果已追加到 {path}")

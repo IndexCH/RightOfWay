@@ -86,7 +86,7 @@ def test_observe_updates_the_agent_view(br):
     assert s.observe().lines == []                        # 看过了，就没有新变化
     rep = s.run_agent(sc.ai_adjust(scene=None, skip=["Rock_2"]), "adjust")
     assert rep.missed == [] and rep.resurrections == []   # 读了提示的 AI 不再补回人删掉的石头
-    ev = evaluate(rt, br.call("poll", {})["records"], s.human, granularity="aspect", labels=s.labels)
+    ev = evaluate(rt, s.scene_records(), s.human, granularity="aspect", labels=s.labels)
     assert ev.human_overwritten == [] and ev.ai_lost == []
 
 
@@ -110,7 +110,7 @@ def test_two_agents_later_one_yields_and_gets_reservation(br):
     r_retry = s.run_agent(sc.ai_look_retry(), "retry", agent="look")
     assert r_retry.skipped == [] and s.values[trunk]["scale"] == "(1.2, 1.2, 1.2)"
     assert s.reservations == {}
-    ev = evaluate(rt, br.call("poll", {})["records"], s.human, granularity="aspect", labels=s.labels)
+    ev = evaluate(rt, s.scene_records(), s.human, granularity="aspect", labels=s.labels)
     assert ev.human_overwritten == [] and ev.ai_lost == []
 
 

@@ -59,7 +59,8 @@ def _syntax_errors(src: str) -> list:
 
 
 @pytest.mark.parametrize("fn,code", [("setup", ""), ("poll", ""), ("run_agent", su.AI_BUILD),
-                                     ("run_agent", su.AI_ADJUST), ("exec", su.HUMAN_SIM)])
+                                     ("run_agent", su.AI_ADJUST), ("exec", su.HUMAN_SIM),
+                                     ("run_agent", su.AI_DELETE_LEAF3), ("exec", su.HUMAN_MOVE_LEAF3)])
 def test_generated_csharp_parses(fn, code):
     assert _syntax_errors(build_command(fn, {"scene_handle": "1"}, code)) == []
 

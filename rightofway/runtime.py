@@ -10,8 +10,11 @@
 """
 from __future__ import annotations
 
+import time
 from typing import Any, Callable, Iterable, Optional
 
+from .identity import suffix_pattern
+from .identity import verify as verify_identity
 from .merge import three_way_merge
 from .model import (
     Actor,
@@ -21,16 +24,24 @@ from .model import (
     CapabilityMeta,
     Channel,
     Event,
+    KEEP_HUMAN,
+    KEEP_OTHER,
+    KEEP_OTHER_AGENT,
+    KEEP_RESERVED,
+    KEEP_SELECTED,
     HumanTouched,
     ObjectState,
     Occupancy,
     Operation,
     OpResult,
     OpStatus,
+    Permit,
+    Settlement,
     Step,
     StepState,
     Target,
     VersionRecord,
+    group_of,
 )
 
 # 仍在进行中的操作状态（步骤以此判断是否全部完成）
@@ -40,6 +51,7 @@ IN_FLIGHT = {OpStatus.QUEUED, OpStatus.PENDING_CONFIRMATION, OpStatus.EXECUTING,
 POLICY_DISCARD = "discard"      # 默认：丢弃 AI 的结果
 POLICY_CANDIDATE = "candidate"  # 另存为候选，不成为当前版本
 POLICY_MERGE = "merge"          # 可合并对象尝试三方合并，失败再丢弃
+REIDENTIFY_RULE = "name+type+parent"   # 认回同一个对象：同一个父对象下名字、类型一样（rightofway/identity.py）
 
 
 class ProtocolError(Exception):
@@ -51,9 +63,33 @@ class ObservationError(ProtocolError):
 
 
 class Runtime:
-    def __init__(self, human_touched_policy: str = POLICY_DISCARD) -> None:
+    def __init__(self, human_touched_policy: str = POLICY_DISCARD, selection_occupies: bool = False,
+                 reserve_seconds: float = 30.0, pause_on_breach: bool = True, reidentify: bool = True,
+                 loop_repeat: int = 3, loop_window: int = 5) -> None:
+        """reidentify：认回同一个对象（design_v0.5.md 12.4、12.5，默认打开）。一次执行里 Agent 删掉一个对象、
+        又新建了同一个父对象下名字（或去掉应用自动加的重名后缀后的名字）和类型都一样的对象时，按同一个对象处理：
+        新对象接过旧对象的编号。同一条规则还用来拦下"补回人删掉的对象"（墓碑）、
+        把"之前想删、因为人改过而保留下来的对象"和后来新建的同名对象认成一个。
+        只有接入代码在连接时的自测（learn_app）里说明支持，才会写进许可单。"""
         assert human_touched_policy in (POLICY_DISCARD, POLICY_CANDIDATE, POLICY_MERGE)
+        self.reidentify = reidentify
+        self.app: dict = {}                                   # 连接时探测出的应用能力（learn_app）
+        self.wanted_gone: dict[str, dict[str, dict]] = {}     # Agent → {它想删、因为人改过而保留下来的对象: 行}
+        self.identity_log: list[dict] = []                    # 认回的记录：哪次执行、哪个对象、置信等级
+        # 循环检测（prior_art_solutions.md 第 3 项）：同一个单元在这个 Agent 最近 loop_window 次执行里
+        # 被保持了 loop_repeat 次，说明它在反复改改不动的东西，提醒人（不暂停，这是告知，不是安全手段）
+        self.loop_repeat, self.loop_window = loop_repeat, loop_window
+        self.kept_history: dict[str, list[set[str]]] = {}      # Agent → 最近几次执行里被保持的单元
+        self.looping: dict[str, set[str]] = {}                 # Agent → 已经提醒过的、正在反复的单元
         self.human_touched_policy = human_touched_policy
+        self.selection_occupies = selection_occupies          # R8 选项："选中即占用"
+        self.reserve_seconds = reserve_seconds                # R23：被别的 Agent 抢先后，预留多少秒
+        self.seen: dict[str, dict[str, int]] = {}             # R3：每个 Agent 上次看到的每个对象的版本
+        self.selection: dict[str, set[str]] = {}              # 人 → 选中的应用对象（group_of 的结果）
+        self.reservations: dict[str, tuple[str, float]] = {}  # 对象 → (预留给哪个 Agent, 到期时间)
+        self.permits: dict[str, Permit] = {}
+        self.pause_on_breach = pause_on_breach                # 违规后暂停这个 Agent，等人处理（第 6 节）
+        self.suspended: dict[str, dict] = {}                  # 被暂停的 Agent → 原因
         self.actors: dict[str, Actor] = {}
         self.objects: dict[str, ObjectState] = {}
         self.capabilities: dict[str, CapabilityMeta] = {}
@@ -75,6 +111,23 @@ class Runtime:
 
     def register_capability(self, meta: CapabilityMeta) -> None:
         self.capabilities[meta.name] = meta
+
+    def learn_app(self, probe: dict) -> dict:
+        """连接时接入代码自测的结果（design_v0.5.md 第 4 节）。不手写任何应用的规则（P4）：
+        重名后缀由应用给两个同名东西起的名字学出（例如 "X" 和 "X.001" → 去掉 ".数字"；Unity 允许重名，就没有后缀）。
+        probe：{"names": [第一个, 第二个], "identity": 接入代码会不会认回, "transfer_ids": 能不能把编号交给新对象}。"""
+        names = list(probe.get("names") or [])
+        suffix = suffix_pattern(names[0], names[1]) if len(names) >= 2 else None
+        self.app = {**probe, "suffix": suffix}
+        self._emit("app/probed", identity=bool(probe.get("identity")), suffix=suffix,
+                   transferIds=bool(probe.get("transfer_ids")))
+        return self.app
+
+    def identity_rule(self) -> Optional[dict]:
+        """许可单里的认回规则；运行时关掉了认回、或者接入代码不支持时为 None。"""
+        if not self.reidentify or not self.app.get("identity"):
+            return None
+        return {"rule": REIDENTIFY_RULE, "suffix": self.app.get("suffix")}
 
     def add_step(self, step_id: str, inputs: Iterable[str], outputs: Iterable[str],
                  assignee: str = "agent") -> Step:
@@ -206,6 +259,15 @@ class Runtime:
         if not is_agent:
             return None   # R5：人的操作不受以下限制
 
+        if op.actor_id in self.suspended:                 # 违规后被暂停，等人处理
+            return OpStatus.REJECTED_SUSPENDED, {"agent": op.actor_id, **self.suspended[op.actor_id]}
+
+        # R8 选项、R23：人选中的、预留给别的 Agent 的
+        for t in op.targets:
+            hit = self._claim_conflict(op.actor_id, t.object_id)
+            if hit is not None:
+                return hit
+
         # R9：被占用的对象，不派发以它为目标或输入的 Agent 操作
         for t in list(op.targets) + list(op.reads):
             obj = self.objects[t.object_id]
@@ -221,18 +283,36 @@ class Runtime:
 
         # 写集：和 _finalize 用同样的判断顺序
         for t in op.targets:
-            obj = self.objects[t.object_id]
-            stale = t.base_version != obj.version
-            touched = obj.human_touched is not None
-            if touched and self.human_touched_policy == POLICY_CANDIDATE:
-                continue                                  # R6 替代策略：执行完再存为候选
-            if obj.mergeable and stale and (not touched or self.human_touched_policy == POLICY_MERGE):
-                continue                                  # 执行完再尝试合并
-            if stale:                                     # R4
-                return OpStatus.REJECTED_STALE, {"objectId": t.object_id, "baseVersion": t.base_version,
-                                                 "currentVersion": obj.version, "set": "targets"}
-            if touched:                                   # R6
-                return OpStatus.REJECTED_HUMAN_TOUCHED, {"objectId": t.object_id, "by": obj.human_touched.by}
+            hit = self._target_conflict(self.objects[t.object_id], t.base_version)
+            if hit is not None:
+                return hit
+        return None
+
+    def _claim_conflict(self, agent_id: str, object_id: str) -> Optional[tuple[OpStatus, dict]]:
+        """R8 选项（选中即占用）和 R23（预留）。_precheck 和 admit 共用。"""
+        if self.selection_occupies:
+            g = group_of(object_id)
+            for holder, groups in self.selection.items():
+                if g in groups:
+                    return OpStatus.REJECTED_OCCUPIED, {"objectId": object_id, "holder": holder, "kind": "selection"}
+        r = self.reservations.get(object_id)
+        if r is not None and r[0] != agent_id and r[1] > time.time():
+            return OpStatus.REJECTED_RESERVED, {"objectId": object_id, "holder": r[0]}
+        return None
+
+    def _target_conflict(self, obj: ObjectState, base_version: int) -> Optional[tuple[OpStatus, dict]]:
+        """写集里的一个对象：过时（R4）或人碰过（R6）时返回拒绝原因。_precheck 和 admit 共用。"""
+        stale = base_version != obj.version
+        touched = obj.human_touched is not None
+        if touched and self.human_touched_policy == POLICY_CANDIDATE:
+            return None                                   # R6 替代策略：执行完再存为候选
+        if obj.mergeable and stale and (not touched or self.human_touched_policy == POLICY_MERGE):
+            return None                                   # 执行完再尝试合并
+        if stale:                                         # R4
+            return OpStatus.REJECTED_STALE, {"objectId": obj.object_id, "baseVersion": base_version,
+                                             "currentVersion": obj.version, "set": "targets"}
+        if touched:                                       # R6
+            return OpStatus.REJECTED_HUMAN_TOUCHED, {"objectId": obj.object_id, "by": obj.human_touched.by}
         return None
 
     def _begin_step_if_needed(self, op: Operation) -> None:
@@ -365,6 +445,8 @@ class Runtime:
         if extra:
             self._record_contract_violation(op, actor, extra, new_versions)
 
+        if op.actor_id in self.seen:                   # R3：Agent 知道自己刚写进去的版本
+            self.seen[op.actor_id].update(new_versions)
         status = OpStatus.MERGED if merged_content else OpStatus.COMMITTED
         op.status = status
         self._emit("op/result", opId=op.op_id, status=status.value, newVersions=new_versions)
@@ -435,6 +517,384 @@ class Runtime:
         # 如果这一步完成时输入正被占用，立即转为阻塞
         if step.state != StepState.DONE and self._inputs_occupied(step):
             self._set_step(step, StepState.BLOCKED)
+
+    # ------------------------------------------------------------------
+    # 许可单（design_v0.5.md 第 2 节）：Agent 执行之前，运行时决定哪些可以改、哪些要保持
+    # ------------------------------------------------------------------
+    def mark_seen(self, agent_id: str, versions: Optional[dict[str, int]] = None) -> None:
+        """R3：记下这个 Agent 看到了哪些版本（它读了场景，或者它的一次执行完成了）。
+        之后它按旧印象做的修改，以这些版本为基准判断是否过时（R4）。"""
+        self._actor(agent_id)
+        self.seen[agent_id] = dict(versions) if versions is not None else {
+            oid: o.version for oid, o in self.objects.items()}
+
+    def set_selection(self, actor_id: str, groups: Iterable[str]) -> None:
+        """R8 选项：人现在选中的应用对象。只有 selection_occupies 打开时才影响许可。"""
+        self._require_human(actor_id)
+        new = set(groups)
+        if new != self.selection.get(actor_id, set()):
+            self.selection[actor_id] = new
+            self._emit("selection/changed", actor=actor_id, objects=sorted(new))
+
+    def _expire_reservations(self) -> None:
+        now = time.time()
+        self.reservations = {u: v for u, v in self.reservations.items() if v[1] > now}
+
+    def reason_for(self, agent_id: str, object_id: str) -> dict:
+        """告诉 Agent 某个对象为什么不能改：人改过或正在改 → 人；最后由别的 Agent 改 → 那个 Agent。"""
+        obj = self.objects[object_id]
+        if obj.human_touched is not None or obj.occupancy is not None:
+            return {"reason": KEEP_HUMAN}
+        last = obj.versions[-1] if obj.versions else None
+        if last is not None and last.author_kind == ActorKind.HUMAN:
+            return {"reason": KEEP_HUMAN}
+        if last is not None and last.author_kind == ActorKind.AGENT and last.author_id != agent_id:
+            return {"reason": KEEP_OTHER_AGENT, "by": last.author_id}
+        return {"reason": KEEP_OTHER}
+
+    def admit(self, agent_id: str) -> Permit:
+        """为这个 Agent 的一次执行开许可单。判断和 _precheck 用的是同一组函数，规则只写一处（P9）：
+        选中、预留（_claim_conflict）→ 占用（R9）→ 过时、人碰过（_target_conflict，R4、R6）。
+        人碰过的对象在"留作候选"策略下也要保持（场景里保留人的，Agent 的版本另存为候选）。"""
+        actor = self._actor(agent_id)
+        if actor.kind != ActorKind.AGENT:
+            raise ProtocolError(f"{agent_id} 不是 Agent，不需要许可")
+        self._expire_reservations()
+        if agent_id in self.suspended:
+            permit = Permit(f"permit-{len(self.permits) + 1}", agent_id,
+                            refused={"reason": "suspended", **self.suspended[agent_id]})
+            self.permits[permit.permit_id] = permit
+            self._emit("permit/refused", permitId=permit.permit_id, agent=agent_id, reason="suspended")
+            return permit
+        seen = self.seen.get(agent_id, {})
+        keep: dict[str, dict] = {}
+        for oid, obj in self.objects.items():
+            if obj.retracted or _is_deleted(obj.content):
+                continue
+            base = seen.get(oid, -1)
+            hit = self._claim_conflict(agent_id, oid)
+            if hit is not None:
+                status, info = hit
+                keep[oid] = ({"reason": KEEP_RESERVED, "by": info["holder"]} if status == OpStatus.REJECTED_RESERVED
+                             else {"reason": KEEP_SELECTED})
+                continue
+            if obj.occupancy is not None:
+                keep[oid] = {"reason": KEEP_HUMAN}
+                continue
+            if obj.human_touched is not None and self.human_touched_policy == POLICY_CANDIDATE:
+                keep[oid] = {"reason": KEEP_HUMAN, "candidate": True}
+                continue
+            if self._target_conflict(obj, base) is not None:
+                keep[oid] = self.reason_for(agent_id, oid)
+        permit = Permit(f"permit-{len(self.permits) + 1}", agent_id, keep,
+                        {oid: seen.get(oid, -1) for oid in self.objects}, reidentify=self.identity_rule())
+        permit.keep_alive = self._ancestors(keep)
+        if permit.reidentify is not None:
+            protected = permit.no_delete
+            wanted = self.wanted_gone.setdefault(agent_id, {})
+            for g in [g for g in wanted if g not in protected]:
+                del wanted[g]                     # 不再受保护了：它想删的那次已经过去，不再认
+            permit.rebind = {g: dict(row) for g, row in sorted(wanted.items())}
+            permit.no_recreate = self._tombstones(agent_id, seen)
+        self.permits[permit.permit_id] = permit
+        self._emit("permit/issued", permitId=permit.permit_id, agent=agent_id, keep=sorted(keep),
+                   keepAlive=sorted(permit.keep_alive), rebind=sorted(permit.rebind),
+                   noRecreate=sorted(permit.no_recreate))
+        return permit
+
+    def _ancestors(self, keep: dict[str, dict]) -> dict[str, dict]:
+        """要保持的对象的祖先（design_v0.5.md 12.6）：不许删，面照样可以改。
+        删掉父对象，子对象的父对象就断了（Blender），或者被连带删掉（Unity），人改过的子对象跟着坏掉。
+        父对象来自账本里每个单元记的 "parent"，对所有应用都一样（P4）。"""
+        parents: dict[str, Optional[str]] = {}
+        for oid, obj in self.objects.items():
+            c = obj.content
+            if obj.retracted or _is_deleted(c) or not isinstance(c, dict):
+                continue
+            parents.setdefault(group_of(oid), c.get("parent"))
+        kept = {group_of(uid) for uid in keep}
+        out: dict[str, dict] = {}
+        for g in sorted(kept):
+            p, seen = parents.get(g), {g}
+            while p and p not in seen and p in parents:
+                seen.add(p)
+                if p not in kept:
+                    out.setdefault(p, {"reason": KEEP_HUMAN, "ancestor": True, "of": g})
+                p = parents.get(p)
+        return out
+
+    def _tombstones(self, agent_id: str, seen: dict[str, int]) -> dict[str, dict]:
+        """墓碑（design_v0.5.md 12.5）：人删掉的对象，这个 Agent 看到过它还在、但还没看到它被删。
+        它新建同名同类型的对象，就是按旧印象把人删掉的东西补回来（R4 + R6），接入代码会把新建的删掉。
+        看到过删除之后再新建，算有意的，照常新建。数据块不记墓碑（删数据块的多半是清理，不是"不要这个东西"）。"""
+        out: dict[str, dict] = {}
+        for oid, obj in sorted(self.objects.items()):
+            content = obj.content
+            if obj.retracted or not _is_deleted(content) or not obj.versions:
+                continue
+            last = obj.versions[-1]
+            if last.author_kind != ActorKind.HUMAN or content.get("kind") == "data":
+                continue
+            base = seen.get(oid, -1)
+            if base < 0 or base >= obj.version:
+                continue                          # 没见过这个对象，或者已经看到它被删了
+            try:
+                if _is_deleted(obj.get_version(base).content):
+                    continue
+            except KeyError:
+                continue
+            g = group_of(oid)
+            out.setdefault(g, {"name": content.get("name"), "type": content.get("type"),
+                               "parent": content.get("parent")})
+        return out
+
+    def close_permit(self, permit: Permit, refused: Iterable[str]) -> list[str]:
+        """一次执行结束。refused：Agent 改到了、但按许可单保持原样的对象。
+        R23：这个 Agent 之前的预留用完了；这次因为别的 Agent 先改而被拒的，给它预留一段时间重试。"""
+        self.reservations = {u: v for u, v in self.reservations.items() if v[0] != permit.agent}
+        out = []
+        if self.reserve_seconds > 0:
+            until = time.time() + self.reserve_seconds
+            for oid in sorted(set(refused)):
+                k = permit.keep.get(oid)
+                if k is not None and k["reason"] == KEEP_OTHER_AGENT:
+                    self.reservations[oid] = (permit.agent, until)
+                    out.append(oid)
+        self._emit("permit/closed", permitId=permit.permit_id, reserved=out)
+        return out
+
+    def settle(self, permit: Permit, before: dict[str, Any], raw: dict[str, Any], final: dict[str, Any],
+               step_id: Optional[str] = None, produce_type: str = "blob",
+               refused: Iterable[str] = (), refused_deletes: Iterable[str] = (),
+               identity: Optional[dict] = None) -> Settlement:
+        """一次执行结束：按应用交回的实际状态核对，再记账（design_v0.5.md 2.3–2.5、第 6 节）。
+
+        before / raw / final：执行前、执行后（恢复前）、最终的单元 {编号: 内容}，内容是带 "fp" 的 dict。
+        - 要保持的单元（许可单里的；以及删掉了不许删的对象时，这个对象的全部单元，R6 按整个对象）：
+          最终和执行前一样 → 保持（kept）；不一样 → 违规（breach），按实际状态记账并标明违规。
+        - 其余单元：最终状态和执行前不一样的，一律按最终状态提交（applied / side_effects）；
+          Agent 改了、但最终又被改回去的，记为 reverted。
+        refused / refused_deletes：类型化命令执行前就按许可单拒掉的单元、拒掉删除的应用对象（Permit.screen）。
+          算作 Agent 想改、按许可单保持，同样要核对场景里确实没变。
+        identity：接入代码认回同一个对象的结果（{"pairs", "kinds", "fresh"}），由运行时按同一条规则重算核对。
+          配上的旧编号在 raw / final 里已经是新对象的内容，所以照常按面核对：人改过的面要么还是人的，要么是违规。
+          补回人删掉的对象（墓碑）被接入代码删掉了：记为保持（kept，"recreate"）。
+        账本只记实际看到的（P1）：结束后账本里每个单元都和 final 一样。"""
+        agent = permit.agent
+        actor = self._actor(agent)
+        st = Settlement(permit.permit_id, agent)
+        refused, pre_deleted = set(refused), set(refused_deletes)
+        before_groups = {group_of(u) for u in before}
+        raw_groups = {group_of(u) for u in raw}
+        if permit.reidentify is not None:
+            self._settle_identity(st, permit, before, raw, identity, pre_deleted)
+        tomb_groups = {g for g, v in st.reidentified.items() if v["kind"] == "tomb"}
+        refused_delete = {g for g in before_groups - raw_groups if g in permit.no_delete}
+        group_reason = {g: dict(k) for g, k in permit.keep_alive.items()}
+        for uid, k in sorted(permit.keep.items()):
+            group_reason.setdefault(group_of(uid), k)
+
+        def required(uid: str) -> Optional[dict]:
+            if uid in permit.keep:
+                return permit.keep[uid]
+            g = group_of(uid)
+            if g in refused_delete:
+                return {**group_reason[g], "whole_object": True}
+            return None
+
+        n = 0
+        for uid in sorted(set(before) | set(raw) | set(final)):
+            b, r, f = before.get(uid), raw.get(uid), final.get(uid)
+            # 执行前拒掉的：这条命令改的面；或者删除被拒掉的对象里、没被同一批别的命令改过的面
+            precheck = uid in refused or (group_of(uid) in pre_deleted and _fp(b) == _fp(r))
+            attempted = _fp(b) != _fp(r) or precheck
+            n += 1
+            op_id = f"{permit.permit_id}-{n}"
+            if b is None or (uid not in self.objects and f is not None):   # 执行前没有（或账本里没有）：新建
+                if f is None:
+                    if r is not None and group_of(uid) in tomb_groups:          # 补回人删掉的对象，已被删掉
+                        st.kept[uid] = {"reason": KEEP_HUMAN, "recreate": True}
+                    continue
+                self._settle_create(op_id, agent, uid, f, step_id, produce_type)
+                (st.created if r is not None and _fp(f) == _fp(r) else st.side_effects).append(uid)
+                continue
+            if uid not in self.objects:                          # 账本里没有、场景里也没了：没什么可记
+                continue
+            req = required(uid)
+            if req is None and precheck and group_of(uid) in pre_deleted and group_of(uid) in group_reason:
+                req = {**group_reason[group_of(uid)], "whole_object": True}
+            if req is not None:
+                if _fp(f) == _fp(b):
+                    if attempted:
+                        st.kept[uid] = {**req, "precheck": True} if precheck else req
+                        if req.get("candidate") and r is not None:
+                            self._settle_candidate(op_id, agent, uid, r, step_id)
+                    continue
+                st.breach[uid] = {**req, "deleted": f is None}
+                self._settle_breach(op_id, agent, actor, uid, f, b, step_id)
+                continue
+            if _fp(f) == _fp(b):
+                if attempted:
+                    st.reverted.append(uid)
+                continue
+            if self._settle_write(op_id, agent, uid, f, b, permit.base.get(uid, -1), step_id):
+                (st.applied if attempted and _fp(f) == _fp(r) else st.side_effects).append(uid)
+            else:   # 执行期间规则状态变了（例如接入代码没核对、人的修改是事后才记的）：如实记为违规
+                st.breach[uid] = {**self.reason_for(agent, uid), "deleted": f is None, "late": True}
+                self._settle_breach(op_id, agent, actor, uid, f, b, step_id)
+
+        st.reserved = self.close_permit(permit, list(st.kept))
+        if permit.reidentify is not None:
+            self._track_wanted_gone(permit, st, before, raw, final, pre_deleted)
+        self._detect_loops(st)
+        self.mark_seen(agent)
+        if st.breach:
+            st.outcome = "breach"
+            groups = sorted({group_of(u) for u in st.breach})
+            self._emit("alert/human", kind="breach", agent=agent, permitId=permit.permit_id, objects=groups)
+            if self.pause_on_breach:
+                self.suspended[agent] = {"permitId": permit.permit_id, "objects": groups}
+                st.suspended = True
+                self._emit("agent/suspended", agent=agent, permitId=permit.permit_id, objects=groups)
+        self._emit("permit/settled", permitId=permit.permit_id, outcome=st.outcome,
+                   applied=st.applied, created=st.created, kept=sorted(st.kept), breach=sorted(st.breach))
+        return st
+
+    def _detect_loops(self, st: Settlement) -> None:
+        """从账本算：同一个单元在这个 Agent 最近 loop_window 次执行里被保持（它想改、没生效）了几次。
+        到 loop_repeat 次记进 st.loops；新进入循环的单元提醒人一次。补回人删掉的对象不算（看到之后再建就是有意的）。"""
+        agent = st.agent
+        history = self.kept_history.setdefault(agent, [])
+        history.append({u for u, k in st.kept.items() if not k.get("recreate")})
+        del history[:-self.loop_window]
+        counts: dict[str, int] = {}
+        for kept in history:
+            for u in kept:
+                counts[u] = counts.get(u, 0) + 1
+        st.loops = {u: n for u, n in sorted(counts.items()) if n >= self.loop_repeat and u in history[-1]}
+        alerted = self.looping.setdefault(agent, set())
+        alerted &= set(st.loops)                                # 不再反复的，下次再进入循环时重新提醒
+        new = sorted(set(st.loops) - alerted)
+        st.loop_alert = new
+        if new:
+            alerted.update(new)
+            self._emit("alert/human", kind="loop", agent=agent, permitId=st.permit_id, objects=new,
+                       times={u: st.loops[u] for u in new}, window=self.loop_window)
+
+    def _settle_identity(self, st: Settlement, permit: Permit, before: dict[str, Any], raw: dict[str, Any],
+                         identity: Optional[dict], pre_deleted: set[str]) -> None:
+        """核对接入代码认回的结果（design_v0.5.md 12.4）：只用执行前、执行后（恢复前）的记录，按许可单里的同一条规则
+        自己重算一遍（rightofway/identity.py 的 verify）。一致的记进 st.reidentified 和认回记录（带置信等级）；
+        不一致的照实记下、提醒人。账本仍按场景的实际状态记（P1）；这是接入代码的问题，不暂停 Agent。"""
+        identity = identity or {}
+        pairs = {o: list(v) for o, v in (identity.get("pairs") or {}).items()}
+        kinds = identity.get("kinds") or {}
+        wanted = set(permit.rebind) | set(pre_deleted)
+        rows_b, rows_r = _group_rows(before), _group_rows(raw)
+        expected, errors = verify_identity(rows_b, rows_r, pairs, identity.get("fresh") or {}, wanted,
+                                           permit.no_recreate, (permit.reidentify or {}).get("suffix"))
+        if not identity and expected:
+            errors.insert(0, "接入代码没有交回认回的结果")
+        for old, (new, level) in sorted(pairs.items()):
+            if expected.get(old) != [new, level]:
+                continue
+            if old in permit.no_recreate and old not in rows_b:
+                kind = "tomb"
+            elif kinds.get(old) == "rebind" and old in wanted:
+                kind = "rebind"
+            else:
+                kind = "gone"
+            name = (rows_b.get(old) or permit.no_recreate.get(old) or {}).get("name")
+            st.reidentified[old] = {"name": name, "level": level, "kind": kind}
+            self.identity_log.append({"permitId": permit.permit_id, "agent": permit.agent, "object": old,
+                                      "name": name, "new": new, "level": level, "kind": kind})
+            self._emit("identity/matched", permitId=permit.permit_id, agent=permit.agent, objectId=old,
+                       level=level, kind=kind)
+        st.identity_errors = errors
+        if errors:
+            self._emit("alert/human", kind="identity", agent=permit.agent, permitId=permit.permit_id,
+                       errors=list(errors))
+
+    def _track_wanted_gone(self, permit: Permit, st: Settlement, before: dict[str, Any], raw: dict[str, Any],
+                           final: dict[str, Any], pre_deleted: set[str]) -> None:
+        """记下 Agent 想删、因为人改过而保留下来的对象：之后它新建同名同类型的对象，就认成这一个（清空和重建分两次执行）。
+        认上了、被删掉了、或者 Agent 又去改它（说明它知道这个对象还在）时，不再记。"""
+        wanted = self.wanted_gone.setdefault(permit.agent, {})
+        rows_b = _group_rows(before)
+        final_groups = {group_of(u) for u in final}
+        raw_groups = {group_of(u) for u in raw}
+        for g in list(wanted):
+            if g in st.reidentified or g not in final_groups:
+                del wanted[g]
+        for uid in raw:
+            if uid in before and _fp(before[uid]) != _fp(raw[uid]):
+                wanted.pop(group_of(uid), None)
+        for g in sorted((set(rows_b) - raw_groups) | pre_deleted):
+            if (g in final_groups and g in permit.no_delete and g not in st.reidentified
+                    and rows_b.get(g, {}).get("kind") != "data"):
+                wanted[g] = {k: rows_b[g].get(k) for k in ("name", "type", "parent")}
+
+    def _settle_write(self, op_id: str, agent: str, uid: str, f: Any, b: Any, base: int,
+                      step_id: Optional[str]) -> bool:
+        """按最终状态提交一个单元，走和 submit 一样的规则检查。"""
+        op = Operation(op_id, agent, targets=[Target(uid, base)], step_id=step_id)
+        if self.submit(op).status.is_rejection:
+            return False
+        content = f if f is not None else _deleted_like(b)
+        return self.complete(op_id, writes={uid: content}).status in (OpStatus.COMMITTED, OpStatus.MERGED)
+
+    def _settle_create(self, op_id: str, agent: str, uid: str, f: Any, step_id: Optional[str],
+                       produce_type: str) -> None:
+        if uid in self.objects and not self.objects[uid].retracted:      # 名义上新建、账本里已有：按修改记
+            obj = self.objects[uid]
+            if _fp(obj.content) != _fp(f):
+                self._commit_version(obj, f, self._actor(agent), op_id, step_id)
+            return
+        op = Operation(op_id, agent, produces=[uid], step_id=step_id)
+        self.submit(op)
+        self.complete(op_id, produces={uid: f}, produce_types={uid: produce_type})
+
+    def _settle_candidate(self, op_id: str, agent: str, uid: str, r: Any, step_id: Optional[str]) -> None:
+        """R6 "留作候选"：场景里保留人的，Agent 的版本记进候选区。"""
+        obj = self.objects[uid]
+        self._seq += 1
+        obj.candidates.append(VersionRecord(version=-1, content=r, author_id=agent, author_kind=ActorKind.AGENT,
+                                            op_id=op_id, step_id=step_id, parent_version=obj.version,
+                                            seq=self._seq))
+        self._emit("result/candidate", opId=op_id, objects=[uid])
+
+    def _settle_breach(self, op_id: str, agent: str, actor: Actor, uid: str, f: Any, b: Any,
+                       step_id: Optional[str]) -> None:
+        """违规：规则要求保持，但应用里实际变了。账本照实记下（P1），标明违规；"人碰过"的标记保留。"""
+        if uid not in self.objects:
+            self.objects[uid] = ObjectState(uid, "blob")
+        obj = self.objects[uid]
+        prior = obj.human_touched
+        op = Operation(op_id, agent, targets=[Target(uid, obj.version)], step_id=step_id,
+                       actor_kind=actor.kind, status=OpStatus.BREACH)
+        self.ops[op_id] = op
+        rec = self._commit_version(obj, f if f is not None else _deleted_like(b), actor, op_id, step_id)
+        rec.breach = True
+        obj.human_touched = prior
+        self._emit("op/breach", opId=op_id, agent=agent, objectId=uid, version=rec.version,
+                   deleted=f is None)
+        self._emit("object/changed", objectId=uid, version=rec.version, author=agent, opId=op_id, breach=True)
+
+    def resume_agent(self, actor_id: str, agent_id: str) -> None:
+        """人处理完违规之后，让这个 Agent 继续。"""
+        self._require_human(actor_id)
+        if self.suspended.pop(agent_id, None) is not None:
+            self._emit("agent/resumed", agent=agent_id, by=actor_id)
+
+    def guarded(self, for_agent: Optional[str] = None) -> set[str]:
+        """人碰过或正被占用、还在的对象；for_agent 时再加上预留给别的 Agent 的。（显示和兼容用）"""
+        out = {oid for oid, o in self.objects.items()
+               if (o.human_touched is not None or o.occupancy is not None)
+               and not o.retracted and not _is_deleted(o.content)}
+        if for_agent is not None:
+            self._expire_reservations()
+            out |= {oid for oid, (h, _) in self.reservations.items() if h != for_agent}
+        return out
 
     # ------------------------------------------------------------------
     # 人直接修改（R2、R5、R8、R9、R12）
@@ -678,3 +1138,35 @@ class Runtime:
 
     def events_of(self, type_: str) -> list[Event]:
         return [e for e in self.events if e.type == type_]
+
+
+def _is_deleted(content: Any) -> bool:
+    """接入层用 {"deleted": True, ...} 记录"对象已被删除"。"""
+    return isinstance(content, dict) and content.get("deleted") is True
+
+
+_IDENTITY_KEYS = ("name", "type", "parent", "kind", "display")
+
+
+def _deleted_like(before: Any) -> dict:
+    """"已删除"的内容：保留名字、类型、父对象（认回同一个对象、拦下补回人删掉的对象时要用）。"""
+    keep = {k: before[k] for k in _IDENTITY_KEYS if isinstance(before, dict) and before.get(k) is not None}
+    return {"deleted": True, **keep}
+
+
+def _group_rows(units: dict[str, Any]) -> dict[str, dict]:
+    """单元 → 应用对象的身份行 {对象编号: {"name", "type", "parent", "kind", "users"}}（认回时用）。"""
+    out: dict[str, dict] = {}
+    for uid, c in sorted(units.items()):
+        g = group_of(uid)
+        if g in out or not isinstance(c, dict):
+            continue
+        out[g] = {k: c.get(k) for k in ("name", "type", "parent", "kind", "users")}
+    return out
+
+
+def _fp(content: Any) -> Any:
+    """核对用的指纹：内容是带 "fp" 的 dict 时取 fp，否则就是内容本身。None 表示不存在。"""
+    if isinstance(content, dict) and "fp" in content:
+        return content["fp"]
+    return content

@@ -23,13 +23,35 @@ _SELFTEST = r'''
         var setup = (Dictionary<string, object>)Setup(args);
         var a = new Dictionary<string, object> {
             { "scene_handle", setup["scene_handle"] }, { "granularity", args["granularity"] }, { "protect", args["protect"] },
-            { "protected", new Dictionary<string, object>() }, { "known", new Dictionary<string, object>() }, { "watch_outside", true },
-            { "protect_selected", args.ContainsKey("protect_selected") && (bool)args["protect_selected"] } };
+            { "protected", new Dictionary<string, object>() }, { "known", new Dictionary<string, object>() }, { "watch_outside", true } };
         STEP = "build";
         var r1 = (Dictionary<string, object>)RunAgent(a, result);
         a["known"] = Known((Dictionary<string, object>)r1["after"]);
         STEP = "human";
         Exec(a, result);
+        // 自测不经过 Python 运行时，这里模拟运行时开许可单：人刚改过的面、人新建的对象要保持；
+        // "选中即占用"时，选中的对象整个保持
+        var seen = (Dictionary<string, object>)Records(TARGET, new Dictionary<string, object>(), null, null, true);
+        var permit = new Dictionary<string, object>();
+        var humanSince = new List<object>();
+        var knownNow = (Dictionary<string, object>)a["known"];
+        bool byObject = (string)args["granularity"] == "object";
+        bool protectSelected = args.ContainsKey("protect_selected") && (bool)args["protect_selected"];
+        foreach (var kv in seen)
+        {
+            var rec = (Dictionary<string, object>)kv.Value;
+            if (protectSelected && (bool)rec["selected"]) { permit[kv.Key] = new List<object> { "*" }; }
+            if (!knownNow.ContainsKey(kv.Key)) { permit[kv.Key] = new List<object> { "*" }; humanSince.Add(kv.Key); continue; }
+            var k = (Dictionary<string, object>)knownNow[kv.Key];
+            if ((string)k["fp"] == (string)rec["fp"]) continue;
+            humanSince.Add(kv.Key);
+            if (permit.ContainsKey(kv.Key)) continue;
+            if (byObject) { permit[kv.Key] = new List<object> { "*" }; continue; }
+            var kf = (Dictionary<string, object>)k["aspects"];
+            permit[kv.Key] = ((Dictionary<string, object>)rec["aspects"])
+                .Where(f => !kf.ContainsKey(f.Key) || (string)kf[f.Key] != (string)f.Value).Select(f => (object)f.Key).ToList();
+        }
+        a["protected"] = permit;
         STEP = "adjust";
         var r2 = (Dictionary<string, object>)RunAgent(a, result);
         var before = (Dictionary<string, object>)r2["before"];
@@ -50,7 +72,7 @@ _SELFTEST = r'''
         s["cube_y"] = G("Cube") == null ? -999f : G("Cube").transform.localPosition.y;
         s["rock2_exists"] = G("Rock_2") != null;
         s["trunk_scale"] = G("Trunk").transform.localScale.ToString();
-        s["human_since"] = ((List<object>)r2["human_since"]).Select(name).ToList();
+        s["human_since"] = humanSince.Select(name).ToList();
         var merged = new Dictionary<string, object>();
         foreach (var kv in (Dictionary<string, object>)r2["merged"]) merged[name(kv.Key)] = kv.Value;
         s["merged"] = merged;

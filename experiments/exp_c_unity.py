@@ -26,7 +26,8 @@ from rightofway.blender.shared_session import SharedSession
 from rightofway.runtime import POLICY_DISCARD, Runtime
 from rightofway.unity.bridge import NeedResponse, RelayTransport, ReplayTransport, UnityBridge, UnityError
 from experiments import scenario_unity as su
-from experiments.common import banner, say, use_utf8_console, wait_for_human, write_row
+from experiments.common import (InvariantLog, banner, breach_objects, say, say_alert, use_utf8_console,
+                                wait_for_human, write_row)
 
 
 def main(argv=None) -> None:
@@ -55,6 +56,7 @@ def main(argv=None) -> None:
         rt = Runtime(human_touched_policy=POLICY_DISCARD)
         session = SharedSession(rt, bridge, granularity=args.granularity, occupy_selection=args.occupy_selection)
         session.start()
+        inv = InvariantLog(protect)
         gran = "按面" if args.granularity == "aspect" else "按对象"
         variant = (f"有保护（{gran}）" if protect else "对照组：没有保护") + \
             ("，AI 不先看提示" if protect and args.ai_no_look else "") + ("，选中即占用" if args.occupy_selection else "")
@@ -63,6 +65,7 @@ def main(argv=None) -> None:
         say("ai", "第 1 步：布置场景")
         r1 = session.run_agent(su.AI_BUILD, "build", protect=protect)
         say("rt", r1.text)
+        inv.after_run(session, r1)
 
         detect = None
         if args.human == "sim":
@@ -103,11 +106,15 @@ def main(argv=None) -> None:
         say("ai", "第 2 步：整体调整（叶子变秋色、统一高度、石头排成一圈、散落物体落地）")
         r2 = session.run_agent(su.ai_adjust(skip), "adjust", protect=protect)
         say("rt", "回给 AI 的说明：\n" + r2.text)
+        say_alert(r2)
+        inv.after_run(session, r2)
+        inv.at_end(session)
 
-        final = bridge.call("poll", {})["records"]
+        final = session.scene_records()
         ev = evaluate(rt, final, session.human, granularity=args.granularity, labels=session.labels)
         banner("结果")
         say("info", ev.summary())
+        say("info", inv.summary())
         say("info", f"AI 新建的对象和人删掉的对象同名：{len(r2.resurrections)} 个 {r2.resurrections or ''}")
         if r2.partial and protect:
             say("info", "部分生效的对象：" + "；".join(
@@ -123,7 +130,7 @@ def main(argv=None) -> None:
                 "实验": "C Unity 同一份", "做法": variant, "人": "真人" if args.human == "real" else "模拟",
                 "人的修改被覆盖": len(ev.human_overwritten), "AI的修改丢失": len(ev.ai_lost),
                 "被删对象被AI重建": len(r2.resurrections), "恢复或合并出错": len(r2.inexact),
-                "AI候选": 0, "AI修改生效": len(r2.committed), "AI修改未采用": len(r2.skipped),
+                "不变量违反": inv.column(), "违规": breach_objects([r1, r2]) if protect else "—", "AI候选": 0, "AI修改生效": len(r2.committed), "AI修改未采用": len(r2.skipped),
                 "人看到AI结果要等(秒)": round(r2.seconds, 4),
                 "备注": (f"发现人的修改用时 {detect} 秒" if detect is not None else f"轮询间隔 {args.poll} 秒")
                 + (f"；改到场景外 {outside} 个对象" if outside else "")})

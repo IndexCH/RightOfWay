@@ -126,6 +126,8 @@ class FakeBridge:
 
     def call(self, fn, args):
         self.sent.append((fn, args))
+        if fn == "probe":                       # 连接时的自测：这个假接入不会认回同一个对象
+            return {"names": ["X", "X"], "identity": False}
         if fn == "poll":
             return {"records": dict(self.world)}
         result, self.next = self.next, None

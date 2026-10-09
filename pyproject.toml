@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rightofway"
-version = "0.4.0"
+version = "0.5.0"
 description = "RightOfWay: a runtime that keeps AI agents from overwriting human edits"
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -18,6 +18,8 @@ dev = ["pytest>=8"]
 blender = ["bpy>=4.2; python_version == '3.11'"]
 # 可选：实验 C 需要作为 MCP 客户端连接 Unity 的 MCP 中继
 unity = ["mcp>=1.2"]
+# 可选：MCP 代理（python -m rightofway.proxy）。用 mcp 1.27 测过，还没在 2.x 上测过
+proxy = ["mcp>=1.20,<2"]
 
 [tool.setuptools.packages.find]
 include = ["rightofway*"]

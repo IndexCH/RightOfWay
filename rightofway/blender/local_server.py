@@ -21,41 +21,80 @@ import threading
 import time
 
 
+def _handle(req: dict, bpy) -> dict:
+    """execute_code：执行代码，返回打印的内容（和插件一样）。别的命令（插件自己的查询命令）这里不支持。"""
+    if req.get("type", "execute_code") != "execute_code":
+        return {"status": "error", "message": f"local_server 只支持 execute_code，不支持 {req.get('type')}"}
+    out = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out):
+            exec(req.get("params", {}).get("code", ""), {"bpy": bpy})
+        return {"status": "success", "result": {"executed": True, "result": out.getvalue()}}
+    except Exception as e:                         # noqa: BLE001
+        return {"status": "error", "message": f"Error executing code: {e}"}
+
+
 def serve(port: int, host: str = "127.0.0.1") -> None:
+    """和插件一样：可以同时有多个连接，一个连接上可以连续发多条命令（新版的 BlenderMCP 服务器会一直开着一个连接，
+    握手时再开一个）；命令都在主线程上一条一条执行（bpy 不是线程安全的）。"""
+    import queue
+
     import bpy
     bpy.ops.wm.read_factory_settings(use_empty=True)
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((host, port))
     srv.listen(5)
+    work: queue.Queue = queue.Queue()
+
+    def reader(conn) -> None:
+        decoder = json.JSONDecoder()
+        raw = b""
+        with conn:
+            while True:
+                try:
+                    chunk = conn.recv(65536)
+                except OSError:
+                    return
+                if not chunk:
+                    return
+                raw += chunk
+                try:
+                    buf = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    continue                       # 一个字符被拆在两次接收之间
+                while buf.strip():
+                    try:
+                        req, end = decoder.raw_decode(buf.lstrip())
+                    except json.JSONDecodeError:
+                        break                      # 还没收完
+                    buf = buf.lstrip()[end:]
+                    raw = buf.encode("utf-8")
+                    done: queue.Queue = queue.Queue()
+                    work.put((req, done))
+                    resp = done.get()
+                    try:
+                        conn.sendall(json.dumps(resp).encode("utf-8"))
+                    except OSError:
+                        return
+
+    def acceptor() -> None:
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            threading.Thread(target=reader, args=(conn,), daemon=True).start()
+
+    threading.Thread(target=acceptor, daemon=True).start()
     print(f"READY {port}", flush=True)
     while True:
-        conn, _ = srv.accept()
-        with conn:
-            buf, req = b"", None
-            while True:
-                chunk = conn.recv(65536)
-                if not chunk:
-                    break
-                buf += chunk
-                try:
-                    req = json.loads(buf.decode("utf-8"))
-                    break
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    continue
-            if req is None:
-                continue
-            if req.get("type") == "shutdown":
-                conn.sendall(b'{"status": "success", "result": {}}')
-                break
-            out = io.StringIO()
-            try:
-                with contextlib.redirect_stdout(out):
-                    exec(req.get("params", {}).get("code", ""), {"bpy": bpy})
-                resp = {"status": "success", "result": {"executed": True, "result": out.getvalue()}}
-            except Exception as e:                 # noqa: BLE001
-                resp = {"status": "error", "message": f"Error executing code: {e}"}
-            conn.sendall(json.dumps(resp).encode("utf-8"))
+        req, done = work.get()
+        if req.get("type") == "shutdown":
+            done.put({"status": "success", "result": {}})
+            break
+        done.put(_handle(req, bpy))
+    time.sleep(0.1)
     srv.close()
 
 

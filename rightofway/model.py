@@ -63,6 +63,7 @@ class VersionRecord:
     parent_version: Optional[int] = None
     seq: int = 0                       # 在全局事件序列中的位置
     restored_from: Optional[int] = None  # 撤回产生的版本：恢复自哪个版本
+    breach: bool = False               # 违规产生的版本：规则要求保持，但应用里实际被改了，按实际状态记下
 
 
 @dataclass
@@ -132,6 +133,9 @@ class OpStatus(str, Enum):
     REJECTED_STALE = "rejected_stale"
     REJECTED_HUMAN_TOUCHED = "rejected_human_touched"
     REJECTED_OCCUPIED = "rejected_occupied"
+    REJECTED_RESERVED = "rejected_reserved"            # R23：预留给了另一个 Agent
+    REJECTED_SUSPENDED = "rejected_suspended"          # 这个 Agent 上次违规后被暂停，等人处理
+    BREACH = "breach"                                  # 违规：要保持的部分在应用里被改了，没能恢复；按实际状态记账
     REJECTED_BY_HUMAN = "rejected_by_human"
     REJECTED_STEP_ASSIGNMENT = "rejected_step_assignment"  # 步骤已被人认领或分配给人
     REJECTED_AUTHORITY = "rejected_authority"              # 权威在会话里却想直接写存储副本
@@ -204,3 +208,90 @@ class Event:
     seq: int
     type: str
     data: dict
+
+
+# ---------------------------------------------------------------------------
+# 许可单（design_v0.5.md 2.1）：一次 Agent 执行之前，运行时开出的"哪些可以改、哪些要保持"
+# ---------------------------------------------------------------------------
+# 要保持的原因
+KEEP_HUMAN = "human"            # 人改过，或者人正在改（占用）
+KEEP_SELECTED = "selected"      # 人正选中着（"选中即占用"选项）
+KEEP_OTHER_AGENT = "other_agent"  # 别的 Agent 在这个 Agent 上次看之后改过（后到的让先到的）
+KEEP_RESERVED = "reserved"      # 预留给了另一个 Agent
+KEEP_OTHER = "other"
+
+
+def group_of(object_id: str) -> str:
+    """运行时里的对象可以是应用里一个对象的某个面，编号写成"对象编号#面"。返回它所属的应用对象。"""
+    return object_id.partition("#")[0]
+
+
+def face_of(object_id: str) -> Optional[str]:
+    return object_id.partition("#")[2] or None
+
+
+@dataclass
+class Permit:
+    permit_id: str
+    agent: str
+    keep: dict[str, dict] = field(default_factory=dict)   # 要保持的单元 → {"reason": ..., "by": ..., "candidate": ...}
+    base: dict[str, int] = field(default_factory=dict)    # 每个单元的基准版本：这个 Agent 上次看到的版本
+    refused: Optional[dict] = None                        # 整次不许执行（例如这个 Agent 被暂停了）：原因
+    # 认回同一个对象（design_v0.5.md 12.4、12.5）。规则在 rightofway/identity.py，运行时和接入代码用同一份。
+    reidentify: Optional[dict] = None                     # {"rule": ..., "suffix": 探测出的重名后缀}；None 表示不认
+    rebind: dict[str, dict] = field(default_factory=dict)       # Agent 之前想删、因为人改过而保留下来的对象 → {name, type, parent}
+    no_recreate: dict[str, dict] = field(default_factory=dict)  # 墓碑：人删掉、这个 Agent 还没看到的对象 → {name, type, parent}
+    # 不许删、但面可以改的应用对象：要保持的对象的祖先（design_v0.5.md 12.6）→ {"reason": ..., "ancestor": True}
+    keep_alive: dict[str, dict] = field(default_factory=dict)
+
+    @property
+    def no_delete(self) -> set[str]:
+        """不许删的应用对象：有任何一个单元要保持的对象，整个不许删（R6 按整个对象）；还有它们的祖先（12.6）。"""
+        return {group_of(uid) for uid in self.keep} | set(self.keep_alive)
+
+    def keep_by_group(self) -> dict[str, list[str]]:
+        """按应用对象分组：{对象编号: [面]}，"*" 表示整个对象。接入代码照这个恢复。"""
+        out: dict[str, set[str]] = {}
+        for uid in self.keep:
+            out.setdefault(group_of(uid), set()).add(face_of(uid) or "*")
+        return {g: sorted(v) for g, v in sorted(out.items())}
+
+    def screen(self, group: str, faces=(), delete: bool = False) -> tuple[list[str], dict[str, dict]]:
+        """类型化命令的预检查：一条命令要改应用对象 group 的这些面（delete=True：要删掉它）。
+        返回 (可以执行的面, 不许执行的 {面: 原因})；整个对象都要保持、或者删除不许删的对象时，键是 "*"。
+        和恢复用的是同一张许可单，规则只写一处（P9）。"""
+        mine = {face_of(uid) or "*": k for uid, k in sorted(self.keep.items()) if group_of(uid) == group}
+        if delete:
+            if mine:
+                return [], {"*": next(iter(mine.values()))}
+            if group in self.keep_alive:
+                return [], {"*": self.keep_alive[group]}
+            return ["*"], {}
+        if not mine:
+            return list(faces), {}
+        if "*" in mine:
+            return [], {"*": mine["*"]}
+        return [f for f in faces if f not in mine], {f: mine[f] for f in faces if f in mine}
+
+
+@dataclass
+class Settlement:
+    """一次执行结束后，运行时按应用交回的实际状态核对、记账的结果（design_v0.5.md 2.3–2.5）。
+    给 Agent 和人的说明只从这里生成。"""
+    permit_id: str
+    agent: str
+    outcome: str = "committed"                                 # committed | breach
+    applied: list[str] = field(default_factory=list)           # Agent 改的已生效：场景里就是它改成的样子
+    created: list[str] = field(default_factory=list)           # Agent 新建的
+    kept: dict[str, dict] = field(default_factory=dict)        # Agent 改到了、按许可单保持原样，场景里确实没变
+    breach: dict[str, dict] = field(default_factory=dict)      # 要保持、但场景里变了（恢复失败或恢复不了）
+    reverted: list[str] = field(default_factory=list)          # 不用保持、但场景里被改回去了（接入代码多恢复了）
+    side_effects: list[str] = field(default_factory=list)      # Agent 没直接改、但场景里变了（例如恢复时连带的）
+    reserved: list[str] = field(default_factory=list)          # R23：这次给这个 Agent 的预留
+    suspended: bool = False                                    # 因为违规，这个 Agent 被暂停了
+    # 认回同一个对象（运行时核对过的）：旧对象编号 → {"name", "level": exact|suffix|global,
+    #   "kind": gone（删掉又新建）| rebind（之前想删、被保留的，又新建了）| tomb（补回人删掉的，已拦下）}
+    reidentified: dict[str, dict] = field(default_factory=dict)
+    identity_errors: list[str] = field(default_factory=list)   # 接入代码交回的配对和规则不一致
+    loops: dict[str, int] = field(default_factory=dict)        # 反复改改不动的单元 → 最近几次执行里被保持了几次
+    loop_alert: list[str] = field(default_factory=list)        # 这次新进入循环、已提醒人的单元

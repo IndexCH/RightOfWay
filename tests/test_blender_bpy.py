@@ -217,11 +217,15 @@ def test_aspect_human_moves_leaf_ai_recolors_both_kept(br):
     assert abs(leaf3.location.z - 3.0) < 1e-6           # 位置保留人的
     assert _leaf_color(leaf3) == (0.8, 0.45, 0.1, 1.0)  # 颜色采用 AI 的
     assert abs(leaf1.location.z - 1.6) < 1e-6
-    assert rep.partial == {"Leaf_3": {"kept": ["material_slots"], "restored": ["location"]}}
+    # 颜色在共用材质上（材质是自己的单元），Leaf_3 这边只改了位置、被整个保留，所以不算"部分生效"
+    mat_id = bpy.data.materials["RightOfWay_Leaf"]["rightofway_id"]
+    assert rep.partial == {} and any(u.startswith(mat_id + "#") for u in rep.committed)
     assert rep.fallback == [] and rep.inexact == []
 
 
 def test_object_granularity_reverts_whole_leaf(br):
+    """按整个对象：人挪了 Leaf_3，Leaf_3 这个对象整个保留。叶子共用的材质是另一个单元，人没碰过，
+    AI 改成秋色照常生效，所有叶子（包括 Leaf_3）一起变，材质不分叉。"""
     rt = Runtime()
     s = SharedSession(rt, br, granularity="object")
     s.start()
@@ -230,7 +234,9 @@ def test_object_granularity_reverts_whole_leaf(br):
     s.poll()
     s.run_agent(sc.ai_adjust())
     leaf3 = bpy.data.objects["Leaf_3"]
-    assert abs(leaf3.location.z - 3.0) < 1e-6 and _leaf_color(leaf3) == (0.2, 0.6, 0.2, 1.0)
+    assert abs(leaf3.location.z - 3.0) < 1e-6 and _leaf_color(leaf3) == (0.8, 0.45, 0.1, 1.0)
+    used = {sl.material.name for o in bpy.data.objects if o.name.startswith("Leaf_") for sl in o.material_slots}
+    assert used == {"RightOfWay_Leaf"}
 
 
 def test_aspect_restore_modifier_and_mesh_keep_ai_parts(br):
@@ -255,7 +261,11 @@ def test_aspect_restore_modifier_and_mesh_keep_ai_parts(br):
     assert rock.location.x == 9 and rock.material_slots[0].material.name == "Red"
     assert [(x.type, round(x.width, 3)) for x in rock.modifiers] == [("BEVEL", 0.2)]
     assert rock.data.vertices[0].co.z > 0
-    assert rep.fallback == [] and rep.partial["Rock_1"]["restored"] == ["data", "modifiers"]
+    # 网格是自己的单元：人改过的顶点在网格上恢复；Rock_1 这个对象只恢复修改器
+    assert rep.partial["Rock_1"]["restored"] == ["modifiers"]
+    assert sorted(rep.partial["Rock_1"]["kept"]) == ["location", "material_slots"]
+    mesh_id = rock.data["rightofway_id"]
+    assert any(x["id"].startswith(mesh_id + "#") for x in rep.skipped)
 
 
 def test_outside_scene_changes_are_reported(br):
@@ -290,7 +300,8 @@ def test_old_experiment_scenes_do_not_interfere(br):
     s.run_agent(sc.ai_build("New"))
     rep = s.run_agent(sc.ai_adjust("New"))
     assert tuple(bpy.data.objects["Trunk"].scale) == (1, 1, 1)          # 旧场景的 Trunk 没被动
-    # 但材质名是全局的，旧场景的叶子和新场景共用 RightOfWay_Leaf：AI 改颜色时旧场景的叶子也变了。
-    # 运行时不追踪旧场景，但把这件事报告出来，而不是静默漏掉（R18）
-    assert rep.outside["modified"] == ["Leaf_1", "Leaf_2", "Leaf_3", "Leaf_4", "Leaf_5"]
-    assert rep.outside["created"] == [] and rep.outside["deleted"] == []
+    # 材质名是全局的，旧场景的叶子和新场景共用 RightOfWay_Leaf。材质是自己的单元，AI 改颜色记在材质上
+    # （运行时追踪着它），旧场景的叶子对象本身没变，所以不再算"场景以外的改动"
+    mat_id = bpy.data.materials["RightOfWay_Leaf"]["rightofway_id"]
+    assert any(u.startswith(mat_id + "#") for u in rep.committed)
+    assert rep.outside["modified"] == [] and rep.outside["created"] == [] and rep.outside["deleted"] == []

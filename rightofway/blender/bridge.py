@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 SOURCE_PATH = Path(__file__).with_name("blender_side.py")
+IDENTITY_PATH = Path(__file__).parent.parent / "identity.py"     # 认回同一个对象的规则：运行时和接入代码用同一份
 MARK_BEGIN = "<<<RIGHTOFWAY_JSON>>>"
 MARK_END = "<<<RIGHTOFWAY_END>>>"
 
@@ -32,12 +33,27 @@ class BridgeError(RuntimeError):
     """和 Blender 通信失败，或者 Blender 里执行出错。"""
 
 
+class _Commands:
+    """类型化命令（design_v0.5.md 第 9 节的小工具）：编成 Blender 脚本，由 run_agent 原子地执行。"""
+
+    @staticmethod
+    def compile_commands(commands: list, scene: Optional[str] = None) -> str:
+        from .commands import compile_commands
+        return compile_commands(commands, scene)
+
+    @staticmethod
+    def command_results(stdout: str) -> dict:
+        from .commands import command_results
+        return command_results(stdout)
+
+
 def blender_source() -> str:
-    return SOURCE_PATH.read_text(encoding="utf-8")
+    """发进 Blender 的源码：identity.py（只用标准库）在前，blender_side.py 在后。"""
+    return IDENTITY_PATH.read_text(encoding="utf-8") + "\n\n" + SOURCE_PATH.read_text(encoding="utf-8")
 
 
 def build_call(fn: str, args: dict) -> str:
-    """blender_side.py 的全部源码，末尾加一行调用。参数先转成 JSON 字符串再嵌进去。"""
+    """identity.py 和 blender_side.py 的全部源码，末尾加一行调用。参数先转成 JSON 字符串再嵌进去。"""
     payload = json.dumps(json.dumps(args, ensure_ascii=True))   # 纯 ASCII，路径和中文都转义
     return blender_source() + f"\n\n_rightofway_out({fn}(json.loads({payload})))\n"
 
@@ -50,7 +66,7 @@ def parse_output(text: str) -> dict:
     return json.loads(text[start + len(MARK_BEGIN):end])
 
 
-class SocketBridge:
+class SocketBridge(_Commands):
     """通过现成的 Blender MCP 插件执行代码。插件那边不需要任何修改。"""
 
     # 用 127.0.0.1 而不是 localhost：Windows 上 localhost 会先尝试 IPv6（::1），插件只监听 IPv4，
@@ -92,7 +108,7 @@ class SocketBridge:
         return parse_output(self.execute(build_call(fn, args)))
 
 
-class InProcessBridge:
+class InProcessBridge(_Commands):
     """当前 Python 能 import bpy 时，直接在本进程执行。行为和插件里的 execute_code 一样：
     每次用一个新的命名空间执行，捕获打印输出。"""
 

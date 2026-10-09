@@ -30,7 +30,8 @@ from rightofway.blender.evaluate import evaluate
 from rightofway.blender.shared_session import R_OTHER_AI, R_RESERVED, SharedSession
 from rightofway.runtime import POLICY_DISCARD, Runtime
 from experiments import scenario_tree as sc
-from experiments.common import banner, say, use_utf8_console, wait_for_human, write_row
+from experiments.common import (InvariantLog, banner, breach_objects, say, say_alert, use_utf8_console,
+                                wait_for_human, write_row)
 from experiments.exp_a_shared import _SETUP
 
 LAYOUT, LOOK = "layout", "look"
@@ -73,6 +74,7 @@ def main(argv=None) -> None:
     s.add_agent(LAYOUT, "布局")
     s.add_agent(LOOK, "材质")
     s.start()
+    inv = InvariantLog(protect)
     variant = (f"有保护（{'按面' if args.granularity == 'aspect' else '按对象'}）" if protect else "对照组：没有保护")
     banner(f"实验 D：两个 AI + 一个人（{variant}，人：{'真人' if args.human == 'real' else '模拟'}）")
 
@@ -80,6 +82,8 @@ def main(argv=None) -> None:
         say("ai", f"「{s.agent_names[agent]}」{what}")
         r = s.run_agent(code, what, protect=protect, agent=agent)
         say("rt", f"回给「{s.agent_names[agent]}」的说明：\n" + r.text)
+        say_alert(r)
+        inv.after_run(s, r)
         return r
 
     def look(agent: str) -> list[str]:
@@ -125,7 +129,8 @@ def main(argv=None) -> None:
     look(LOOK)
     reports.append(run(LOOK, sc.ai_look_retry(scene), "看了最新情况后重试：树干 1.2"))
 
-    final = bridge.call("poll", {"scene": scene} if scene else {})["records"]
+    inv.at_end(s)
+    final = s.scene_records()
     ev = evaluate(rt, final, s.human, granularity=args.granularity, labels=s.labels)
     between = sum(1 for r in reports for x in r.skipped if x["reason"] in (R_OTHER_AI, R_RESERVED))
     resur = sum(len(r.resurrections) for r in reports)
@@ -133,6 +138,7 @@ def main(argv=None) -> None:
     trunk = next((r for r in final.values() if r["name"] == "Trunk"), None)
     banner("结果")
     say("info", ev.summary())
+    say("info", inv.summary())
     say("info", f"AI 之间的冲突被拦下：{between} 处；AI 重建了人删掉的对象：{resur} 个；恢复出错：{errors} 处")
     if trunk is not None:
         say("info", f"树干最后的缩放：{s.values.get(trunk['id'], {}).get('scale', '?')}"
@@ -141,7 +147,8 @@ def main(argv=None) -> None:
         path = write_row({
             "实验": "D 多个AI+人", "做法": variant, "人": "真人" if args.human == "real" else "模拟",
             "人的修改被覆盖": len(ev.human_overwritten), "AI的修改丢失": len(ev.ai_lost),
-            "被删对象被AI重建": resur, "恢复或合并出错": errors, "AI候选": 0,
+            "被删对象被AI重建": resur, "恢复或合并出错": errors, "不变量违反": inv.column(),
+            "违规": breach_objects(reports) if protect else "—", "AI候选": 0,
             "AI修改生效": sum(len(r.committed) for r in reports), "AI修改未采用": sum(len(r.skipped) for r in reports),
             "人看到AI结果要等(秒)": round(max(r.seconds for r in reports), 4),
             "备注": f"AI 之间的冲突被拦下 {between} 处"})

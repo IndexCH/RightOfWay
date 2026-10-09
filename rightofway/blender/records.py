@@ -84,14 +84,23 @@ def unit_ids(cid: str, granularity: str, faces) -> list[str]:
 
 
 def units(recs: Records, granularity: str) -> dict[str, dict]:
-    """把对象记录展开成单元。按面展开时，每个单元的指纹就是那个面的指纹。"""
+    """把对象记录展开成单元。按面展开时，每个单元的指纹就是那个面的指纹。
+    单元里还带着对象的名字、类型、父对象和显示名（数据块还有用它的个数）：认回同一个对象、拦下"补回人删掉的对象"时要用。"""
     if granularity == OBJECT:
         return dict(recs)
     out = {}
     for cid, r in recs.items():
+        meta = {k: r[k] for k in ("type", "parent", "kind", "display", "users") if r.get(k) is not None}
         for a, fp in r["aspects"].items():
-            out[unit_id(cid, a)] = {"id": cid, "aspect": a, "name": r["name"], "fp": fp, "cfp": fp}
+            out[unit_id(cid, a)] = {"id": cid, "aspect": a, "name": r["name"], "fp": fp, "cfp": fp, **meta}
     return out
+
+
+def display(rec: dict | None, fallback: str = "") -> str:
+    """给人和 AI 看的名字。数据块（材质、网格……）带上类型，例如"RightOfWay_Leaf（材质）"。"""
+    if not rec:
+        return fallback
+    return rec.get("display") or rec.get("name") or fallback
 
 
 def label(face: str, labels: Labels | None = None) -> str:

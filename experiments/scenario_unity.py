@@ -126,3 +126,22 @@ HUMAN_STEPS = [
     "选中 Leaf_3，在 Inspector 的 Transform 里把 Position 的 Y 改大一点（或者用移动工具往上拖）",
     "菜单 GameObject → 3D Object → Cube 新建一个立方体，在 Inspector 里把 Position 的 Y 改成 1.5 左右（悬在空中）",
 ]
+
+
+# ---------------------------------------------------------------------------
+# 实验 E：AI 删掉人刚改过的对象（v0.5 第 1 步，用不变量检查复现问题）
+# ---------------------------------------------------------------------------
+HUMAN_MOVE_LEAF3 = _HELPERS + r'''
+        var l3 = Find("Leaf_3").transform;                                   // 人把 Leaf_3 往上挪
+        var p3 = l3.localPosition; p3.y += 0.8f; l3.localPosition = p3;
+'''
+
+AI_DELETE_LEAF3 = _HELPERS + r'''
+        // AI 按旧印象：觉得 Leaf_3 多余，删掉；顺手把 Leaf_1 放大一点
+        var l3 = Find("Leaf_3");
+        if (l3 != null) UnityEngine.Object.DestroyImmediate(l3);
+        var l1 = Find("Leaf_1");
+        if (l1 != null) { result.RegisterObjectModification(l1.transform); l1.transform.localScale = Vector3.one * 1.44f; }
+'''
+
+HUMAN_STEPS_E = ["在 Hierarchy 里选中 Leaf_3，在 Inspector 的 Transform 里把 Position 的 Y 改大一点"]

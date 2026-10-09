@@ -5,10 +5,10 @@
       "label": "初始化环境（创建 .venv 并安装依赖）",
       "type": "shell",
       "windows": {
-        "command": "python -m venv .venv; .venv\\Scripts\\python -m pip install -e \".[dev]\""
+        "command": "python -m venv .venv; .venv\\Scripts\\python -m pip install -e \".[dev,proxy]\""
       },
-      "osx": { "command": "python3 -m venv .venv && .venv/bin/python -m pip install -e '.[dev]'" },
-      "linux": { "command": "python3 -m venv .venv && .venv/bin/python -m pip install -e '.[dev]'" },
+      "osx": { "command": "python3 -m venv .venv && .venv/bin/python -m pip install -e '.[dev,proxy]'" },
+      "linux": { "command": "python3 -m venv .venv && .venv/bin/python -m pip install -e '.[dev,proxy]'" },
       "problemMatcher": []
     },
     {

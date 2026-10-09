@@ -18,6 +18,10 @@
     edit_file(args)   打开一个 .blend，执行一段脚本，保存（模拟 AI 用 computer use 改自己的副本）
     merge_file(args)  打开人的 .blend，按合并计划换入/删除对象，保存到新路径   方式二
 结果用 _rightofway_out() 打印在两个标记之间，调用方从标准输出里取出来。
+
+方式一（poll、run_agent 带参数 data_units=True）里，对象引用的数据块（材质、网格、灯光数据……）各自是一个单元，
+有自己的编号和面；对象的面里只记"引用了哪个数据块"。这样人改一次共用材质只记一次，恢复时也写回同一个数据块。
+哪些数据块算数据块、它们有哪些面，同样从 RNA 读出，不手写。
 """
 import array
 import base64
@@ -91,12 +95,31 @@ def _base_name(name):
 
 
 def _ref(idb):
-    """对另一个数据块的引用：只记它是谁。"""
+    """对另一个数据块的引用：只记它是谁。单独追踪的数据块按编号记，改名不算变。"""
     if idb is None:
         return None
     if isinstance(idb, bpy.types.Object):
         return "obj:" + str(idb.get(ID_KEY) or idb.name)
+    if _is_unit_data(idb):
+        return "data:" + str(idb[ID_KEY])
     return "id:" + type(idb).__name__ + ":" + _base_name(idb.name)
+
+
+_DATA_UNITS = False      # 方式一：对象引用的数据块各自是一个单元（poll、run_agent 的参数 data_units）
+
+
+def _set_data_units(args):
+    global _DATA_UNITS
+    _DATA_UNITS = bool((args or {}).get("data_units"))
+
+
+def _is_unit_data(idb):
+    """单独作为单元追踪的数据块：盖过章、不是对象、不是内嵌数据、不来自链接的库。"""
+    try:
+        return (_DATA_UNITS and isinstance(idb, bpy.types.ID) and not isinstance(idb, bpy.types.Object)
+                and idb.library is None and not getattr(idb, "is_embedded_data", False) and bool(idb.get(ID_KEY)))
+    except Exception:
+        return False
 
 
 def _val(v):
@@ -160,6 +183,12 @@ def _walk(v, depth, cache, in_object):
         if getattr(v, "is_embedded_data", False):
             return _id_content(v, cache)               # 内嵌数据（材质的节点树）算作内容
         if in_object and not isinstance(v, bpy.types.Object):
+            if "collect" in cache:                     # 只是找出对象引用了哪些数据块
+                if v.library is None:
+                    cache["collect"][v.as_pointer()] = v
+                return None
+            if _is_unit_data(v):
+                return _ref(v)                         # 数据块单独成单元：对象这一面只记引用了哪个
             return [_ref(v), _id_content(v, cache)]
         return _ref(v)
     if isinstance(v, bpy.types.bpy_prop_collection):
@@ -228,11 +257,154 @@ def object_faces(o, cache):
 
 
 def face_labels():
-    """面的显示名，来自 Blender 自己的界面文字（Blender 界面是中文时就是中文）。"""
+    """面的显示名，来自 Blender 自己的界面文字（Blender 界面是中文时就是中文）。
+    方式一里再加上追踪的数据块那些类型的属性名（对象的同名属性优先）。"""
     tr = getattr(bpy.app.translations, "pgettext_iface", lambda x: x)
     labels = {p.identifier: tr(p.name) for p in bpy.types.Object.bl_rna.properties}
     labels["users_collection"] = tr("Collections")
+    if _DATA_UNITS:
+        seen = set()
+        for idb, _ in _tracked_data():
+            t = type(idb)
+            if t in seen:
+                continue
+            seen.add(t)
+            for p in idb.bl_rna.properties:
+                labels.setdefault(p.identifier, tr(p.name))
+        labels.setdefault("[props]", tr("Custom Properties"))
     return labels
+
+
+# ---------------------------------------------------------------------------
+# 数据块（方式一）：对象引用的材质、网格、灯光数据……各自是一个单元
+# ---------------------------------------------------------------------------
+_DATA_COLLS = None
+
+
+def _data_collections():
+    """bpy.data 里装数据块的集合名，从 RNA 读出。对象单独追踪，不在其中。"""
+    global _DATA_COLLS
+    if _DATA_COLLS is None:
+        names = []
+        for p in bpy.types.BlendData.bl_rna.properties:
+            if p.type != "COLLECTION" or p.identifier == "objects":
+                continue
+            try:
+                coll = getattr(bpy.data, p.identifier)
+            except Exception:
+                continue
+            if isinstance(coll, bpy.types.bpy_prop_collection):
+                names.append(p.identifier)
+        _DATA_COLLS = names
+    return _DATA_COLLS
+
+
+def _tracked_data():
+    """盖过章的数据块：[(数据块, 所在集合名)]。还在文件里就追踪（没有对象用它也一样），从 bpy.data 里移除才算删除。"""
+    out = []
+    for cname in _data_collections():
+        for idb in getattr(bpy.data, cname):
+            try:
+                if (isinstance(idb, bpy.types.ID) and idb.library is None and idb.get(ID_KEY)
+                        and not getattr(idb, "is_embedded_data", False)):
+                    out.append((idb, cname))
+            except Exception:
+                continue
+    return out
+
+
+def _find_data(cid, exclude=()):
+    for idb, cname in _tracked_data():
+        if idb.get(ID_KEY) == cid and idb.as_pointer() not in exclude:
+            return idb, cname
+    return None, None
+
+
+def _data_refs(objs):
+    """这些对象直接引用的数据块（不是对象、不是内嵌数据、不来自链接的库）。和算指纹时走同一条路径。"""
+    cache = {"collect": {}}
+    for o in objs:
+        for p in _content_props(o):
+            if p.type not in ("POINTER", "COLLECTION"):
+                continue
+            try:
+                v = getattr(o, p.identifier)
+            except Exception:
+                continue
+            _walk(v, 0, cache, in_object=True)
+    return list(cache["collect"].values())
+
+
+def _ensure_data_ids(objs, prefix):
+    """给对象引用的数据块盖章。复制出来的数据块（ID.copy() 连自定义属性一起复制）带着原来的编号，这里区分开。"""
+    groups = {}
+    for idb, _ in _tracked_data():
+        groups.setdefault(idb[ID_KEY], []).append(idb)
+    for cid, group in groups.items():
+        if len(group) > 1:
+            keeper = next((d for d in group if d.get(UID_KEY) == getattr(d, "session_uid", None)), group[0])
+            for d in group:
+                if d is not keeper:
+                    del d[ID_KEY]
+    for idb, _ in _tracked_data():
+        uid = getattr(idb, "session_uid", None)
+        if uid is not None and idb.get(UID_KEY) != uid:
+            idb[UID_KEY] = uid
+    new = []
+    for idb in _data_refs(objs):
+        if not idb.get(ID_KEY):
+            idb[ID_KEY] = prefix + uuid.uuid4().hex[:10]
+            new.append(idb[ID_KEY])
+            uid = getattr(idb, "session_uid", None)
+            if uid is not None:
+                idb[UID_KEY] = uid
+    return new
+
+
+def data_faces(idb, cache):
+    """数据块的每个面一个指纹：它的每个顶层属性，引用别的数据块的只记引用，外加自定义属性。"""
+    faces = {}
+    for p in _content_props(idb):
+        try:
+            v = getattr(idb, p.identifier)
+        except Exception:
+            continue
+        if (p.type == "COLLECTION" and len(v) > 0 and isinstance(v[0], bpy.types.ID)):
+            faces[p.identifier] = _md5([_ref(x) for x in v])       # 引用列表（例如网格上的材质）
+            continue
+        faces[p.identifier] = _md5(_walk(v, 0, cache, in_object=False))
+    try:
+        keys = [k for k in idb.keys() if not k.startswith("rightofway_")]
+        if keys:
+            faces["[props]"] = _md5(sorted((k, repr(idb[k].to_dict() if hasattr(idb[k], "to_dict") else
+                                                    idb[k].to_list() if hasattr(idb[k], "to_list") else idb[k]))
+                                           for k in keys))
+    except Exception:
+        pass
+    return faces
+
+
+def _data_display(idb):
+    tr = getattr(bpy.app.translations, "pgettext_iface", lambda x: x)
+    return f"{idb.name}（{tr(idb.bl_rna.name)}）"
+
+
+def _data_record(idb, cname, cache, values, known):
+    aspects = data_faces(idb, cache)
+    cfp, fp = _fps(aspects)
+    cid = idb[ID_KEY]
+    rec = {"id": cid, "name": idb.name, "type": "data:" + type(idb).__name__, "kind": "data", "coll": cname,
+           "display": _data_display(idb), "cfp": cfp, "fp": fp, "aspects": aspects, "parent": None,
+           "collections": [], "editing": False, "selected": False, "users": idb.users}
+    if values is not None:
+        if values == "all" or cid not in values:
+            want = list(aspects)
+        else:
+            old = values[cid]
+            want = [f for f, fp_ in aspects.items() if old.get(f) != fp_]
+        if want:
+            rec["values"] = object_values(idb, [f for f in want if f != "[props]"])
+    return rec
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +534,8 @@ def ensure_ids(scene, prefix="h-", deterministic=False):
             uid = getattr(o, "session_uid", None)
             if uid is not None and o.get(UID_KEY) != uid:
                 o[UID_KEY] = uid
+    if _DATA_UNITS and not deterministic:
+        new += _ensure_data_ids(objs, prefix)
     return new
 
 
@@ -417,6 +591,12 @@ def records(scene, values=None, only=None):
             if want:
                 rec["values"] = object_values(o, want)
         out[cid] = rec
+    if _DATA_UNITS:
+        for idb, cname in _tracked_data():
+            cid = idb.get(ID_KEY)
+            if only is not None and cid not in only:
+                continue
+            out[cid] = _data_record(idb, cname, cache, values, None)
     return out
 
 
@@ -441,10 +621,16 @@ def _content_fp(idblock, cache):
     return _md5([_id_content(idblock, cache), mats])
 
 
+def _pointers():
+    """追加前各类数据块的指针，_settle 用来找出新带进来的。方式一里是全部数据块集合。"""
+    colls = set(_DEDUP_COLLECTIONS) | (set(_data_collections()) if _DATA_UNITS else set())
+    return {c: set(x.as_pointer() for x in getattr(bpy.data, c)) for c in colls}
+
+
 def _append(path, names):
     """从 path 追加指定名字的对象。返回 {文件里的名字: 新对象}、间接带进来的对象、追加前各类数据块的指针。"""
     before_objs = set(o.as_pointer() for o in bpy.data.objects)
-    before = {c: set(x.as_pointer() for x in getattr(bpy.data, c)) for c in _DEDUP_COLLECTIONS}
+    before = _pointers()
     with bpy.data.libraries.load(path, link=False) as (src, dst):
         wanted = [n for n in names if n in src.objects]
         dst.objects = list(wanted)
@@ -467,6 +653,22 @@ def _settle(scene, extras, before, report, tidy=True):
         else:
             report.setdefault("dangling", []).append(extra.name)
         bpy.data.objects.remove(extra, do_unlink=True)
+    if _DATA_UNITS:
+        # 快照里带出来的数据块副本（带着同一个编号）：一律指回场景里现在的那一个。
+        # 数据块自己的内容由它自己的单元管（先于对象恢复），对象这边只管"引用了哪个"。
+        for coll in _data_collections():
+            if coll not in before:
+                continue
+            pool = getattr(bpy.data, coll)
+            current = {}
+            for x in pool:
+                if x.as_pointer() in before[coll] and x.get(ID_KEY):
+                    current[x[ID_KEY]] = x
+            for new in [x for x in pool if x.as_pointer() not in before[coll]]:
+                sid = new.get(ID_KEY)
+                if sid and sid in current:
+                    new.user_remap(current[sid])
+                    pool.remove(new)
     cache = {}
     for coll in _DEDUP_COLLECTIONS:
         pool = getattr(bpy.data, coll)
@@ -476,6 +678,7 @@ def _settle(scene, extras, before, report, tidy=True):
                 continue
             for old in pool:
                 if (old.as_pointer() in before[coll] and _base_name(old.name) == _base_name(new.name)
+                        and old.get(ID_KEY) == new.get(ID_KEY)          # 单独追踪的数据块不和别的合并
                         and _content_fp(old, cache) == _content_fp(new, cache)):
                     new.user_remap(old)
                     pool.remove(new)
@@ -621,6 +824,12 @@ def _copy_face(scene, dst, face, src, src_rec):
         _set_collections(scene, dst, src_rec.get("collections", []))
     elif face == "name":
         dst.name = src_rec["name"]
+    elif face == "[props]":
+        for k in [k for k in dst.keys() if not k.startswith("rightofway_")]:
+            del dst[k]
+        for k in src.keys():
+            if not k.startswith("rightofway_"):
+                dst[k] = src[k]
     else:
         p = dst.bl_rna.properties.get(face)
         if p is None:
@@ -631,12 +840,14 @@ def _copy_face(scene, dst, face, src, src_rec):
 _FACE_ORDER = {"data": 0}     # 先换数据块，它会连带改变别的面（例如材质槽），后面的面再按需要改回来
 
 
-def apply_faces(scene, dst, want):
+def apply_faces(scene, dst, want, faces_fn=None):
     """want = {面: (来源对象, 来源记录, 期望的指纹)}。
     先把和期望不同的面从各自的来源复制过来；再核对一遍，被连带改掉的面再复制一次。
-    返回仍然对不上的面（调用方据此决定是否整个换回）。"""
+    返回仍然对不上的面（调用方据此决定是否整个换回）。faces_fn：算面的指纹的函数（数据块用 data_faces）。"""
+    faces_fn = faces_fn or object_faces
+
     def mismatched():
-        now = object_faces(dst, {})
+        now = faces_fn(dst, {})
         return [f for f, (_, _, fp) in want.items() if now.get(f) != fp]
 
     for _ in range(2):
@@ -650,6 +861,70 @@ def apply_faces(scene, dst, want):
             except Exception:
                 pass
     return mismatched()
+
+
+def _restore_data(scene, snap_path, before, after, full, partial, restored, merged, fallback, report):
+    """恢复要保持的数据块，写回同一个数据块，不分叉：
+    - 只有部分面要保持：把这些面从快照里的副本复制到现在的数据块上；
+    - 整个要保持（或者按面复制没能还原）：现在的数据块的所有使用者改指向快照里的副本（user_remap），
+      副本接过编号和名字，原来的删掉。所以任何时候都只有一个数据块带着这个编号，用它的对象全部跟着走。"""
+    by_coll = {}
+    for cid in list(full) + list(partial):
+        by_coll.setdefault(before[cid]["coll"], []).append(cid)
+    bef = _pointers()
+    with bpy.data.libraries.load(snap_path, link=False) as (src, dst):
+        for coll, cids in by_coll.items():
+            avail = set(getattr(src, coll))
+            setattr(dst, coll, [before[c]["name"] for c in cids if before[c]["name"] in avail])
+    loaded = {}
+    for coll, cids in by_coll.items():
+        pool = getattr(bpy.data, coll)
+        fresh = [x for x in pool if x.as_pointer() not in bef.get(coll, set())]
+        for c in cids:
+            loaded[c] = next((x for x in fresh if x.get(ID_KEY) == c), None)
+
+    def replace(cid, tmp):
+        cur, coll = _find_data(cid, exclude={tmp.as_pointer()})
+        if cur is not None:
+            cur.user_remap(tmp)
+            getattr(bpy.data, coll).remove(cur)
+        tmp[ID_KEY] = cid
+        uid = getattr(tmp, "session_uid", None)
+        if uid is not None:
+            tmp[UID_KEY] = uid
+        tmp.name = before[cid]["name"]
+        restored.append(cid)
+
+    for cid in full:
+        tmp = loaded.get(cid)
+        if tmp is not None:
+            replace(cid, tmp)
+    for cid, asp in partial.items():
+        tmp = loaded.get(cid)
+        if tmp is None:
+            continue
+        cur, coll = _find_data(cid, exclude={tmp.as_pointer()})
+        if cur is None:
+            replace(cid, tmp)
+            continue
+        ai_copy = cur.copy()                         # AI 的版本：被连带改掉的面从这里取回
+        want = {}
+        for face in before[cid]["aspects"]:
+            if face in asp:
+                want[face] = (tmp, before[cid], before[cid]["aspects"][face])
+            elif face in after[cid]["aspects"]:
+                want[face] = (ai_copy, after[cid], after[cid]["aspects"][face])
+        left = apply_faces(scene, cur, want, faces_fn=data_faces)
+        getattr(bpy.data, coll).remove(ai_copy)
+        if not left:
+            merged[cid] = {"restored": list(asp),
+                           "kept": sorted(x for x in before[cid]["aspects"]
+                                          if after[cid]["aspects"].get(x) != before[cid]["aspects"][x] and x not in asp)}
+            getattr(bpy.data, coll).remove(tmp)
+        else:                                        # 按面复制没能完全还原：整个换回
+            replace(cid, tmp)
+            fallback.append({"id": cid, "faces": left})
+    _settle(scene, [], bef, report, tidy=False)
 
 
 def _put_candidate(scene, new, cid, name):
@@ -674,7 +949,9 @@ def _put_candidate(scene, new, cid, name):
 # 方式一：同一份，实时
 # ---------------------------------------------------------------------------
 def poll(args):
-    """args.known = {编号: {面: 指纹}}：只带回和它不一样的面的值；没有 known 时带回全部值。"""
+    """args.known = {编号: {面: 指纹}}：只带回和它不一样的面的值；没有 known 时带回全部值。
+    args.data_units：方式一里数据块单独作为单元。"""
+    _set_data_units(args)
     scene = _scene(args)
     ensure_ids(scene, prefix=args.get("prefix", "h-"))
     known = args.get("known")
@@ -730,56 +1007,236 @@ def _restore_selection(scene, vl, state):
             continue
 
 
+# ---------------------------------------------------------------------------
+# 认回同一个对象（design_v0.5.md 12.4、12.5）。配对规则在 identity.py（bridge 把它放在这个文件前面一起发进来，
+# 运行时用的是同一份），这里只照许可单做，不做别的判断。
+# ---------------------------------------------------------------------------
+PROBE_NAME = "RightOfWayProbe"
+
+
+def probe(args):
+    """连接时的自测（design_v0.5.md 第 4 节）。能做到什么不手写，而是测出来：
+    - 应用给两个同名的东西起什么名字（运行时据此学出重名后缀）；
+    - 在一个临时场景里，用和平时完全一样的 run_agent / begin_agent / finish_agent 试一遍：
+      改掉的面能不能按面恢复、删掉的对象能不能恢复、两次调用之间的修改（不透明的工具调用）能不能恢复。
+    临时场景和里面的东西最后都删掉，你的场景不受影响（文件会被标成"已修改"）。"""
+    base = PROBE_NAME + "_" + uuid.uuid4().hex[:6]
+    a = bpy.data.objects.new(base, None)
+    b = bpy.data.objects.new(base, None)
+    names = [a.name, b.name]
+    bpy.data.objects.remove(a)
+    bpy.data.objects.remove(b)
+    out = {"names": names, "identity": True, "transfer_ids": True, "notify": True, "atomic": True, "measured": True}
+    out.update(_self_test(base))
+    return out
+
+
+def _self_test(base):
+    """改一个面、删掉对象、在 begin/finish 之间改，三种情况各试一次，看要保持的部分最后是不是和原来一样。"""
+    saved = _DATA_UNITS
+    sc = bpy.data.scenes.new(base)
+    made = []
+    result = {"restore_face": False, "restore_deleted": False, "around": False}
+    try:
+        def fresh():
+            for o in list(sc.objects):
+                bpy.data.objects.remove(o, do_unlink=True)
+            me = bpy.data.meshes.new(base + "_mesh")
+            o = bpy.data.objects.new(base + "_obj", me)
+            sc.collection.objects.link(o)
+            made.append(me)
+            common = {"scene": sc.name, "prefix": "p-", "watch_outside": False, "undo_push": False,
+                      "restore_selection": False, "defer_if_editing": False}
+            cid = next(iter(poll(common)["records"]))
+            return o.name, cid, common
+
+        def same(res, cid):
+            return cid in res["after"] and res["after"][cid]["cfp"] == res["before"][cid]["cfp"]
+
+        name, cid, common = fresh()
+        move = f"o = bpy.data.objects[{name!r}]\no.location.x += 1\n"
+        res = run_agent({**common, "code": move, "protected": {cid: ["location"]}})
+        result["restore_face"] = same(res, cid)
+        name, cid, common = fresh()
+        res = run_agent({**common, "code": f"bpy.data.objects.remove(bpy.data.objects[{name!r}])",
+                         "protected": {cid: ["*"]}})
+        result["restore_deleted"] = same(res, cid)
+        name, cid, common = fresh()
+        b = begin_agent({**common, "protected": {cid: ["location"]}})
+        bpy.data.objects[name].location.x += 1                # 两次调用之间的修改（代理转发的工具调用）
+        res = finish_agent({"token": b["token"]})
+        result["around"] = same(res, cid)
+    except Exception:
+        traceback.print_exc()
+    finally:
+        for o in list(sc.objects):
+            bpy.data.objects.remove(o, do_unlink=True)
+        bpy.data.scenes.remove(sc)
+        for me in list(bpy.data.meshes):
+            if me.name.startswith(base) and me.users == 0:
+                bpy.data.meshes.remove(me)
+        _set_data_units({"data_units": saved})
+    return result
+
+
+def notify(args):
+    """给人的提醒（违规、AI 反复改改不动的东西、认回核对不一致）：在 Blender 界面里弹出提示；没有界面时只打印。"""
+    text = str((args or {}).get("text", ""))
+    lines = []
+    for para in text.splitlines() or [""]:
+        while len(para) > 60:
+            lines.append(para[:60])
+            para = para[60:]
+        lines.append(para)
+    shown = False
+    try:
+        wm = bpy.context.window_manager
+        if wm.windows:
+            def draw(menu, _context):
+                for line in lines:
+                    menu.layout.label(text=line)
+            with bpy.context.temp_override(window=wm.windows[0]):
+                wm.popup_menu(draw, title="RightOfWay", icon="ERROR")
+            shown = True
+    except Exception:
+        shown = False
+    print("RightOfWay 提醒：" + text)
+    return {"shown": shown}
+
+
+def _row(x):
+    if isinstance(x, bpy.types.Object):
+        return {"name": x.name, "type": x.type, "parent": (x.parent.get(ID_KEY) if x.parent else None)}
+    return {"name": x.name, "type": "data:" + type(x).__name__, "parent": None}
+
+
+def _stamp(x, cid):
+    x[ID_KEY] = cid
+    uid = getattr(x, "session_uid", None)
+    if uid is not None:
+        x[UID_KEY] = uid
+
+
+def _unstamp(x):
+    for k in (ID_KEY, UID_KEY):
+        if k in x:
+            del x[k]
+
+
+def _identity(scene, before, created, args):
+    """认回同一个对象。三种旧对象和这次新建的对象配对（identity.match_identities：同一个父对象下从上往下，
+    先比完整名字、再比去掉重名后缀的名字，类型相同，一对一，有歧义就不配）：
+      gone    这次执行里 Agent 删掉的（数据块：从文件里删掉，或者执行前有对象用、执行后没有了）；
+      rebind  Agent 之前想删、因为人改过而保留下来的（许可单的 rebind）；
+      tomb    人删掉、这个 Agent 还没看到的（许可单的 no_recreate，墓碑）。
+    配上的新对象接过旧编号，之后的保护步骤照常把人改过的面恢复到它身上：
+      rebind、还留在文件里的 gone 数据块（没人用了）：引用旧的（子对象、修改器……）改指向新的，删掉旧的；
+      tomb：新对象在恢复之后删掉（_remove_recreated）。
+    去掉后缀才配上的，名字还给它（后缀只是因为和旧的重名，旧的已经不在了）。
+    先配对象，再配数据块（删掉旧对象之后，它用的数据块才没人用）。
+    返回 (交给运行时核对的 {"pairs", "kinds", "fresh"}, 要删掉的墓碑编号)。"""
+    rule = args.get("reidentify") or {}
+    pattern = rule.get("suffix")
+    out = {"pairs": {}, "kinds": {}, "fresh": {}}
+    tombs = []
+    for phase in ("object", "data"):
+        objs = {o.get(ID_KEY): o for o in _tracked(scene) if o.get(ID_KEY)}
+        datas = {d.get(ID_KEY): (d, c) for d, c in _tracked_data()} if _DATA_UNITS else {}
+        olds, kinds = {}, {}
+        for cid, r in before.items():
+            is_data = r.get("kind") == "data"
+            if is_data != (phase == "data") or cid in out["pairs"]:
+                continue
+            row = {"name": r["name"], "type": r["type"], "parent": r.get("parent")}
+            if is_data:
+                d = datas.get(cid)
+                if d is None or (r.get("users", 0) > 0 and d[0].users == 0):
+                    olds[cid], kinds[cid] = row, "gone"
+            elif cid not in objs:
+                olds[cid], kinds[cid] = row, "gone"
+        for cid in sorted(args.get("rebind") or {}):
+            r = before.get(cid)
+            if (r is not None and cid not in olds and (r.get("kind") == "data") == (phase == "data")
+                    and (cid in objs or cid in datas)):
+                olds[cid], kinds[cid] = {"name": r["name"], "type": r["type"], "parent": r.get("parent")}, "rebind"
+        if phase == "object":
+            for cid, row in sorted((args.get("no_recreate") or {}).items()):
+                if cid not in before and cid not in objs:
+                    olds[cid], kinds[cid] = ({"name": row.get("name"), "type": row.get("type"),
+                                              "parent": row.get("parent")}, "tomb")
+        fresh, made = {}, {}
+        for cid in created:
+            x = objs.get(cid) if phase == "object" else (datas.get(cid) or (None,))[0]
+            if x is not None:
+                fresh[cid], made[cid] = _row(x), x
+        pairs = match_identities(olds, fresh, pattern) if olds and fresh else {}
+        for old, (new, level) in sorted(pairs.items()):
+            x, kind = made[new], kinds[old]
+            pool = bpy.data.objects if phase == "object" else getattr(bpy.data, datas[new][1])
+            if kind == "rebind" or (kind == "gone" and old in datas):
+                # 保留下来的旧对象、没人用了的旧数据块：引用改指向新的，删掉旧的。一个编号只对应一个东西，
+                # 旧的也不再占着名字（没人用的数据块存盘时 Blender 本来也会丢掉）
+                k = objs[old] if phase == "object" else datas[old][0]
+                if phase == "object":
+                    for c in list(k.users_collection):
+                        c.objects.unlink(k)             # 所在集合由新对象自己决定，不跟着换
+                k.user_remap(x)                         # 子对象、修改器……原来引用旧对象的，改指向新对象
+                (bpy.data.objects if phase == "object" else getattr(bpy.data, datas[old][1])).remove(k)
+            _stamp(x, old)
+            if kind == "tomb":
+                tombs.append(old)
+            elif level == "suffix":
+                want = before[old]["name"]
+                if x.name != want and pool.get(want) is None:
+                    x.name = want
+            out["pairs"][old] = [new, level]
+            out["kinds"][old] = kind
+            out["fresh"][new] = fresh[new]
+    return out, tombs
+
+
+def _remove_recreated(scene, tombs, created):
+    """拦下"补回人删掉的对象"（design_v0.5.md 12.5）：删掉配上墓碑的新对象，
+    以及这次新建、只给它用的数据块（删完之后没人用了的）。"""
+    removed = []
+    for cid in tombs:
+        o = _find(scene, cid)
+        if o is None:
+            continue
+        refs = [d for d in _data_refs([o]) if d.get(ID_KEY) in created]
+        bpy.data.objects.remove(o, do_unlink=True)
+        removed.append(cid)
+        for d in refs:
+            if d.users == 0:
+                x, cname = _find_data(d.get(ID_KEY))
+                if x is not None:
+                    getattr(bpy.data, cname).remove(x)
+    return removed
+
+
 def run_agent(args):
     """原子地执行 AI 的一段脚本。Blender 是单线程的，这个函数执行期间人不可能同时操作。
 
+    这里只照运行时开的许可单执行，自己不判断哪些该保护（design_v0.5.md 第 2 节，P9）。
+
     args:
       code         AI 的脚本
-      protected    {编号: [要保护的面]}，"*" 表示整个对象（人碰过或正被占用的部分）
-      known        运行时上次看到的 {编号: {"fp", "aspects"}}；和现在不同的，说明人刚改过，也要保护
-      granularity  "aspect"（默认，按面保护）或 "object"（整个对象）
+      protected    许可单里要保持的部分 {编号: [面]}，"*" 表示整个对象
+      keep_alive   许可单里不许删、但面可以改的对象（要保持的对象的祖先）：被删了就整个放回
+      expected     运行时以为的执行前状态 {编号: 指纹}；和实际不一样（人刚改过、刚新建或删除了对象），
+                   就不执行，返回 status "replan"，由运行时先记下人的修改、重开许可单
+      expected_selection  运行时以为人选中的对象（"选中即占用"选项开启时才给）；不一样同样返回 "replan"
+      known        这个 AI 上次看到的 {编号: {"fp", "aspects"}}：只用来决定带回哪些面的值
+      reidentify   认回同一个对象的规则（许可单给的 {"rule", "suffix"}）：删掉又新建的同一个对象接过旧编号（_identity）
+      rebind       许可单的 rebind：Agent 之前想删、因为人改过而保留下来的对象，又新建了同一个的，认成它
+      no_recreate  许可单的墓碑：人删掉、这个 Agent 还没看到的对象，Agent 新建同一个的，恢复之后删掉
+      granularity  "aspect"（默认，按面）或 "object"（整个对象）
       protect      False 表示对照组：不保护
-      protect_selected  True 表示人选中的对象也不能改（"选中即占用"选项）
       scene        场景名（可选）
-    known 是这个 AI 上次看到的场景。多个 AI 时每个 AI 各有一份：别人（人或别的 AI）在它看过之后改的，
-    这次也受保护，它的脚本改到了就恢复成别人的版本（后到的让先到的）。
     """
-    t0 = time.perf_counter()
-    scene = _scene(args)
-    ensure_ids(scene, prefix=args.get("prefix", "h-"))
-    known = args.get("known", {})
-    before = records(scene, values={cid: k["aspects"] for cid, k in known.items()})
-    editing = sorted(cid for cid, r in before.items() if r["editing"])
-    if editing and args.get("defer_if_editing", True):
-        return {"status": "deferred", "reason": "edit_mode", "editing": editing, "before": before}
-
-    by_object = args.get("granularity", "aspect") == "object"
-    protected = {cid: set(v) for cid, v in args.get("protected", {}).items()}
-    selected = sorted(cid for cid, r in before.items() if r["selected"])
-    if args.get("protect_selected"):
-        for cid in selected:
-            protected[cid] = {"*"}
-    human_since = []
-    for cid, rec in before.items():
-        k = known.get(cid)
-        if k is None:
-            protected[cid] = {"*"}                  # 上次观察之后人新建的对象：整个保护
-            human_since.append(cid)
-        elif k["fp"] != rec["fp"]:
-            changed = {"*"} if by_object else {a for a in rec["aspects"] if k["aspects"].get(a) != rec["aspects"][a]}
-            protected.setdefault(cid, set()).update(changed)
-            human_since.append(cid)
-    protected = {cid: a for cid, a in protected.items() if cid in before and a}
-    do_protect = args.get("protect", True)
-    snap_path = None
-    if protected and do_protect:
-        snap_path = os.path.join(tempfile.gettempdir(), f"rightofway_snap_{uuid.uuid4().hex[:8]}.blend")
-        bpy.data.libraries.write(snap_path, set(o for o in _tracked(scene) if o.get(ID_KEY) in protected),
-                                 fake_user=False)
-    outside_before = _other_objects(scene) if args.get("watch_outside", True) else None
-    vl = _view_layer(scene)
-    sel_state = _selection_state(scene, vl)
-
+    st = _begin(args)
+    if "status" in st:
+        return st                                    # replan / deferred：没有执行
     out = io.StringIO()
     error = None
     try:
@@ -787,28 +1244,124 @@ def run_agent(args):
             exec(args["code"], {"bpy": bpy, "__name__": "__rightofway_agent__"})
     except Exception:
         error = traceback.format_exc(limit=3)
+    return _finish(st, error, out.getvalue(), "RightOfWay: AI 脚本")
+
+
+def _pending():
+    """begin_agent 和 finish_agent 之间的状态（跨两次调用）。每次调用都在新的命名空间里执行，所以放在 sys.modules 里
+    （bpy.app.driver_namespace 也能跨调用，但 pip 装的 bpy 退出时会因此卡住）。"""
+    import sys
+    import types
+    mod = sys.modules.get("_rightofway_state")
+    if mod is None:
+        mod = sys.modules["_rightofway_state"] = types.ModuleType("_rightofway_state")
+        mod.pending = {}
+    return mod.pending
+
+
+def begin_agent(args):
+    """把一次不是脚本的修改（例如 MCP 代理转发给应用 MCP 服务器的类型化工具调用）包起来：前一半。
+    和 run_agent 一样核对、快照，但不执行代码；返回 {"status": "begun", "token"}，之后调用 finish_agent。
+    两次调用之间应用里发生的一切都算这个 Agent 做的（不是原子的；代理在两次调用之间只做那一次工具调用）。"""
+    st = _begin(args)
+    if "status" in st:
+        return st
+    token = uuid.uuid4().hex
+    _pending()[token] = st
+    return {"status": "begun", "token": token}
+
+
+def finish_agent(args):
+    """后一半：和 run_agent 执行完代码之后一样，认回、恢复、核对，返回同样的结果。"""
+    st = _pending().pop(args["token"], None)
+    if st is None:
+        raise RuntimeError("找不到 begin_agent 的状态（Blender 重启过，或者已经 finish 过）")
+    return _finish(st, args.get("error"), "", "RightOfWay: AI 工具")
+
+
+def _begin(args):
+    """执行前：盖章、列对象、核对和运行时以为的一样、快照要保持的部分。返回状态 dict；不执行时返回带 status 的结果。"""
+    t0 = time.perf_counter()
+    _set_data_units(args)
+    scene = _scene(args)
+    ensure_ids(scene, prefix=args.get("prefix", "h-"))
+    known = args.get("known", {})
+    before = records(scene, values={cid: k["aspects"] for cid, k in known.items()})
+    editing = sorted(cid for cid, r in before.items() if r["editing"])
+    if editing and args.get("defer_if_editing", True):
+        return {"status": "deferred", "reason": "edit_mode", "editing": editing, "before": before}
+    selected = sorted(cid for cid, r in before.items() if r["selected"])
+    expected = args.get("expected")
+    if expected is not None:
+        changed = sorted((set(before) ^ set(expected))
+                         | {cid for cid in before if cid in expected and before[cid]["fp"] != expected[cid]})
+        sel = args.get("expected_selection")
+        if changed or (sel is not None and sorted(sel) != selected):
+            return {"status": "replan", "changed": changed, "before": before, "selected": selected,
+                    "labels": face_labels()}
+
+    protected = {cid: set(v) for cid, v in args.get("protected", {}).items()}
+    protected = {cid: a for cid, a in protected.items() if cid in before and a}
+    keep_alive = [c for c in args.get("keep_alive", []) if c in before and c not in protected]
+    do_protect = args.get("protect", True)
+    snap_path = None
+    if (protected or keep_alive) and do_protect:
+        snap_path = os.path.join(tempfile.gettempdir(), f"rightofway_snap_{uuid.uuid4().hex[:8]}.blend")
+        ids = set(o for o in _tracked(scene) if o.get(ID_KEY) in protected or o.get(ID_KEY) in keep_alive)
+        if _DATA_UNITS:
+            ids |= set(d for d, _ in _tracked_data() if d.get(ID_KEY) in protected)
+        bpy.data.libraries.write(snap_path, ids, fake_user=False)
+    outside_before = _other_objects(scene) if args.get("watch_outside", True) else None
+    vl = _view_layer(scene)
+    sel_state = _selection_state(scene, vl)
+
+    return {"t0": t0, "args": args, "before": before, "selected": selected, "protected": protected,
+            "keep_alive": keep_alive, "do_protect": do_protect, "snap_path": snap_path,
+            "outside_before": outside_before, "sel_state": sel_state}
+
+
+def _finish(st, error, stdout, undo_message):
+    """执行后：认回、恢复要保持的部分、核对，返回交给运行时的结果。"""
+    args, before, selected, protected = st["args"], st["before"], st["selected"], st["protected"]
+    keep_alive, do_protect, snap_path = st["keep_alive"], st["do_protect"], st["snap_path"]
+    outside_before, sel_state, t0 = st["outside_before"], st["sel_state"], st["t0"]
+    _set_data_units(args)
+    scene = _scene(args)
+    vl = _view_layer(scene)
     ai_created = ensure_ids(scene, prefix="a-")
+    identity, tombs = ({}, [])
+    if args.get("reidentify") and do_protect:
+        identity, tombs = _identity(scene, before, ai_created, args)
+    taken = {new for new, _ in identity.get("pairs", {}).values()}
+    ai_created = [c for c in ai_created if c not in taken]
     before_faces = {cid: r["aspects"] for cid, r in before.items()}
     after = records(scene, values=before_faces)
 
-    # 哪些要整个换回，哪些只把冲突的面换回
-    full, partial = [], {}
+    # 哪些要整个换回，哪些只把冲突的面换回（数据块和对象分开处理，数据块先恢复）
+    full, partial, data_full, data_partial = [], {}, [], {}
     for cid, asp in sorted(protected.items()):
         b, a = before[cid], after.get(cid)
+        is_data = b.get("kind") == "data"
         if a is None:
-            full.append(cid)                        # AI 删掉了受保护的对象
+            (data_full if is_data else full).append(cid)   # AI 删掉了受保护的对象或数据块
             continue
-        changed = {x for x in b["aspects"] if a["aspects"].get(x) != b["aspects"][x]}
+        changed = ({x for x in b["aspects"] if a["aspects"].get(x) != b["aspects"][x]}
+                   | (set(a["aspects"]) - set(b["aspects"])))
         conflict = changed if "*" in asp else changed & asp
         if not conflict:
             continue                                # AI 只改了人没碰过的面：照常生效
         if conflict == changed:
-            full.append(cid)
+            (data_full if is_data else full).append(cid)
         else:
-            partial[cid] = sorted(conflict)
+            (data_partial if is_data else partial)[cid] = sorted(conflict)
+    for cid in keep_alive:                          # 祖先：不许删，面照样可以改（被删了就整个放回）
+        if cid not in after:
+            full.append(cid)
 
     restored, merged, candidates, fallback, report = [], {}, [], [], {}
     keep = args.get("keep_candidates", False)
+    if snap_path and (data_full or data_partial):
+        _restore_data(scene, snap_path, before, after, data_full, data_partial, restored, merged, fallback, report)
     if snap_path and (full or partial):
         loaded, extras, bef = _append(snap_path, [before[c]["name"] for c in full + list(partial)])
         for cid in full:
@@ -850,6 +1403,7 @@ def run_agent(args):
             os.remove(snap_path)
         except OSError:
             pass
+    recreated = _remove_recreated(scene, tombs, set(ai_created)) if tombs else []
 
     if do_protect and args.get("restore_selection", True):
         _restore_selection(scene, vl, sel_state)     # 选中状态是人的界面状态，AI 的脚本改了就还原
@@ -863,15 +1417,15 @@ def run_agent(args):
                    "deleted": sorted(set(outside_before) - set(outside_after)),
                    "modified": sorted(n for n in set(outside_before) & set(outside_after)
                                       if outside_before[n] != outside_after[n])}
-    undo_pushed = _try_undo_push("RightOfWay: AI 脚本") if args.get("undo_push", True) else False
+    undo_pushed = _try_undo_push(undo_message) if args.get("undo_push", True) else False
     return {
         "status": "ok", "before": before, "after_raw": after, "after": final,
-        "human_since": sorted(human_since), "protected": {k: sorted(v) for k, v in protected.items()},
+        "protected": {k: sorted(v) for k, v in protected.items()},
         "selected": selected,
         "restored": restored, "merged": merged, "fallback": fallback,
         "inexact": inexact, "renamed": renamed, "dangling": report.get("dangling", []),
-        "candidates": candidates, "outside": outside,
-        "ai_created": ai_created, "error": error, "stdout": out.getvalue()[-4000:],
+        "candidates": candidates, "outside": outside, "identity": identity, "recreated": recreated,
+        "ai_created": ai_created, "error": error, "stdout": stdout[-4000:],
         "undo_pushed": undo_pushed, "seconds": round(time.perf_counter() - t0, 4), "labels": face_labels(),
     }
 

@@ -271,6 +271,173 @@
         "PYTHONIOENCODING": "utf-8",
         "PYTHONUTF8": "1"
       }
+    },
+    {
+      "name": "实验 E 删掉人改过的对象：模拟 Unity（不需要软件）",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "experiments.exp_e_delete",
+      "args": [
+        "--backend",
+        "fake-unity"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1"
+      }
+    },
+    {
+      "name": "实验 E 删掉人改过的对象：Blender（模拟人）",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "experiments.exp_e_delete",
+      "args": [],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1"
+      }
+    },
+    {
+      "name": "实验 E 删掉人改过的对象：Blender（真人）",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "experiments.exp_e_delete",
+      "args": [
+        "--human",
+        "real"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1"
+      }
+    },
+    {
+      "name": "实验 E 删掉人改过的对象：Unity（模拟人）",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "experiments.exp_e_delete",
+      "args": [
+        "--backend",
+        "unity"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1"
+      }
+    },
+    {
+      "name": "实验 H 真实 AI 写法：模拟 Unity（不需要软件）",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "experiments.exp_h_habits",
+      "args": [
+        "--backend",
+        "fake-unity"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1"
+      }
+    },
+    {
+      "name": "实验 H 真实 AI 写法：模拟 Unity，对照：不认回同一个对象",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "experiments.exp_h_habits",
+      "args": [
+        "--backend",
+        "fake-unity",
+        "--no-reidentify"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1"
+      }
+    },
+    {
+      "name": "实验 H 真实 AI 写法：Blender（每种组合新建一个场景）",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "experiments.exp_h_habits",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1"
+      }
+    },
+    {
+      "name": "实验 H 人改一处撞上的概率：模拟 Unity（不需要软件）",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "experiments.exp_h_habits",
+      "args": [
+        "--backend",
+        "fake-unity",
+        "--sweep"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1"
+      }
+    },
+    {
+      "name": "实验 P 经过 MCP 代理（不需要软件）",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "experiments.exp_p_proxy",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1"
+      }
+    },
+    {
+      "name": "实验 P 经过 MCP 代理：BlenderMCP（uvx blender-mcp，Blender 开着）",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "experiments.exp_p_proxy",
+      "args": [
+        "--upstream",
+        "uvx blender-mcp"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1"
+      }
+    },
+    {
+      "name": "实验 S 影子执行（试验，两个 Blender：9876、9877）",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "experiments.exp_s_shadow",
+      "args": [
+        "--backend",
+        "socket"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1"
+      }
     }
   ]
 }

@@ -34,6 +34,7 @@ internal class CommandScript : IRunCommand
             switch (FN)
             {
                 case "setup": output = Setup(args); break;
+                case "probe": output = Probe(args); break;
                 case "poll": output = Poll(args); break;
                 case "exec": output = Exec(args, result); break;
                 case "run_agent": output = RunAgent(args, result); break;
@@ -83,6 +84,22 @@ __AGENT__
         SceneManager.MoveGameObjectToScene(marker, ns);
         SceneManager.SetActiveScene(ns);
         return new Dictionary<string, object> { { "scene_handle", ns.handle.ToString() }, { "closed", closed } };
+    }
+
+    // 连接时的自测（design_v0.5.md 第 4 节）：新建两个同名的 GameObject，看 Unity 怎么起名，马上删掉。
+    // 用 HideAndDontSave 新建，不进层级面板、不会被存盘。Unity 允许重名，所以运行时学不出后缀。
+    // 其余几项还没有在 Unity 里实测（measured=false），是按这份接入代码现在的能力如实填的：
+    // 能按面恢复（CopyFromSerializedProperty）；恢复不了删除；没有 begin/finish；没有实现"认回同一个对象"；编号不能转交。
+    static object Probe(Dictionary<string, object> args)
+    {
+        var a = EditorUtility.CreateGameObjectWithHideFlags("RightOfWayProbe", HideFlags.HideAndDontSave);
+        var b = EditorUtility.CreateGameObjectWithHideFlags("RightOfWayProbe", HideFlags.HideAndDontSave);
+        var names = new List<object> { a.name, b.name };
+        UnityEngine.Object.DestroyImmediate(a);
+        UnityEngine.Object.DestroyImmediate(b);
+        return new Dictionary<string, object> { { "names", names }, { "identity", false }, { "transfer_ids", false },
+                                                { "around", false }, { "restore_deleted", false }, { "notify", false },
+                                                { "restore_face", true }, { "atomic", true }, { "measured", false } };
     }
 
     static IEnumerable<GameObject> AllGameObjects(Scene s)
@@ -313,29 +330,33 @@ __AGENT__
         var objs = new Dictionary<string, UnityEngine.Object>();
         var known = (Dictionary<string, object>)args["known"];
         var before = Records(scene, labels, objs, KnownFaces(known), true);
-        bool byObject = (string)args["granularity"] == "object";
+        // 只照运行时开的许可单执行，自己不判断哪些该保护（design_v0.5.md 第 2 节）
         var prot = new Dictionary<string, List<string>>();
         foreach (var kv in (Dictionary<string, object>)args["protected"])
             prot[kv.Key] = ((List<object>)kv.Value).Cast<string>().ToList();
         var selected = new List<object>();
         foreach (var kv in before)
             if ((bool)((Dictionary<string, object>)kv.Value)["selected"]) selected.Add(kv.Key);
-        if (args.ContainsKey("protect_selected") && (bool)args["protect_selected"])
-            foreach (string id in selected) prot[id] = new List<string> { "*" };
-        var humanSince = new List<object>();
-        foreach (var kv in before)
+        // 执行前核对：场景或选中状态和运行时以为的不一样（人刚改过），就不执行，让运行时重开许可单
+        if (args.ContainsKey("expected") && args["expected"] is Dictionary<string, object> expectedFp)
         {
-            var rec = (Dictionary<string, object>)kv.Value;
-            if (!known.ContainsKey(kv.Key)) { prot[kv.Key] = new List<string> { "*" }; humanSince.Add(kv.Key); continue; }
-            var k = (Dictionary<string, object>)known[kv.Key];
-            if ((string)k["fp"] == (string)rec["fp"]) continue;
-            humanSince.Add(kv.Key);
-            if (!prot.ContainsKey(kv.Key)) prot[kv.Key] = new List<string>();
-            var pl = prot[kv.Key];
-            if (byObject) { if (!pl.Contains("*")) pl.Add("*"); continue; }
-            var kf = (Dictionary<string, object>)k["aspects"];
-            foreach (var f in (Dictionary<string, object>)rec["aspects"])
-                if ((!kf.ContainsKey(f.Key) || (string)kf[f.Key] != (string)f.Value) && !pl.Contains(f.Key)) pl.Add(f.Key);
+            var changedIds = new List<object>();
+            foreach (var kv in before)
+                if (!expectedFp.ContainsKey(kv.Key) || (string)expectedFp[kv.Key] != (string)((Dictionary<string, object>)kv.Value)["fp"])
+                    changedIds.Add(kv.Key);
+            foreach (var id in expectedFp.Keys)
+                if (!before.ContainsKey(id)) changedIds.Add(id);
+            bool selectionChanged = false;
+            if (args.ContainsKey("expected_selection") && args["expected_selection"] is List<object> expSel)
+            {
+                var wantSel = expSel.Cast<string>().OrderBy(x => x).ToList();
+                var nowSel = selected.Cast<string>().OrderBy(x => x).ToList();
+                selectionChanged = !wantSel.SequenceEqual(nowSel);
+            }
+            if (changedIds.Count > 0 || selectionChanged)
+                return new Dictionary<string, object> {
+                    { "status", "replan" }, { "changed", changedIds }, { "before", before },
+                    { "selected", selected }, { "labels", labels } };
         }
         bool protect = (bool)args["protect"];
         var selBefore = Selection.objects;
@@ -404,7 +425,8 @@ __AGENT__
         }
         return new Dictionary<string, object> {
             { "status", "ok" }, { "before", before }, { "after_raw", afterRaw }, { "after", after },
-            { "human_since", humanSince }, { "selected", selected }, { "restored", restored }, { "merged", merged }, { "fallback", fallback },
+            { "protected", prot.ToDictionary(kv => kv.Key, kv => (object)kv.Value.Cast<object>().ToList()) },
+            { "selected", selected }, { "restored", restored }, { "merged", merged }, { "fallback", fallback },
             { "inexact", inexact }, { "lost", lost }, { "renamed", new List<object>() }, { "dangling", new List<object>() },
             { "candidates", new List<object>() }, { "outside", outside }, { "ai_created", new List<object>() },
             { "error", error }, { "stdout", "" }, { "undo_pushed", false },

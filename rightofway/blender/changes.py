@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Callable, Optional
 
-from .records import Records, label
+from .records import Records, display, label
 
 Values = dict[str, dict[str, str]]          # 编号 → 面 → 值的文字
 Who = Callable[[str, Optional[str]], str]    # (编号, 面) → 谁改的（显示用）
@@ -33,9 +33,9 @@ def describe_changes(old: Records, new: Records, old_values: Values, new_values:
     exclude = exclude or set()
     lines: list[str] = []
     for cid in sorted(set(new) - set(old), key=lambda c: new[c]["name"]):
-        lines.append(f"{who(cid, None)}新建了 {new[cid]['name']}".strip())
+        lines.append(f"{who(cid, None)}新建了 {display(new[cid])}".strip())
     for cid in sorted(set(old) - set(new), key=lambda c: old[c]["name"]):
-        lines.append(f"{who(cid, None)}删除了 {old[cid]['name']}".strip())
+        lines.append(f"{who(cid, None)}删除了 {display(old[cid])}".strip())
     for cid in sorted(set(old) & set(new), key=lambda c: new[c]["name"]):
         a, b = old[cid], new[cid]
         if a["fp"] == b["fp"]:
@@ -51,7 +51,7 @@ def describe_changes(old: Records, new: Records, old_values: Values, new_values:
             parts = [face_change(f, cid, old_values, new_values, labels) for f in fs[:max_faces]]
             if len(fs) > max_faces:
                 parts.append(f"等 {len(fs)} 项")
-            lines.append(f"{w}修改了 {b['name']}：".lstrip() + "；".join(parts))
+            lines.append(f"{w}修改了 {display(b)}：".lstrip() + "；".join(parts))
     if len(lines) > max_objects:
         lines = lines[:max_objects] + [f"……另外还有 {len(lines) - max_objects} 处变化"]
     return lines

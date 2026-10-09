@@ -34,7 +34,7 @@ from rightofway.blender.evaluate import evaluate
 from rightofway.blender.live_sync import LiveSyncSession
 from rightofway.runtime import POLICY_DISCARD, Runtime
 from experiments import scenario_tree as sc
-from experiments.common import banner, say, use_utf8_console, wait_for_human, write_row
+from experiments.common import InvariantLog, banner, say, use_utf8_console, wait_for_human, write_row
 from experiments.exp_a_shared import _SETUP
 
 
@@ -85,6 +85,7 @@ def _run(args, protect: bool) -> None:
     rt = Runtime(human_touched_policy=POLICY_DISCARD)
     s = LiveSyncSession(rt, hb, ab, human_scene=scene, ai_scene=scene, granularity=args.granularity, inline=args.inline)
     s.start()
+    inv = InvariantLog(protect)
     gran = "按面" if args.granularity == "aspect" else "按对象"
     variant = f"实时同步（{gran}）" if protect else "对照组：谁后同步谁生效"
     banner(f"实验 B：各自一个窗口，实时同步（{variant}，人：{'真人' if args.human == 'real' else '模拟'}）")
@@ -93,6 +94,7 @@ def _run(args, protect: bool) -> None:
         r = s.sync(protect=protect, label_=what)
         say("rt", "告诉你：\n" + r.text_for_human)
         say("rt", "告诉 AI：\n" + r.text_for_ai)
+        inv.ledger(rt, r.human_final, s.g, s.labels)       # I1：你这边的场景 = 账本（I2、I3 目前只查方式一）
         return r
 
     say("ai", "第 1 步：在我自己的 Blender 里布置场景")
@@ -138,6 +140,7 @@ def _run(args, protect: bool) -> None:
         wait_for_human([sc.HUMAN_MOVE_ROCK1])
     r3 = sync("human-only")
 
+    inv.at_end(s.hs)
     final = hb.call("poll", {"scene": scene})["records"]
     ai_final = ab.call("poll", {"scene": scene, "prefix": "a-"})["records"]
     ev = evaluate(rt, final, s.human, granularity=args.granularity, labels=s.labels)
@@ -146,6 +149,7 @@ def _run(args, protect: bool) -> None:
     errors = sum(len(r.errors) for r in reports)
     banner("结果")
     say("info", ev.summary())
+    say("info", inv.summary())
     say("info", f"两边是否一致：{'是' if same else '否'}；同步出错：{errors} 处；AI 重建了人删掉的对象：{len(r2.resurrections)} 个")
     say("info", f"AI 做完一步到你看到结果：{r2.seconds:.2f} 秒（不用存盘，也不用「文件 → 恢复」）")
     if args.human == "real":
@@ -155,7 +159,7 @@ def _run(args, protect: bool) -> None:
         path = write_row({
             "实验": "B 各自一个窗口（实时同步）", "做法": variant, "人": "真人" if args.human == "real" else "模拟",
             "人的修改被覆盖": len(ev.human_overwritten), "AI的修改丢失": len(ev.ai_lost),
-            "被删对象被AI重建": len(r2.resurrections), "恢复或合并出错": errors, "AI候选": 0,
+            "被删对象被AI重建": len(r2.resurrections), "恢复或合并出错": errors, "不变量违反": inv.column(), "AI候选": 0,
             "AI修改生效": sum(len(r.committed) for r in reports), "AI修改未采用": sum(len(r.skipped) for r in reports),
             "人看到AI结果要等(秒)": r2.seconds,
             "备注": f"两边{'一致' if same else '不一致'}；不用存盘和恢复" + ("；对象用 base64 传" if args.inline else "")})
