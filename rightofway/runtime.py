@@ -11,6 +11,8 @@
 from __future__ import annotations
 
 import time
+import uuid
+from dataclasses import asdict
 from typing import Any, Callable, Iterable, Optional
 
 from .identity import suffix_pattern
@@ -88,6 +90,10 @@ class Runtime:
         self.selection: dict[str, set[str]] = {}              # 人 → 选中的应用对象（group_of 的结果）
         self.reservations: dict[str, tuple[str, float]] = {}  # 对象 → (预留给哪个 Agent, 到期时间)
         self.permits: dict[str, Permit] = {}
+        self.in_doubt: dict[str, dict] = {}                   # 结果没收到的许可单 → {agent, reason, since}（14.2）
+        self._n_permit = 0                                    # 许可单编号：落盘后接着往下数，不会重复
+        self.nonce = uuid.uuid4().hex[:8]                     # 这个运行时（账本）的编号：许可单编号全局唯一，
+        #                                                       接入代码按它记执行结果、只执行一次（14.2）
         self.pause_on_breach = pause_on_breach                # 违规后暂停这个 Agent，等人处理（第 6 节）
         self.suspended: dict[str, dict] = {}                  # 被暂停的 Agent → 原因
         self.actors: dict[str, Actor] = {}
@@ -259,8 +265,11 @@ class Runtime:
         if not is_agent:
             return None   # R5：人的操作不受以下限制
 
-        if op.actor_id in self.suspended:                 # 违规后被暂停，等人处理
+        g = self.gate(op.actor_id)                        # 和许可单同一个准入判断（暂停由 submit 排队，见 R17）
+        if g is not None and g["reason"] == "suspended":  # 违规后被暂停，等人处理
             return OpStatus.REJECTED_SUSPENDED, {"agent": op.actor_id, **self.suspended[op.actor_id]}
+        if g is not None and g["reason"] == "in_doubt":   # 有一次执行结果还没查清
+            return OpStatus.REJECTED_IN_DOUBT, {"agent": op.actor_id, "permitId": g["permitId"]}
 
         # R8 选项、R23：人选中的、预留给别的 Agent 的
         for t in op.targets:
@@ -543,6 +552,8 @@ class Runtime:
     def reason_for(self, agent_id: str, object_id: str) -> dict:
         """告诉 Agent 某个对象为什么不能改：人改过或正在改 → 人；最后由别的 Agent 改 → 那个 Agent。"""
         obj = self.objects[object_id]
+        if obj.human_touched is not None and obj.human_touched.by.startswith("external:"):
+            return {"reason": KEEP_HUMAN, "source": obj.human_touched.by}     # 来源不明，按人的修改保护（14.2）
         if obj.human_touched is not None or obj.occupancy is not None:
             return {"reason": KEEP_HUMAN}
         last = obj.versions[-1] if obj.versions else None
@@ -552,19 +563,35 @@ class Runtime:
             return {"reason": KEEP_OTHER_AGENT, "by": last.author_id}
         return {"reason": KEEP_OTHER}
 
+    def gate(self, agent_id: str) -> Optional[dict]:
+        """准入：这个 Agent 现在能不能开始一次新的执行（design_v0.5.md 14.1）。许可单（admit）和旧的逐项提交
+        （_precheck）用同一个判断，规则只写一处（P9）。返回不许的原因，None 表示可以。
+          paused     人暂停了全部 AI（R17）；
+          in_doubt   有一次执行发出去了、结果还没查清：查清之前谁的差异都说不准，所以谁都不开始新的执行；
+          suspended  这个 Agent 上次违规，被暂停了，等人处理。"""
+        if self.paused:
+            return {"reason": "paused"}
+        if self.in_doubt:
+            pid = sorted(self.in_doubt)[0]
+            return {"reason": "in_doubt", "permitId": pid, "agent": self.in_doubt[pid]["agent"]}
+        if agent_id in self.suspended:
+            return {"reason": "suspended", **self.suspended[agent_id]}
+        return None
+
     def admit(self, agent_id: str) -> Permit:
         """为这个 Agent 的一次执行开许可单。判断和 _precheck 用的是同一组函数，规则只写一处（P9）：
-        选中、预留（_claim_conflict）→ 占用（R9）→ 过时、人碰过（_target_conflict，R4、R6）。
+        准入（gate）→ 选中、预留（_claim_conflict）→ 占用（R9）→ 过时、人碰过（_target_conflict，R4、R6）。
         人碰过的对象在"留作候选"策略下也要保持（场景里保留人的，Agent 的版本另存为候选）。"""
         actor = self._actor(agent_id)
         if actor.kind != ActorKind.AGENT:
             raise ProtocolError(f"{agent_id} 不是 Agent，不需要许可")
         self._expire_reservations()
-        if agent_id in self.suspended:
-            permit = Permit(f"permit-{len(self.permits) + 1}", agent_id,
-                            refused={"reason": "suspended", **self.suspended[agent_id]})
+        refusal = self.gate(agent_id)
+        if refusal is not None:
+            self._n_permit += 1
+            permit = Permit(f"permit-{self._n_permit}-{self.nonce}", agent_id, refused=refusal, state="refused")
             self.permits[permit.permit_id] = permit
-            self._emit("permit/refused", permitId=permit.permit_id, agent=agent_id, reason="suspended")
+            self._emit("permit/refused", permitId=permit.permit_id, agent=agent_id, reason=refusal["reason"])
             return permit
         seen = self.seen.get(agent_id, {})
         keep: dict[str, dict] = {}
@@ -586,7 +613,8 @@ class Runtime:
                 continue
             if self._target_conflict(obj, base) is not None:
                 keep[oid] = self.reason_for(agent_id, oid)
-        permit = Permit(f"permit-{len(self.permits) + 1}", agent_id, keep,
+        self._n_permit += 1
+        permit = Permit(f"permit-{self._n_permit}-{self.nonce}", agent_id, keep,
                         {oid: seen.get(oid, -1) for oid in self.objects}, reidentify=self.identity_rule())
         permit.keep_alive = self._ancestors(keep)
         if permit.reidentify is not None:
@@ -624,33 +652,69 @@ class Runtime:
         return out
 
     def _tombstones(self, agent_id: str, seen: dict[str, int]) -> dict[str, dict]:
-        """墓碑（design_v0.5.md 12.5）：人删掉的对象，这个 Agent 看到过它还在、但还没看到它被删。
-        它新建同名同类型的对象，就是按旧印象把人删掉的东西补回来（R4 + R6），接入代码会把新建的删掉。
-        看到过删除之后再新建，算有意的，照常新建。数据块不记墓碑（删数据块的多半是清理，不是"不要这个东西"）。"""
+        """墓碑（design_v0.5.md 12.5、14.4）：人删掉的东西，人交还（hand_back）之前，Agent 不能补回来。
+        它新建了同一个（同一条认回规则），接入代码在恢复之后把新建的删掉。Agent 看没看到这次删除都一样：
+        "知道你删了"不等于"你允许它建回来"。只对这个 Agent 见过还在的东西立墓碑：从没见过的，新建同名的不是"补回"。
+        数据块按能看到的事实区分：删的时候还有对象在用 → 有意删除，立墓碑；没对象用了之后才消失 → 清理，不立。
+        来源不明的删除（external，14.2）也立：宁可多拦一次，人交还就放开。"""
         out: dict[str, dict] = {}
         for oid, obj in sorted(self.objects.items()):
             content = obj.content
             if obj.retracted or not _is_deleted(content) or not obj.versions:
                 continue
             last = obj.versions[-1]
-            if last.author_kind != ActorKind.HUMAN or content.get("kind") == "data":
-                continue
+            if last.author_kind not in (ActorKind.HUMAN, ActorKind.EXTERNAL) or obj.human_touched is None:
+                continue                          # Agent 自己删的；或者人已经交还
+            if content.get("kind") == "data" and not (content.get("users") or 0):
+                continue                          # 没人用了之后才消失：清理
             base = seen.get(oid, -1)
-            if base < 0 or base >= obj.version:
-                continue                          # 没见过这个对象，或者已经看到它被删了
-            try:
-                if _is_deleted(obj.get_version(base).content):
-                    continue
-            except KeyError:
-                continue
+            if not any(not _is_deleted(v.content) for v in obj.versions if v.version <= base):
+                continue                          # 这个 Agent 从没见过它还在
             g = group_of(oid)
             out.setdefault(g, {"name": content.get("name"), "type": content.get("type"),
-                               "parent": content.get("parent")})
+                               "parent": content.get("parent"), "kind": content.get("kind")})
         return out
 
-    def close_permit(self, permit: Permit, refused: Iterable[str]) -> list[str]:
-        """一次执行结束。refused：Agent 改到了、但按许可单保持原样的对象。
+    OPEN_STATES = ("issued", "dispatched", "in_doubt")
+
+    def dispatched(self, permit: Permit) -> None:
+        """接入层把许可单发给应用之前调用（design_v0.5.md 14.1）。之后这张许可单要么结算、要么关闭、要么记为结果未知。"""
+        if permit.state != "issued":
+            raise ProtocolError(f"{permit.permit_id} 的状态是 {permit.state}，不能发出")
+        permit.state = "dispatched"
+        self._emit("permit/dispatched", permitId=permit.permit_id, agent=permit.agent)
+
+    def mark_in_doubt(self, permit: Permit, reason: str) -> None:
+        """发出去了，结果没收到（超时、断连、代理出错，design_v0.5.md 14.2）。可能执行了，也可能没有。
+        查清之前不给任何 Agent 开新的许可单（gate），接入层也不把这期间看到的差异算成人的。"""
+        if permit.state not in ("dispatched", "in_doubt"):
+            raise ProtocolError(f"{permit.permit_id} 的状态是 {permit.state}，不能记为结果未知")
+        first = permit.state != "in_doubt"
+        permit.state = "in_doubt"
+        self.in_doubt[permit.permit_id] = {"agent": permit.agent, "reason": reason, "since": time.time()}
+        if first:
+            self._emit("permit/in_doubt", permitId=permit.permit_id, agent=permit.agent, reason=reason)
+            self._emit("alert/human", kind="in_doubt", agent=permit.agent, permitId=permit.permit_id, reason=reason)
+
+    def resolve_unattributed(self, permit: Permit, objects: Iterable[str]) -> None:
+        """结果查不回来（应用重启过、接入代码不记结果）：差异已经由接入层记为来源不明（record_external），这里结束许可单。"""
+        if permit.state not in self.OPEN_STATES:
+            raise ProtocolError(f"{permit.permit_id} 已经结束（{permit.state}）")
+        self.in_doubt.pop(permit.permit_id, None)
+        permit.state = "unattributed"
+        objs = sorted(set(objects))
+        self._emit("permit/unattributed", permitId=permit.permit_id, agent=permit.agent, objects=objs)
+        if objs:
+            self._emit("alert/human", kind="unattributed", agent=permit.agent, permitId=permit.permit_id, objects=objs)
+
+    def close_permit(self, permit: Permit, refused: Iterable[str], state: str = "closed") -> list[str]:
+        """一次执行结束：settled（settle 调用）或 closed（没有执行）。每张许可单正好结束一次。
+        refused：Agent 改到了、但按许可单保持原样的对象。
         R23：这个 Agent 之前的预留用完了；这次因为别的 Agent 先改而被拒的，给它预留一段时间重试。"""
+        if permit.state not in self.OPEN_STATES:
+            raise ProtocolError(f"{permit.permit_id} 已经结束（{permit.state}），不能再关闭")
+        self.in_doubt.pop(permit.permit_id, None)
+        permit.state = state
         self.reservations = {u: v for u, v in self.reservations.items() if v[0] != permit.agent}
         out = []
         if self.reserve_seconds > 0:
@@ -660,7 +724,7 @@ class Runtime:
                 if k is not None and k["reason"] == KEEP_OTHER_AGENT:
                     self.reservations[oid] = (permit.agent, until)
                     out.append(oid)
-        self._emit("permit/closed", permitId=permit.permit_id, reserved=out)
+        self._emit("permit/closed", permitId=permit.permit_id, reserved=out, state=state)
         return out
 
     def settle(self, permit: Permit, before: dict[str, Any], raw: dict[str, Any], final: dict[str, Any],
@@ -680,10 +744,16 @@ class Runtime:
           配上的旧编号在 raw / final 里已经是新对象的内容，所以照常按面核对：人改过的面要么还是人的，要么是违规。
           补回人删掉的对象（墓碑）被接入代码删掉了：记为保持（kept，"recreate"）。
         账本只记实际看到的（P1）：结束后账本里每个单元都和 final 一样。"""
+        if permit.state not in self.OPEN_STATES:
+            raise ProtocolError(f"{permit.permit_id} 已经结束（{permit.state}），不能再结算")
         agent = permit.agent
         actor = self._actor(agent)
         st = Settlement(permit.permit_id, agent)
         refused, pre_deleted = set(refused), set(refused_deletes)
+        step = self.steps.get(step_id) if step_id else None
+        if step is not None and step.state != StepState.RUNNING:
+            step.state, step.committed_ops = StepState.RUNNING, []
+            self._emit("step/state", stepId=step.step_id, state=step.state.value)
         before_groups = {group_of(u) for u in before}
         raw_groups = {group_of(u) for u in raw}
         if permit.reidentify is not None:
@@ -743,7 +813,13 @@ class Runtime:
                 st.breach[uid] = {**self.reason_for(agent, uid), "deleted": f is None, "late": True}
                 self._settle_breach(op_id, agent, actor, uid, f, b, step_id)
 
-        st.reserved = self.close_permit(permit, list(st.kept))
+        st.reserved = self.close_permit(permit, list(st.kept), state="settled")
+        if step is not None:
+            step.state = StepState.DONE if step.committed_ops else StepState.PENDING
+            if step.state == StepState.DONE:
+                step.done_seq = self._seq
+            self._emit("step/state", stepId=step.step_id, state=step.state.value)
+        st.holds = sorted({group_of(u) for u, k in st.kept.items() if k.get("recreate")})
         if permit.reidentify is not None:
             self._track_wanted_gone(permit, st, before, raw, final, pre_deleted)
         self._detect_loops(st)
@@ -805,15 +881,25 @@ class Runtime:
             else:
                 kind = "gone"
             name = (rows_b.get(old) or permit.no_recreate.get(old) or {}).get("name")
-            st.reidentified[old] = {"name": name, "level": level, "kind": kind}
+            # 都是推断（按名字、类型、父对象），不是应用自己保持下来的身份：人可以撤销（unmatch，14.5）
+            st.reidentified[old] = {"name": name, "level": level, "kind": kind, "inferred": True}
             self.identity_log.append({"permitId": permit.permit_id, "agent": permit.agent, "object": old,
-                                      "name": name, "new": new, "level": level, "kind": kind})
+                                      "name": name, "new": new, "level": level, "kind": kind, "inferred": True})
             self._emit("identity/matched", permitId=permit.permit_id, agent=permit.agent, objectId=old,
                        level=level, kind=kind)
         st.identity_errors = errors
         if errors:
             self._emit("alert/human", kind="identity", agent=permit.agent, permitId=permit.permit_id,
                        errors=list(errors))
+
+    def mark_unmatched(self, actor_id: str, permit_id: str, old: str, new: str) -> None:
+        """人说"不是同一个"（design_v0.5.md 14.5）：接入层已经把对象拆开、记好账，这里在认回记录上注明撤销了。"""
+        self._require_human(actor_id)
+        for e in self.identity_log:
+            if e["permitId"] == permit_id and e["object"] == old and not e.get("undone"):
+                e["undone"], e["splitTo"] = True, new
+        self.wanted_gone.get(next((e["agent"] for e in self.identity_log if e["permitId"] == permit_id), ""), {}).pop(old, None)
+        self._emit("identity/unmatched", permitId=permit_id, objectId=old, new=new, by=actor_id)
 
     def _track_wanted_gone(self, permit: Permit, st: Settlement, before: dict[str, Any], raw: dict[str, Any],
                            final: dict[str, Any], pre_deleted: set[str]) -> None:
@@ -834,25 +920,43 @@ class Runtime:
                     and rows_b.get(g, {}).get("kind") != "data"):
                 wanted[g] = {k: rows_b[g].get(k) for k in ("name", "type", "parent")}
 
+    def _settle_commit(self, op_id: str, agent: str, obj: ObjectState, content: Any, step_id: Optional[str],
+                       produced: bool = False) -> VersionRecord:
+        """结算时按实际状态记一个单元（design_v0.5.md 14.1）。不走 submit / complete：准入在开许可单时已经判断过，
+        结算只记实际发生了什么，不会再"拒绝结算"（暂停、排队这些只管还没开始的执行）。"""
+        actor = self._actor(agent)
+        op = Operation(op_id, agent, targets=[] if produced else [Target(obj.object_id, obj.version)],
+                       produces=[obj.object_id] if produced else [], step_id=step_id, actor_kind=actor.kind,
+                       status=OpStatus.COMMITTED)
+        self.ops[op_id] = op
+        rec = self._commit_version(obj, content, actor, op_id, step_id)
+        self._emit("op/result", opId=op_id, status=op.status.value, newVersions={obj.object_id: rec.version})
+        self._emit("object/changed", objectId=obj.object_id, version=rec.version, author=agent, opId=op_id)
+        if step_id and step_id in self.steps:
+            self.steps[step_id].committed_ops.append(op_id)
+        self._invalidate_from(obj.object_id, exclude_step=step_id)       # R12
+        return rec
+
     def _settle_write(self, op_id: str, agent: str, uid: str, f: Any, b: Any, base: int,
                       step_id: Optional[str]) -> bool:
-        """按最终状态提交一个单元，走和 submit 一样的规则检查。"""
-        op = Operation(op_id, agent, targets=[Target(uid, base)], step_id=step_id)
-        if self.submit(op).status.is_rejection:
+        """按最终状态提交一个单元。开许可单之后规则状态又变了的（例如人的修改是事后才记的），返回 False，由调用方记为违规。"""
+        obj = self.objects[uid]
+        if self._claim_conflict(agent, uid) is not None or self._target_conflict(obj, base) is not None:
             return False
-        content = f if f is not None else _deleted_like(b)
-        return self.complete(op_id, writes={uid: content}).status in (OpStatus.COMMITTED, OpStatus.MERGED)
+        self._settle_commit(op_id, agent, obj, f if f is not None else _deleted_like(b), step_id)
+        return True
 
     def _settle_create(self, op_id: str, agent: str, uid: str, f: Any, step_id: Optional[str],
                        produce_type: str) -> None:
-        if uid in self.objects and not self.objects[uid].retracted:      # 名义上新建、账本里已有：按修改记
-            obj = self.objects[uid]
+        obj = self.objects.get(uid)
+        if obj is not None and not obj.retracted:                         # 名义上新建、账本里已有：按修改记
             if _fp(obj.content) != _fp(f):
-                self._commit_version(obj, f, self._actor(agent), op_id, step_id)
+                self._settle_commit(op_id, agent, obj, f, step_id)
             return
-        op = Operation(op_id, agent, produces=[uid], step_id=step_id)
-        self.submit(op)
-        self.complete(op_id, produces={uid: f}, produce_types={uid: produce_type})
+        if obj is None:
+            obj = ObjectState(uid, produce_type, provenance={"opId": op_id, "stepId": step_id})
+            self.objects[uid] = obj
+        self._settle_commit(op_id, agent, obj, f, step_id, produced=True)
 
     def _settle_candidate(self, op_id: str, agent: str, uid: str, r: Any, step_id: Optional[str]) -> None:
         """R6 "留作候选"：场景里保留人的，Agent 的版本记进候选区。"""
@@ -954,6 +1058,21 @@ class Runtime:
                 self._emit("conflict/external_overwrite", objectId=object_id,
                            overwrittenVersion=overwritten, matchesVersion=rec.version)
                 break
+        rec = self._commit_version(obj, content, self.actors[ext_id])
+        self._emit("object/changed", objectId=object_id, version=rec.version, author=ext_id)
+        self._invalidate_from(object_id)
+        return rec
+
+    def record_external(self, object_id: str, content: Any, source: str, type_: str = "blob") -> VersionRecord:
+        """来源说不准的变化（design_v0.5.md 14.2、14.3）：结果没收到的那次执行前后、代理没运行期间、应用重新打开过。
+        记在 external:<source> 名下，和人的修改一样保护（人碰过），不产生占用；人交还之后 Agent 才能改。
+        和 external_change 不同，对象可以是新出现的。"""
+        ext_id = f"external:{source}"
+        if ext_id not in self.actors:
+            self.register_actor(ext_id, ActorKind.EXTERNAL)
+        obj = self.objects.get(object_id)
+        if obj is None:
+            obj = self.objects[object_id] = ObjectState(object_id, type_)
         rec = self._commit_version(obj, content, self.actors[ext_id])
         self._emit("object/changed", objectId=object_id, version=rec.version, author=ext_id)
         self._invalidate_from(object_id)
@@ -1118,6 +1237,75 @@ class Runtime:
             if step.state == StepState.RUNNING and not any(
                     o.step_id == step.step_id and o.status in IN_FLIGHT for o in self.ops.values()):
                 self._set_step(step, StepState.DONE if step.committed_ops else StepState.PENDING)
+
+    # ------------------------------------------------------------------
+    # 账本落盘（design_v0.5.md 14.3）
+    # ------------------------------------------------------------------
+    def to_state(self) -> dict:
+        """运行时的全部记录，只含基本类型（可以存成 JSON）。重启后用 load_state 接着用。
+        事件日志不存（它只是记录，序号接着往下数）；规则选项不存（由创建运行时的人决定）；还开着的许可单要存。"""
+        def ver(v: VersionRecord) -> dict:
+            d = asdict(v)
+            d["author_kind"] = v.author_kind.value
+            return d
+        objects = {}
+        for oid, o in self.objects.items():
+            objects[oid] = {"type": o.type, "versions": [ver(v) for v in o.versions],
+                            "authority": {"kind": o.authority.kind.value, "adapter_id": o.authority.adapter_id},
+                            "provenance": o.provenance, "mergeable": o.mergeable, "retracted": o.retracted,
+                            "human_touched": asdict(o.human_touched) if o.human_touched else None,
+                            "occupancy": asdict(o.occupancy) if o.occupancy else None,
+                            "candidates": [ver(v) for v in o.candidates]}
+        caps = {n: {**asdict(m), "channel": m.channel.value} for n, m in self.capabilities.items()}
+        steps = {sid: {**asdict(st), "state": st.state.value} for sid, st in self.steps.items()}
+        open_permits = {pid: asdict(pm) for pid, pm in self.permits.items() if pm.state in self.OPEN_STATES}
+        return {"format": 1, "seq": self._seq, "n_permit": self._n_permit, "nonce": self.nonce,
+                "actors": {a: x.kind.value for a, x in self.actors.items()}, "capabilities": caps,
+                "objects": objects, "steps": steps, "seen": self.seen,
+                "selection": {h: sorted(g) for h, g in self.selection.items()},
+                "suspended": self.suspended, "paused": self.paused, "app": self.app,
+                "wanted_gone": self.wanted_gone, "identity_log": self.identity_log,
+                "kept_history": {a: [sorted(x) for x in h] for a, h in self.kept_history.items()},
+                "looping": {a: sorted(v) for a, v in self.looping.items()},
+                "permits": open_permits, "in_doubt": self.in_doubt}
+
+    def load_state(self, state: dict) -> None:
+        """接着 to_state 存下的记录用。预留（R23）是短时间的，不恢复。"""
+        if state.get("format") != 1:
+            raise ProtocolError(f"不认识的账本格式：{state.get('format')}")
+
+        def ver(d: dict) -> VersionRecord:
+            return VersionRecord(**{**d, "author_kind": ActorKind(d["author_kind"])})
+        self._seq = state["seq"]
+        self._n_permit = state.get("n_permit", 0)
+        self.nonce = state.get("nonce") or self.nonce
+        self.actors = {a: Actor(a, ActorKind(k)) for a, k in state["actors"].items()}
+        self.capabilities = {n: CapabilityMeta(**{**m, "channel": Channel(m["channel"])})
+                             for n, m in state["capabilities"].items()}
+        self.objects = {}
+        for oid, d in state["objects"].items():
+            self.objects[oid] = ObjectState(
+                oid, d["type"], versions=[ver(v) for v in d["versions"]],
+                authority=Authority(AuthorityKind(d["authority"]["kind"]), d["authority"]["adapter_id"]),
+                provenance=d["provenance"], mergeable=d["mergeable"], retracted=d["retracted"],
+                human_touched=HumanTouched(**d["human_touched"]) if d["human_touched"] else None,
+                occupancy=Occupancy(**d["occupancy"]) if d["occupancy"] else None,
+                candidates=[ver(v) for v in d["candidates"]])
+        self.steps = {sid: Step(**{**d, "state": StepState(d["state"])}) for sid, d in state["steps"].items()}
+        self.seen = {a: dict(v) for a, v in state["seen"].items()}
+        self.selection = {h: set(g) for h, g in state["selection"].items()}
+        self.suspended = dict(state["suspended"])
+        self.paused = bool(state["paused"])
+        self.app = dict(state["app"])
+        self.wanted_gone = {a: dict(v) for a, v in state["wanted_gone"].items()}
+        self.identity_log = list(state["identity_log"])
+        self.kept_history = {a: [set(x) for x in h] for a, h in state["kept_history"].items()}
+        self.looping = {a: set(v) for a, v in state["looping"].items()}
+        self.permits = {pid: Permit(**d) for pid, d in state["permits"].items()}
+        self.in_doubt = dict(state["in_doubt"])
+        self.reservations = {}
+        self.ops = {}
+        self._emit("ledger/loaded", objects=len(self.objects), openPermits=sorted(self.permits))
 
     # ------------------------------------------------------------------
     # 集合与引用（R13）

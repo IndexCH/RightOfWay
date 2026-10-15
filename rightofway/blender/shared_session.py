@@ -25,6 +25,7 @@ AI 通过现成的 Blender MCP 执行脚本。这个类站在 AI 和 Blender 之
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -48,6 +49,9 @@ R_OTHER_AI = KEEP_OTHER_AGENT   # 别的 AI 在这个 AI 上次看之后改过�
 R_RESERVED = KEEP_RESERVED      # 别的 AI 刚被拒、正在重试，暂时留给它
 R_OTHER = KEEP_OTHER
 R_REVERTED = "reverted"         # 不在许可单里、但应用把它改回去了（接入代码多恢复了）
+# 来源说不准的变化（design_v0.5.md 14.2、14.3），记在 external:<来源> 名下，和人的修改一样保护
+SOURCES = {"external:unattributed": "结果没收到的那次执行前后", "external:offline": "RightOfWay 没运行期间",
+           "external:reopened": "应用重新打开时"}
 
 
 @dataclass
@@ -120,6 +124,8 @@ class AgentReport:
     loop_alert: list[str] = field(default_factory=list)         # 这次新进入循环的（已提醒人）
     # 派生改动（prior_art_solutions.md 问题三）：AI 新建的数据块副本（X → X.001）；人改过的数据块少了使用者
     derived: list[dict] = field(default_factory=list)
+    # 给人的按钮（design_v0.5.md 14.4、14.5）：{"kind": "release" | "unmatch", "id": 对象编号, "label", "permit"?}
+    actions: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -167,6 +173,14 @@ class SharedSession:
         self.labels: dict[str, str] = {}           # 面的显示名（来自应用）
         self.capabilities: dict = {}               # 连接时探测出的应用能力（Runtime.learn_app）
         self.aliases: dict[str, str] = {}          # 编号不能转交的应用（Unity）：应用编号 → 运行时编号
+        # 执行生命周期（design_v0.5.md 14.1–14.3）
+        self.app_boot: Optional[str] = None        # 应用进程的启动编号（接入代码报的）：变了说明应用重新打开过
+        self._doubts: dict[str, dict] = {}          # 发出去了、结果没收到的执行：许可单编号 → 查清之后结算要用的东西
+        self._tokens: dict[str, str] = {}           # begin_agent 交回的 token（按许可单编号）：结果没收到时补做 finish
+        self._notes: dict[str, list[str]] = {}      # 下一次要告诉某个 AI 的话（例如它上次没收到的结果已经查清）
+        self._alerted: set = set()                  # 已经提醒过人的 (种类, AI, 对象)：同一件事只弹一次
+        self.ledger_path: Optional[str] = None      # 账本落盘的位置；None 表示不落盘
+        self.start_alert = ""                       # 接着旧账本时发现的变化：给人的提醒（代理启动后显示）
         self._n_op = 0
         self._n_step = 0
         self._started = False
@@ -220,9 +234,18 @@ class SharedSession:
         self.selected = set(selected)
         self.rt.set_selection(self.human, self.selected)
 
-    def start(self) -> Records:
-        # 连接时的自测（design_v0.5.md 第 4 节）：重名后缀、接入代码会不会认回、编号能不能转交
+    def start(self, ledger=None) -> Records:
+        """连接。ledger：账本落盘的文件（design_v0.5.md 14.3），或者"文档 → 文件"的函数（按连接时测出的文档决定）。
+        文件在、并且是同一个文档的，接着上次的账本，先和场景对一遍：上次之后的变化来源说不准（代理没运行），
+        按人的修改保护；结果没查清的执行先查清。"""
+        # 连接时的自测（design_v0.5.md 第 4 节）：重名后缀、接入代码会不会认回、编号能不能转交、记不记执行结果
         self.capabilities = self.rt.learn_app(self.bridge.call("probe", self._args()))
+        self.app_boot = self.capabilities.get("boot")
+        if callable(ledger):
+            ledger = ledger(self.capabilities.get("document"))
+        self.ledger_path = ledger
+        if ledger and os.path.exists(ledger) and self._load(ledger):
+            return self._reconcile()
         res = self.bridge.call("poll", self._args())
         self.labels = res.get("labels", {})
         owner = BASELINE_ACTOR if self.initial_owner == "open" else self.human
@@ -235,25 +258,41 @@ class SharedSession:
         self._started = True
         for a in self.agent_names:
             self._see(a)
+        self._save()
         return self.view
 
     # ------------------------------------------------------------------
     # 观察
     # ------------------------------------------------------------------
     def poll(self) -> Diff:
-        """列一次对象，和上次比。执行 AI 脚本之外发生的变化，都是人做的。"""
+        """列一次对象，和上次比。执行 AI 脚本之外发生的变化，都是人做的——除了两种说不准的情况（design_v0.5.md 14.2）：
+        有一次执行结果还没查清（先查；查不清就先不记，免得把 AI 的改动算成人的），
+        应用重新打开过（启动编号变了：变化来自重新打开，记为来源不明，按人的修改保护）。"""
+        if self._doubts:
+            self._resolve_in_doubt()
+            if self._doubts:
+                return Diff()
         res = self.bridge.call("poll", self._args(known=self._known(self.view)))
         recs = res["records"]
         self._learn(recs)
-        d = self._absorb_human(self.view, recs)
+        reopened = bool(res.get("boot") and self.app_boot and res["boot"] != self.app_boot)
+        d = self._absorb_human(self.view, recs, source="reopened" if reopened else None)
+        if res.get("boot"):
+            self.app_boot = res["boot"]
         self.view = recs
         self._set_selected(cid for cid, r in recs.items() if r.get("selected"))
+        self._apply_requests(res)
+        if d or reopened or res.get("releases"):
+            self._save()
         return d
 
     def observe(self, agent: Optional[str] = None) -> ObserveResult:
         """AI 读场景时调用（例如 MCP 代理收到它的读取请求）：告诉它上次看之后发生了什么，并更新它的视图。"""
         agent = agent or self.agent
         self.poll()
+        if self._doubts:
+            return ObserveResult([], Diff(), "之前有一次执行的结果还没收到，查清之前不能告诉你最新的变化"
+                                              "（说不准哪些是谁做的）。稍后再看。")
         av = self.agent_views[agent]
         lines = describe_changes(av.recs, self.view, av.values, self.values, self.labels, who=self._who_for(agent))
         diff = diff_records(av.recs, self.view)
@@ -261,25 +300,32 @@ class SharedSession:
         text = ("你上次看场景之后，发生了这些变化：\n" + "\n".join("- " + x for x in lines)) if lines else "你上次看场景之后没有变化。"
         return ObserveResult(lines, diff, text)
 
-    def _absorb_human(self, old: Records, new: Records) -> Diff:
+    def _absorb_human(self, old: Records, new: Records, source: Optional[str] = None) -> Diff:
+        """把 old → new 的变化记进运行时：source 为 None 时是人做的；否则来源说不准（design_v0.5.md 14.2、14.3），
+        记在 external:<source> 名下，和人的修改一样保护。删除时记下当时有几个对象在用（数据块的墓碑要用，14.4）。"""
         d = diff_records(old, new)
         if not d:
             return d
-        self.detections.append({"time": time.time(), "changes": d.describe()})
+        self.detections.append({"time": time.time(), "changes": d.describe(), **({"source": source} if source else {})})
         ud = diff_records(self._units(old), self._units(new))
-        for uid, content in ud.created.items():
-            if uid in self.rt.objects:
+
+        def record(uid: str, content: dict) -> None:
+            if source is not None:
+                self.rt.record_external(uid, content, source, OBJECT_TYPE)
+            elif uid in self.rt.objects:
                 self.rt.human_edit(self.human, uid, content)
             else:
                 self.rt.create_object(uid, OBJECT_TYPE, content, self.human)
+        for uid, content in ud.created.items():
+            record(uid, content)
         for uid, (_, content) in ud.modified.items():
-            self.rt.human_edit(self.human, uid, content)
+            record(uid, content)
         for uid, content in ud.deleted.items():
-            self.rt.human_edit(self.human, uid, {**DELETED, **{k: content[k] for k in ("name", "type", "parent",
-                                                                                       "kind", "display")
-                                                               if content.get(k) is not None}})
-        for cid, rec in d.deleted.items():
-            self.human_deleted[cid] = rec["name"]
+            record(uid, {**DELETED, **{k: content[k] for k in ("name", "type", "parent", "kind", "display", "users")
+                                       if content.get(k) is not None}})
+        if source is None:
+            for cid, rec in d.deleted.items():
+                self.human_deleted[cid] = rec["name"]
         return d
 
     # ------------------------------------------------------------------
@@ -288,6 +334,8 @@ class SharedSession:
     def _display(self, actor: str, recipient: Optional[str]) -> str:
         if actor == self.human:
             return "人 "
+        if actor.startswith("external:"):
+            return "来源不明（" + SOURCES.get(actor, actor) + "） "
         if actor == BASELINE_ACTOR:
             return ""
         if recipient is not None and actor == recipient:
@@ -408,8 +456,12 @@ class SharedSession:
             b = self.bridge.call("begin_agent", args)
             if b.get("status") != "begun":
                 return b                                  # replan / deferred
+            if args.get("permit_id"):
+                self._tokens[args["permit_id"]] = b["token"]   # 结果没收到时，用它补做 finish（14.2）
             error = invoke()
-            return self.bridge.call("finish_agent", self._args(token=b["token"], error=error))
+            res = self.bridge.call("finish_agent", self._args(token=b["token"], error=error))
+            self._tokens.pop(args.get("permit_id"), None)
+            return res
         before = self.bridge.call("poll", args)["records"]
         expected = args.get("expected")
         if expected is not None:
@@ -480,11 +532,15 @@ class SharedSession:
 
     def _execute(self, prepare, label: str, protect: bool, agent: Optional[str], max_replan: int,
                  executor=None) -> AgentReport:
+        """一次执行（design_v0.5.md 第 2 节、14.1）：许可 → 发出 → 结算，许可单正好结束一次。
+        结果没收到时记为结果未知（14.2），查清之前不开始新的执行。"""
         agent = agent or self.agent
         if agent not in self.agent_names or agent not in self.agent_views:
             self.add_agent(agent)
             if agent not in self.agent_views:
                 self._see(agent)
+        if self._doubts:
+            self._resolve_in_doubt()                  # 先查清上一次没收到结果的执行
         av = self.agent_views[agent]
         keep_cand = self.rt.human_touched_policy == POLICY_CANDIDATE
         known = {cid: {"fp": r["fp"], "aspects": r["aspects"]} for cid, r in av.recs.items()}
@@ -492,16 +548,14 @@ class SharedSession:
         while True:
             permit = self.rt.admit(agent)
             if permit.refused is not None:
-                names = "、".join(self._group_name(g) for g in permit.refused.get("objects", []))
-                return AgentReport(status="refused", agent=agent, text=(
-                    f"这次没有执行：你上一次的操作违规（{names}），已被暂停。等人处理之后才能继续。"))
+                return self._with_notes(self._refused_report(agent, permit.refused))
             plan = permit.keep_by_group()
             prep = prepare(permit)
             if prep.blocked:
                 self.rt.close_permit(permit, [])
-                return self._blocked_report(agent, prep.blocked)
+                return self._with_notes(self._blocked_report(agent, prep.blocked))
             args = dict(code=prep.code, protected=plan, protect=protect, keep_candidates=keep_cand,
-                        granularity=self.granularity, known=known)
+                        granularity=self.granularity, known=known, permit_id=permit.permit_id)
             if permit.keep_alive and protect:
                 args["keep_alive"] = sorted(permit.keep_alive)       # 祖先：不许删，面可以改（12.6）
             if permit.reidentify and protect:
@@ -519,9 +573,23 @@ class SharedSession:
                 args["expected"] = {cid: r["fp"] for cid, r in self.view.items()}
                 if self.rt.selection_occupies:
                     args["expected_selection"] = sorted(self.selected)
-            res = (executor or (lambda a: self.bridge.call("run_agent", a)))(self._args(**args))
-            if res["status"] != "replan":
+            self.rt.dispatched(permit)
+            self._doubts[permit.permit_id] = self._doubt_record(permit, prep, label, protect, agent, plan)
+            self._save()                              # 发出之前落盘：代理在执行期间退出，重启后也知道这次结果未知
+            try:
+                res = (executor or (lambda a: self.bridge.call("run_agent", a)))(self._args(**args))
+            except Exception as e:                    # noqa: BLE001  发出去了，结果没收到
+                return self._lost(permit, e)
+            if res["status"] not in ("replan", "deferred"):
                 break
+            del self._doubts[permit.permit_id]
+            self.rt.close_permit(permit, [])           # 没有执行
+            self._apply_requests(res)
+            if res["status"] == "deferred":
+                self._save()
+                names = [res["before"][c]["name"] for c in res["editing"]]
+                return self._with_notes(AgentReport(status="deferred", agent=agent, text=(
+                    "这次没有执行：人正在编辑模式里修改 " + "、".join(names) + "。等人退出编辑模式后再试。")))
             # 人在上次轮询之后刚改过（或者刚换了选中）：先记下来，再重开许可单
             self.labels = res.get("labels", self.labels)
             self._learn(res["before"])
@@ -530,13 +598,32 @@ class SharedSession:
             self._set_selected(res.get("selected", [cid for cid, r in self.view.items() if r.get("selected")]))
             replans += 1
             if replans > max_replan:
-                return AgentReport(status="deferred", agent=agent, text=(
-                    "这次没有执行：执行前场景一直在变（人正在连续修改）。稍后再试。"))
-        if res["status"] == "deferred":
-            names = [res["before"][c]["name"] for c in res["editing"]]
-            return AgentReport(status="deferred", agent=agent, text=(
-                "这次没有执行：人正在编辑模式里修改 " + "、".join(names) + "。等人退出编辑模式后再试。"))
+                self._save()
+                return self._with_notes(AgentReport(status="deferred", agent=agent, text=(
+                    "这次没有执行：执行前场景一直在变（人正在连续修改）。稍后再试。")))
+        rep = self._complete(permit, prep, res, label, protect, agent, plan)
+        del self._doubts[permit.permit_id]
+        self._save()
+        return self._with_notes(rep)
 
+    def _doubt_record(self, permit, prep, label: str, protect: bool, agent: str, plan: dict) -> dict:
+        """结果没收到时，查清之后结算要用的东西。可以落盘（只有基本类型），代理重启后也能接着查。"""
+        cmds = prep.commands
+        return {"permit": permit.permit_id, "agent": agent, "label": label, "protect": protect, "plan": plan,
+                "view": dict(self.view), "since": time.time(), "boot": self.app_boot,
+                "prep": {"code": "", "refused": sorted(prep.refused), "refused_deletes": sorted(prep.refused_deletes),
+                         "commands": cmds, "executed": [cmds.index(e) for e in prep.executed] if cmds else []}}
+
+    @staticmethod
+    def _prep_from(d: dict) -> "_Prepared":
+        p = d["prep"]
+        cmds = p.get("commands")
+        return _Prepared("", set(p.get("refused") or ()), set(p.get("refused_deletes") or ()), cmds,
+                         [cmds[i] for i in p.get("executed") or ()] if cmds else [])
+
+    def _complete(self, permit, prep, res: dict, label: str, protect: bool, agent: str, plan: dict) -> AgentReport:
+        """应用交回了结果：认回、核对、记账、写说明（第 2 节 ③④）。结果没收到、之后查回来的也走这里。"""
+        av = self.agent_views[agent]
         before, after, raw = res["before"], res["after"], res["after_raw"]
         self.aliases.update(res.get("aliases") or {})
         self.labels = res.get("labels", self.labels)
@@ -601,8 +688,301 @@ class SharedSession:
             cl = self._command_lines(rep)
             if cl:
                 rep.text += "\n命令：\n" + "\n".join("- " + x for x in cl)
+        if res.get("forged_release"):
+            rep.text += "\n注意：你的代码改了交还记录（只有人能交还），已经撤销。"
+        self._apply_requests(res)
         rep.alert = self._alert(rep, before, raw)
+        offers = self._offers(rep, permit) if protect else []
+        if offers:
+            rep.alert = "\n".join(x for x in [rep.alert] + offers if x)
+        if res.get("forged_release"):
+            rep.alert = "\n".join(x for x in (rep.alert, "注意：AI 的代码试图替你交还对象，已经撤销。") if x)
         return rep
+
+    # ------------------------------------------------------------------
+    # 结果没收到（design_v0.5.md 14.2）
+    # ------------------------------------------------------------------
+    def _lost(self, permit, error: Exception) -> AgentReport:
+        """发出去了，结果没收到：可能执行了，也可能没有。记为结果未知，先试着马上查一次。"""
+        d = self._doubts[permit.permit_id]
+        d["token"] = self._tokens.pop(permit.permit_id, None)
+        d["reason"] = f"{type(error).__name__}: {error}"
+        self.rt.mark_in_doubt(permit, d["reason"])
+        self._save()
+        reports = self._resolve_in_doubt()
+        if permit.permit_id in reports:
+            return self._with_notes(reports[permit.permit_id], skip=permit.permit_id)
+        return AgentReport(status="unknown", agent=d["agent"], text=(
+            f"这次执行的结果没收到（{d['reason']}）：可能已经执行了，也可能没有。查清之前不会开始新的执行；"
+            "稍后再调用一次，会先把结果查回来，再告诉你。"),
+            alert=(f"注意：AI 的一次执行结果没收到（{d['reason']}）。查清之前不会开始新的执行；"
+                   "应用重新连上之后会先查回结果。"))
+
+    def _resolve_in_doubt(self) -> dict[str, AgentReport]:
+        """把结果没收到的执行查清（接入代码按许可单编号记着结果）。返回查清了的 {许可单编号: 报告}；
+        报告的要点也记进 _notes，下一次告诉那个 AI。连不上应用的，继续等。"""
+        out: dict[str, AgentReport] = {}
+        for pid in sorted(self._doubts):
+            d = self._doubts[pid]
+            permit = self.rt.permits.get(pid)
+            if permit is None or permit.state not in self.rt.OPEN_STATES:
+                del self._doubts[pid]
+                continue
+            if permit.state == "dispatched":          # 代理在执行期间退出过：重启后才发现
+                self.rt.mark_in_doubt(permit, d.get("reason") or "代理在执行期间退出")
+            try:
+                rep = self._requery(pid, d, permit)
+            except Exception:                          # noqa: BLE001  还是连不上：继续等
+                continue
+            del self._doubts[pid]
+            out[pid] = rep
+            self._notes.setdefault(d["agent"], []).append(rep.text)
+        if out:
+            self._save()
+        return out
+
+    def _requery(self, pid: str, d: dict, permit) -> AgentReport:
+        agent = d["agent"]
+        head = "你之前有一次执行的结果没收到（" + str(d.get("reason") or "") + "），现在查清了："
+        if not self.capabilities.get("journal"):
+            recs = self.bridge.call("poll", self._args())["records"]
+            return self._unattributed(pid, d, permit, recs, "接入代码不记执行结果")
+        q = self.bridge.call("result", self._args(permit_id=pid))
+        entry, boot = q.get("entry"), q.get("boot")
+        status = (entry or {}).get("status")
+        if status == "done":
+            rep = self._complete(permit, self._prep_from(d), entry["result"], d["label"], d["protect"], agent, d["plan"])
+            rep.text = head + "\n" + rep.text
+            return rep
+        token = d.get("token") or (entry or {}).get("token")
+        if status == "begun" and token:
+            res = self.bridge.call("finish_agent", self._args(token=token, error="结果没收到之后补做的收尾"))
+            rep = self._complete(permit, self._prep_from(d), res, d["label"], d["protect"], agent, d["plan"])
+            rep.text = head + "\n" + rep.text
+            return rep
+        if status == "not_executed" or (entry is None and boot is not None and boot == d.get("boot")):
+            self.rt.close_permit(permit, [])           # 应用没执行（没收到，或者执行前场景变了）
+            self._apply_requests((entry or {}).get("result") or {})
+            return AgentReport(status="not_executed", agent=agent, text=head + "那次没有执行，场景没有被它改动。需要的话请重新执行。")
+        recs = self.bridge.call("poll", self._args())["records"]
+        why = "应用重新打开过，记的结果没了" if boot is not None and boot != d.get("boot") else "执行状态说不清"
+        return self._unattributed(pid, d, permit, recs, why, boot)
+
+    def _unattributed(self, pid: str, d: dict, permit, recs: Records, why: str, boot: Optional[str] = None) -> AgentReport:
+        """查不回来：发出前运行时以为的场景（d["view"]）和现在不一样的地方，说不准是这次执行改的还是人改的。
+        如实记为来源不明，按人的修改保护（人交还之后 AI 才能改），提醒人。"""
+        diff = self._absorb_human(d["view"], recs, source="unattributed")
+        self._learn(recs)
+        self.view = recs
+        if boot is not None:
+            self.app_boot = boot
+        names = sorted({display(diff.created.get(c) or diff.deleted.get(c) or (diff.modified.get(c) or (None, {}))[1], c)
+                        for c in diff.ids})
+        groups = sorted(diff.ids)
+        self.rt.resolve_unattributed(permit, groups)
+        what = "、".join(names[:12]) + ("……" if len(names) > 12 else "") if names else "没有变化"
+        rep = AgentReport(status="unknown", agent=d["agent"], text=(
+            f"你之前有一次执行的结果没收到（{d.get('reason') or ''}），查不回来（{why}）。"
+            + (f"场景里这些地方和执行前不一样，说不准是你改的还是人改的，已按人的修改保护，你现在不能改：{what}。"
+               "人交还之后才能再改。" if names else "场景和执行前一样，那次应该没有执行。")))
+        if names:
+            rep.alert = (f"注意：AI 的一次执行结果没收到，也查不回来（{why}）。场景里这些地方和执行前不一样，"
+                         f"说不准是 AI 还是你改的，已按你的修改保护：{what}。如果是 AI 改的、你同意它继续改，请交还给它。")
+            rep.actions = [{"kind": "release", "id": c, "label": f"交还 {self._group_name(c)}"} for c in groups[:5]]
+        return rep
+
+    def _offers(self, rep: AgentReport, permit) -> list[str]:
+        """给人的提醒和按钮（每件事只提醒一次）：拦下了补回人删掉的对象 → "允许重建"（14.4）；
+        推断是同一个对象、把人改过的部分带到了新对象上 → "不是同一个"（14.5）。"""
+        st, notes = rep.settlement, []
+        if st is None:
+            return notes
+        held = []
+        for cid in st.holds:
+            if ("hold", rep.agent, cid) in self._alerted:
+                continue
+            self._alerted.add(("hold", rep.agent, cid))
+            nm = self._group_name(cid)
+            held.append(nm)
+            rep.actions.append({"kind": "release", "id": cid, "label": f"允许 AI 重建 {nm}"})
+        if held:
+            notes.append(f"注意：AI 想把你删掉的 {'、'.join(held)} 建回来，已经拦下。你同意的话，点\"允许重建\"。")
+        human = {split_unit(u)[0] for u, k in permit.keep.items() if k.get("reason") == R_HUMAN}
+        carried = []
+        for old, v in sorted(st.reidentified.items()):
+            if v["kind"] not in ("gone", "rebind") or old not in human or ("unmatch", rep.agent, old) in self._alerted:
+                continue
+            self._alerted.add(("unmatch", rep.agent, old))
+            nm = display(rep.after.get(old) or rep.before.get(old), v.get("name") or old)
+            carried.append(nm)
+            rep.actions.append({"kind": "unmatch", "id": old, "permit": permit.permit_id, "label": f"{nm} 不是同一个"})
+        if carried:
+            notes.append(f"注意：AI 删掉又新建了 {'、'.join(carried)}。按名字、类型、父对象推断是同一个对象，你改过的部分"
+                         "已经带到新对象上。如果不是同一个，点\"不是同一个\"拆开。")
+        return notes
+
+    def _refused_report(self, agent: str, refused: dict) -> AgentReport:
+        why = refused.get("reason")
+        if why == "paused":
+            text = "这次没有执行：人暂停了所有 AI。等人恢复之后再试。"
+        elif why == "in_doubt":
+            text = ("这次没有执行：之前有一次执行的结果还没收到，查清之前不会开始新的执行"
+                    "（说不准哪些变化是谁做的）。稍后再试。")
+        else:
+            names = "、".join(self._group_name(g) for g in refused.get("objects", []))
+            text = f"这次没有执行：你上一次的操作违规（{names}），已被暂停。等人处理之后才能继续。"
+        return AgentReport(status="refused", agent=agent, text=text)
+
+    def _with_notes(self, rep: AgentReport, skip: Optional[str] = None) -> AgentReport:
+        """把要告诉这个 AI 的话（例如它上次没收到的结果已经查清）放在说明前面。"""
+        notes = self._notes.pop(rep.agent, [])
+        if skip is not None and notes and notes[-1] == rep.text:
+            notes = notes[:-1]
+        if notes:
+            rep.text = "\n\n".join(notes + [rep.text])
+        return rep
+
+    # ------------------------------------------------------------------
+    # 账本落盘（design_v0.5.md 14.3）
+    # ------------------------------------------------------------------
+    def _state(self) -> dict:
+        return {"format": 1, "document": self.capabilities.get("document"), "boot": self.app_boot,
+                "scene": self.scene, "granularity": self.granularity, "human": self.human,
+                "runtime": self.rt.to_state(), "view": self.view, "values": self.values,
+                "selected": sorted(self.selected),
+                "agent_views": {a: {"recs": v.recs, "values": v.values, "versions": v.versions, "time": v.time}
+                                for a, v in self.agent_views.items()},
+                "agent_names": self.agent_names, "human_deleted": self.human_deleted, "aliases": self.aliases,
+                "labels": self.labels, "n_op": self._n_op, "n_step": self._n_step, "doubts": self._doubts,
+                "tokens": self._tokens, "notes": self._notes, "alerted": sorted(list(x) for x in self._alerted)}
+
+    def _save(self) -> None:
+        """每次执行、发现变化之后存一次（先写临时文件再改名，存到一半退出也不会留下坏文件）。"""
+        if not self.ledger_path:
+            return
+        tmp = self.ledger_path + ".tmp"
+        os.makedirs(os.path.dirname(os.path.abspath(self.ledger_path)), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(self._state(), fh, ensure_ascii=False)
+        os.replace(tmp, self.ledger_path)
+
+    def _load(self, path: str) -> bool:
+        """接着存下的账本用。必须是同一个文档（接入代码报的 document）、同样的粒度，否则不用（返回 False）。"""
+        try:
+            with open(path, encoding="utf-8") as fh:
+                st = json.load(fh)
+        except (OSError, ValueError):
+            return False
+        doc = self.capabilities.get("document")
+        if (st.get("format") != 1 or doc is None or st.get("document") != doc
+                or st.get("granularity") != self.granularity or st.get("scene") != self.scene):
+            return False
+        app = dict(self.rt.app)                      # 这次连接测出来的能力为准
+        self.rt.load_state(st["runtime"])
+        self.rt.app = app
+        for actor, kind in ((self.human, ActorKind.HUMAN), (BASELINE_ACTOR, ActorKind.AGENT)):
+            if actor not in self.rt.actors:
+                self.rt.register_actor(actor, kind)
+        self.view, self.values = st["view"], st["values"]
+        self.selected = set(st["selected"])
+        self.agent_views = {a: AgentView(v["recs"], v["values"], v["versions"], v["time"])
+                            for a, v in st["agent_views"].items()}
+        self.agent_names.update(st["agent_names"])
+        for a in self.agent_names:
+            if a not in self.rt.actors:
+                self.rt.register_actor(a, ActorKind.AGENT)
+        self.human_deleted, self.aliases = st["human_deleted"], st["aliases"]
+        self.labels, self._n_op, self._n_step = st["labels"], st["n_op"], st["n_step"]
+        self._doubts, self._tokens, self._notes = st["doubts"], st["tokens"], st["notes"]
+        self._alerted = {tuple(x) for x in st["alerted"]}
+        self._started = True
+        for a in self.agent_names:
+            if a not in self.agent_views:
+                self._see(a)
+        return True
+
+    def _reconcile(self) -> Records:
+        """接着存下的账本，和现在的场景对一遍：先查清结果没收到的执行；剩下的差异是代理没运行期间发生的，
+        说不准是谁做的（人，或者绕过代理的工具），记为来源不明，按人的修改保护（14.3）。"""
+        self._resolve_in_doubt()
+        res = self.bridge.call("poll", self._args(known=self._known(self.view)))
+        recs = res["records"]
+        self._learn(recs)
+        if not self._doubts:
+            d = self._absorb_human(self.view, recs, source="offline")
+            self.view = recs
+            if d:
+                names = sorted(r["name"] for r in list(d.created.values()) + list(d.deleted.values()))
+                names += sorted(new["name"] for _, new in d.modified.values())
+                self.start_alert = ("注意：RightOfWay 上次停下之后，场景里有这些变化（说不准是谁做的，已按你的修改保护）："
+                                    + "、".join(names[:12]) + ("……" if len(names) > 12 else "")
+                                    + "。如果是 AI 改的、你同意它继续改，请交还给它。")
+        if res.get("boot"):
+            self.app_boot = res["boot"]
+        self._set_selected(cid for cid, r in self.view.items() if r.get("selected"))
+        self._apply_requests(res)
+        self._save()
+        return self.view
+
+    # ------------------------------------------------------------------
+    # 人交还（design_v0.5.md 14.4）
+    # ------------------------------------------------------------------
+    def _apply_requests(self, res: dict) -> None:
+        """人在应用里点了提醒里的按钮（接入代码记下，随结果交回）：
+          release  交还：例如允许 AI 重建人删掉的对象（14.4），或者改来源不明的部分；
+          unmatch  不是同一个：把一次认回拆开（14.5）。
+        只有人能点：AI 的代码在执行期间改了这些记录的，接入代码会撤销并报告（forged_release）。"""
+        for r in res.get("requests") or ():
+            cid = r.get("id")
+            if not cid:
+                continue
+            name = r.get("name") or self._group_name(cid)
+            if r.get("kind", "release") == "release":
+                self.hand_back(cid)
+                for a in self.agent_names:
+                    self._notes.setdefault(a, []).append(f"人把 {name} 交还给了 AI：现在可以改它了（被人删掉的，也可以重建了）。")
+            elif r.get("kind") == "unmatch":
+                self.unmatch(cid, r.get("permit"))
+
+    def unmatch(self, old: str, permit_id: Optional[str] = None) -> str:
+        """人说"不是同一个"（design_v0.5.md 14.5）：认回是按名字、类型、父对象推断的，可以撤销。
+        原来的对象放回那次执行之前的样子（这是人的决定，记在人名下）；AI 新建的那个放回 AI 的版本，
+        换一个新编号，记在那个 AI 名下。只拆这一个对象。返回结果说明。"""
+        entries = [e for e in self.rt.identity_log if e["object"] == old and not e.get("undone")
+                   and e["kind"] in ("gone", "rebind") and (permit_id is None or e["permitId"] == permit_id)]
+        if not entries:
+            return "找不到这次认回（或者已经拆开过）"
+        e = entries[-1]
+        res = self.bridge.call("unmatch", self._args(permit_id=e["permitId"], old=old))
+        if res.get("status") != "ok":
+            return {"changed": "之后又改过，不能自动拆开", "unavailable": "拆开用的材料已经没有了"}.get(
+                res.get("status"), str(res.get("status")))
+        if "aliases" in res:
+            self.aliases = dict(res["aliases"])
+        before, after, new = res["before"], res["after"], res["new"]
+        ub, ua = self._units(before), self._units(after)
+        for uid, content in sorted(ua.items()):
+            if split_unit(uid)[0] == new:
+                self.rt.create_object(uid, OBJECT_TYPE, content, e["agent"],
+                                      provenance={"splitFrom": old, "permitId": e["permitId"]})
+            elif uid not in ub or ub[uid]["fp"] != content["fp"]:
+                if uid in self.rt.objects:
+                    self.rt.human_edit(self.human, uid, content, occupy=False)
+                else:
+                    self.rt.create_object(uid, OBJECT_TYPE, content, self.human)
+        for uid, content in sorted(ub.items()):
+            if uid not in ua and uid in self.rt.objects:
+                self.rt.human_edit(self.human, uid, {**DELETED, **{k: content[k] for k in ("name", "type", "parent", "kind")
+                                                                   if content.get(k) is not None}}, occupy=False)
+        self._learn(after)
+        self.view = after
+        self.rt.mark_unmatched(self.human, e["permitId"], old, new)
+        name, new_name = display(after.get(old), old), display(after.get(new), new)
+        self._notes.setdefault(e["agent"], []).append(
+            f"人认为 {name} 不是你删掉又新建的那个，已经拆开：原来的 {name} 放回了那次执行之前的样子；"
+            f"你新建的那个现在是另一个对象（{new_name}），你还没看过它，先看一下再改。")
+        self._save()
+        return "已拆开"
 
     def _conflicts(self, rep: AgentReport, before: Records, raw: Records, after: Records,
                    before_values: Values, raw_values: Values) -> list[dict]:
@@ -751,6 +1131,7 @@ class SharedSession:
                 continue                               # 补回人删掉的对象：已经在 recreate_blocked 里
             rep.skipped.append({"id": uid, "name": name(uid), "reason": k["reason"],
                                 **({"by": k["by"]} if "by" in k else {}),
+                                **({"source": k["source"]} if k.get("source") else {}),
                                 **({"whole_object": True} if k.get("whole_object") else {}),
                                 **({"ancestor": True} if k.get("ancestor") else {}),
                                 **({"precheck": True} if k.get("precheck") else {})})
@@ -838,6 +1219,8 @@ class SharedSession:
         r = s["reason"]
         if s.get("ancestor"):
             return "下面有人改过的对象，不能删除"
+        if r == R_HUMAN and s.get("source"):
+            return "来源不明（" + SOURCES.get(s["source"], s["source"]) + "），按人的修改保护"
         if r == R_HUMAN:
             return "人改过，保留人的"
         if r == R_SELECTED:
@@ -969,14 +1352,15 @@ class SharedSession:
             return "、".join(n + ("" if rep.identity_levels.get(n) == "同名" else f"（{rep.identity_levels[n]}）")
                             if n in rep.identity_levels else n for n in names)
         if rep.reidentified:
-            lines.append("你删掉又新建的这些对象，按同一个对象处理（编号不变，人改过的部分照样保留）："
-                         + with_level(rep.reidentified))
+            lines.append("你删掉又新建的这些对象，按同一个对象处理（按名字、类型、父对象推断的，人可以撤销；"
+                         "编号不变，人改过的部分照样保留）：" + with_level(rep.reidentified))
         if rep.rebound:
             lines.append("你新建的这些对象，就是你想删、但因为人改过而保留下来的那几个，按同一个对象处理"
-                         "（人改过的部分照样保留，没有出现两份）：" + with_level(rep.rebound))
+                         "（按名字、类型、父对象推断的，人可以撤销；人改过的部分照样保留，没有出现两份）："
+                         + with_level(rep.rebound))
         if rep.recreate_blocked:
-            lines.append("人删掉了这些对象，你还没看到这次删除；你新建的同名对象已删掉，没有补回来："
-                         + "、".join(rep.recreate_blocked) + "。如果确实需要，看过最新情况后再新建。")
+            lines.append("人删掉了这些对象，你新建的同名对象已删掉，没有补回来：" + "、".join(rep.recreate_blocked)
+                         + "。人交还之前不能重建，请从计划里去掉；确实需要的话，请人交还。")
         if rep.facts:
             lines.append("以现在的值为准（请当作新的目标，写进你之后的计划；下次重建或调整时直接用这些值）：")
             lines += ["- " + self._fact_text(f) for f in rep.facts[:12]]

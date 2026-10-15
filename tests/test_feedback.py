@@ -66,7 +66,8 @@ def test_repeated_futile_edits_are_detected_from_the_ledger():
     assert sorted(x["object"] for x in rep.loops if x["label"] == "Location") == ["Cube", "Leaf_3"]
     assert next(x for x in rep.loops if x["object"] == "Leaf_3")["times"] == 4
     assert "反复想改" in rep.text
-    assert [bool(a) for a in alerts] == [False, False, True, False]            # 第 3 次提醒人一次，之后不重复
+    assert ["反复改" in a for a in alerts] == [False, False, True, False]        # 第 3 次提醒人一次，之后不重复
+    assert "Rock_2 建回来" in alerts[0] and not any("建回来" in a for a in alerts[1:])   # 拦下补回：只提醒一次（14.4）
     assert "反复改你改过的部分" in alerts[2] and "Leaf_3 的Location" in alerts[2]
     events = [e for e in rt.events if e.type == "alert/human" and e.data.get("kind") == "loop"]
     assert len(events) == 1

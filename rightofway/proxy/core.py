@@ -183,15 +183,19 @@ class Proxy:
         return bool(rep.conflicts or rep.breach or rep.missed or rep.derived or rep.loops or rep.recreate_blocked
                     or rep.identity_errors or rep.reidentified or rep.rebound or rep.side_effects or rep.error)
 
+    def tell_human(self, text: str, actions: Optional[list] = None) -> None:
+        """给人的提醒：写进日志；接入代码支持的话也显示在应用里，带上按钮（交还、不是同一个，design_v0.5.md 14.4、14.5）。"""
+        self.alerts.append(text)
+        log.warning("提醒人：%s", text)
+        if self.s.capabilities.get("notify"):
+            try:
+                self.s.bridge.call("notify", {"text": text, "actions": list(actions or [])})
+            except Exception:                        # noqa: BLE001
+                log.exception("在应用里显示提醒失败")
+
     def _result(self, rep, content: list, upstream=None) -> types.CallToolResult:
         if rep.alert:
-            self.alerts.append(rep.alert)
-            log.warning("提醒人：%s", rep.alert)
-            if self.s.capabilities.get("notify"):
-                try:
-                    self.s.bridge.call("notify", {"text": rep.alert})
-                except Exception:                    # noqa: BLE001
-                    log.exception("在应用里显示提醒失败")
+            self.tell_human(rep.alert, rep.actions)
         is_error = SharedSession.is_error(rep) or bool(upstream is not None and upstream.isError)
         return types.CallToolResult(content=content, isError=is_error,
                                     structuredContent=getattr(upstream, "structuredContent", None),

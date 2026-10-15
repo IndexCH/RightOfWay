@@ -956,7 +956,7 @@ def poll(args):
     ensure_ids(scene, prefix=args.get("prefix", "h-"))
     known = args.get("known")
     return {"records": records(scene, values=known if known is not None else "all"),
-            "time": time.time(), "labels": face_labels()}
+            "time": time.time(), "labels": face_labels(), "boot": _state().boot, "requests": _take_requests()}
 
 
 def _other_objects(scene):
@@ -1026,7 +1026,10 @@ def probe(args):
     names = [a.name, b.name]
     bpy.data.objects.remove(a)
     bpy.data.objects.remove(b)
-    out = {"names": names, "identity": True, "transfer_ids": True, "notify": True, "atomic": True, "measured": True}
+    out = {"names": names, "identity": True, "transfer_ids": True, "notify": True, "atomic": True, "measured": True,
+           "journal": True, "requests": True, "unmatch": True, "boot": _state().boot,
+           # 文档：哪个文件的哪个场景。账本落盘时按它对上（design_v0.5.md 14.3）；没存过盘的文件只在这次打开期间有效
+           "document": (bpy.data.filepath or ("unsaved:" + _state().boot)) + "|" + _scene(args).name}
     out.update(_self_test(base))
     return out
 
@@ -1082,6 +1085,7 @@ def _self_test(base):
 def notify(args):
     """给人的提醒（违规、AI 反复改改不动的东西、认回核对不一致）：在 Blender 界面里弹出提示；没有界面时只打印。"""
     text = str((args or {}).get("text", ""))
+    actions = list((args or {}).get("actions") or [])
     lines = []
     for para in text.splitlines() or [""]:
         while len(para) > 60:
@@ -1092,9 +1096,15 @@ def notify(args):
     try:
         wm = bpy.context.window_manager
         if wm.windows:
+            buttons = actions and _ensure_operator()
+
             def draw(menu, _context):
                 for line in lines:
                     menu.layout.label(text=line)
+                for a in (actions if buttons else ()):   # 交还、不是同一个：人点了才算（AI 的代码改不了，见 run_agent）
+                    op = menu.layout.operator("rightofway.request", text=str(a.get("label") or a.get("kind")))
+                    op.kind, op.target = str(a.get("kind") or ""), str(a.get("id") or "")
+                    op.permit, op.objname = str(a.get("permit") or ""), str(a.get("name") or "")
             with bpy.context.temp_override(window=wm.windows[0]):
                 wm.popup_menu(draw, title="RightOfWay", icon="ERROR")
             shown = True
@@ -1159,11 +1169,11 @@ def _identity(scene, before, created, args):
             if (r is not None and cid not in olds and (r.get("kind") == "data") == (phase == "data")
                     and (cid in objs or cid in datas)):
                 olds[cid], kinds[cid] = {"name": r["name"], "type": r["type"], "parent": r.get("parent")}, "rebind"
-        if phase == "object":
-            for cid, row in sorted((args.get("no_recreate") or {}).items()):
-                if cid not in before and cid not in objs:
-                    olds[cid], kinds[cid] = ({"name": row.get("name"), "type": row.get("type"),
-                                              "parent": row.get("parent")}, "tomb")
+        for cid, row in sorted((args.get("no_recreate") or {}).items()):   # 墓碑：对象、数据块各在自己那一轮
+            if (cid not in before and cid not in objs and cid not in datas
+                    and (row.get("kind") == "data") == (phase == "data")):
+                olds[cid], kinds[cid] = ({"name": row.get("name"), "type": row.get("type"),
+                                          "parent": row.get("parent")}, "tomb")
         fresh, made = {}, {}
         for cid in created:
             x = objs.get(cid) if phase == "object" else (datas.get(cid) or (None,))[0]
@@ -1202,6 +1212,10 @@ def _remove_recreated(scene, tombs, created):
     for cid in tombs:
         o = _find(scene, cid)
         if o is None:
+            x, cname = _find_data(cid)              # 数据块的墓碑：删掉新建的那个（用它的对象，引用清空）
+            if x is not None:
+                getattr(bpy.data, cname).remove(x)
+                removed.append(cid)
             continue
         refs = [d for d in _data_refs([o]) if d.get(ID_KEY) in created]
         bpy.data.objects.remove(o, do_unlink=True)
@@ -1234,9 +1248,19 @@ def run_agent(args):
       protect      False 表示对照组：不保护
       scene        场景名（可选）
     """
+    pid = args.get("permit_id")
+    state = _state()
+    if pid and pid in state.journal:                 # 同一张许可单只执行一次：再发来就交回记下的结果（14.2）
+        e = state.journal[pid]
+        if e.get("status") == "done":
+            return dict(e["result"], replayed=True)
+        raise RuntimeError(f"许可单 {pid} 已经用过（{e.get('status')}）")
     st = _begin(args)
     if "status" in st:
+        st["requests"] = _take_requests()
+        _journal_put(pid, {"status": "not_executed", "result": st})
         return st                                    # replan / deferred：没有执行
+    requests_before = [dict(r) for r in state.requests]
     out = io.StringIO()
     error = None
     try:
@@ -1244,30 +1268,99 @@ def run_agent(args):
             exec(args["code"], {"bpy": bpy, "__name__": "__rightofway_agent__"})
     except Exception:
         error = traceback.format_exc(limit=3)
-    return _finish(st, error, out.getvalue(), "RightOfWay: AI 脚本")
+    # 只有人能交还、说"不是同一个"：AI 的代码改了这些请求的，撤销并报告（14.4）
+    forged = _state().requests != requests_before
+    if forged:
+        _state().requests[:] = requests_before
+    res = _finish(st, error, out.getvalue(), "RightOfWay: AI 脚本")
+    res["forged_release"] = forged
+    res["requests"] = _take_requests()
+    _journal_put(pid, {"status": "done", "result": res})
+    return res
 
 
-def _pending():
-    """begin_agent 和 finish_agent 之间的状态（跨两次调用）。每次调用都在新的命名空间里执行，所以放在 sys.modules 里
-    （bpy.app.driver_namespace 也能跨调用，但 pip 装的 bpy 退出时会因此卡住）。"""
+def _state():
+    """跨调用的状态。每次调用都在新的命名空间里执行，所以放在 sys.modules 里
+    （bpy.app.driver_namespace 也能跨调用，但 pip 装的 bpy 退出时会因此卡住）：
+      pending   begin_agent 和 finish_agent 之间的状态；
+      journal   按许可单编号记的执行结果（design_v0.5.md 14.2）：结果没收到时查回来，同一张许可单只执行一次；
+      boot      这个 Blender 进程的启动编号：变了说明 Blender 重新打开过，记的结果都没了；
+      requests  人在 RightOfWay 提醒里点的按钮（交还、不是同一个，14.4、14.5），随下一次结果交回；
+      undo      认回的撤销材料（14.5）：许可单编号 → {旧编号: 快照文件、AI 版本的副本……}。"""
     import sys
     import types
     mod = sys.modules.get("_rightofway_state")
     if mod is None:
         mod = sys.modules["_rightofway_state"] = types.ModuleType("_rightofway_state")
-        mod.pending = {}
-    return mod.pending
+    for key, make in (("pending", dict), ("journal", dict), ("requests", list), ("undo", dict)):
+        if not hasattr(mod, key):
+            setattr(mod, key, make())
+    if not hasattr(mod, "boot"):
+        mod.boot = uuid.uuid4().hex[:12]
+    return mod
 
+
+def _pending():
+    return _state().pending
+
+
+def _journal_put(pid, entry):
+    if not pid:
+        return
+    j = _state().journal
+    j[pid] = entry
+    while len(j) > 32:
+        j.pop(next(iter(j)))
+
+
+def _take_requests():
+    st = _state()
+    out, st.requests = list(st.requests), []
+    return out
+
+
+def result(args):
+    """查回一次执行的结果（design_v0.5.md 14.2）。Blender 重新打开过（boot 变了）就没有了。"""
+    return {"boot": _state().boot, "entry": _state().journal.get((args or {}).get("permit_id") or "")}
+
+
+def _ensure_operator():
+    """注册 RightOfWay 提醒里的按钮背后的操作（只注册一次）：人点了，就把请求记在 _state().requests 里。
+    只用 Blender 的脚本接口注册，不改 Blender 和插件（P3），不存进文件。只在有界面时注册（无界面的 Blender
+    没有人点按钮；pip 装的 bpy 注册了类，退出时会卡住）。属性直接写进 __annotations__，不依赖注解的求值方式。"""
+    if getattr(bpy.types, "RIGHTOFWAY_OT_request", None) is not None:
+        return True
+    wm = getattr(bpy.context, "window_manager", None)
+    if wm is None or not wm.windows:
+        return False
+
+    def execute(self, context):
+        _state().requests.append({"kind": self.kind, "id": self.target, "permit": self.permit or None,
+                                  "name": self.objname, "time": time.time()})
+        self.report({"INFO"}, "RightOfWay：已记下")
+        return {"FINISHED"}
+    cls = type("RIGHTOFWAY_OT_request", (bpy.types.Operator,), {
+        "__doc__": "RightOfWay 提醒里的按钮：交还给 AI，或者说明不是同一个对象",
+        "bl_idname": "rightofway.request", "bl_label": "RightOfWay", "bl_options": {"INTERNAL"},
+        "__annotations__": {"kind": bpy.props.StringProperty(), "target": bpy.props.StringProperty(),
+                            "permit": bpy.props.StringProperty(), "objname": bpy.props.StringProperty()},
+        "execute": execute})
+    bpy.utils.register_class(cls)
+    return True
 
 def begin_agent(args):
     """把一次不是脚本的修改（例如 MCP 代理转发给应用 MCP 服务器的类型化工具调用）包起来：前一半。
     和 run_agent 一样核对、快照，但不执行代码；返回 {"status": "begun", "token"}，之后调用 finish_agent。
     两次调用之间应用里发生的一切都算这个 Agent 做的（不是原子的；代理在两次调用之间只做那一次工具调用）。"""
+    pid = args.get("permit_id")
     st = _begin(args)
     if "status" in st:
+        st["requests"] = _take_requests()
+        _journal_put(pid, {"status": "not_executed", "result": st})
         return st
     token = uuid.uuid4().hex
     _pending()[token] = st
+    _journal_put(pid, {"status": "begun", "token": token})
     return {"status": "begun", "token": token}
 
 
@@ -1276,7 +1369,10 @@ def finish_agent(args):
     st = _pending().pop(args["token"], None)
     if st is None:
         raise RuntimeError("找不到 begin_agent 的状态（Blender 重启过，或者已经 finish 过）")
-    return _finish(st, args.get("error"), "", "RightOfWay: AI 工具")
+    res = _finish(st, args.get("error"), "", "RightOfWay: AI 工具")
+    res["requests"] = _take_requests()
+    _journal_put(st["args"].get("permit_id"), {"status": "done", "result": res})
+    return res
 
 
 def _begin(args):
@@ -1296,7 +1392,8 @@ def _begin(args):
         changed = sorted((set(before) ^ set(expected))
                          | {cid for cid in before if cid in expected and before[cid]["fp"] != expected[cid]})
         sel = args.get("expected_selection")
-        if changed or (sel is not None and sorted(sel) != selected):
+        # 人刚在提醒里点了按钮（交还、不是同一个）也算人的新决定：先交回去，运行时照着重开许可单（14.4）
+        if changed or (sel is not None and sorted(sel) != selected) or _state().requests:
             return {"status": "replan", "changed": changed, "before": before, "selected": selected,
                     "labels": face_labels()}
 
@@ -1334,6 +1431,23 @@ def _finish(st, error, stdout, undo_message):
         identity, tombs = _identity(scene, before, ai_created, args)
     taken = {new for new, _ in identity.get("pairs", {}).values()}
     ai_created = [c for c in ai_created if c not in taken]
+    # 认回的撤销材料（design_v0.5.md 14.5）：推断带上了要保持的部分的对象，把 AI 新建的那个（恢复之前的样子）
+    # 写进一个临时文件，执行前的快照文件也留着；人说"不是同一个"时拆回两个（unmatch）。都不进你的文件
+    undo = {}
+    pid = args.get("permit_id")
+    if pid and snap_path and identity.get("kinds"):
+        keep_objs = []
+        for old, kind in identity["kinds"].items():
+            x = _find(scene, old)
+            if kind in ("gone", "rebind") and x is not None and (old in protected or old in keep_alive):
+                undo[old] = {"ai_name": x.name, "old_name": before[old]["name"],
+                             "collections": before[old]["collections"]}
+                keep_objs.append(x)
+        if keep_objs:
+            ai_path = os.path.join(tempfile.gettempdir(), f"rightofway_undo_{uuid.uuid4().hex[:8]}.blend")
+            bpy.data.libraries.write(ai_path, set(keep_objs), fake_user=False)
+            for m in undo.values():
+                m["ai_path"] = ai_path
     before_faces = {cid: r["aspects"] for cid, r in before.items()}
     after = records(scene, values=before_faces)
 
@@ -1398,7 +1512,7 @@ def _finish(st, error, stdout, undo_message):
                 restored.append(cid)
                 fallback.append({"id": cid, "faces": left})
         _settle(scene, extras, bef, report, tidy=False)
-    if snap_path:
+    if snap_path and not undo:
         try:
             os.remove(snap_path)
         except OSError:
@@ -1408,6 +1522,10 @@ def _finish(st, error, stdout, undo_message):
     if do_protect and args.get("restore_selection", True):
         _restore_selection(scene, vl, sel_state)     # 选中状态是人的界面状态，AI 的脚本改了就还原
     final = records(scene, values=before_faces)
+    if undo:
+        for old, m in undo.items():
+            m["final_fp"] = (final.get(old) or {}).get("fp")
+        _undo_put(pid, {"snap": snap_path, "items": undo})
     inexact = [cid for cid in restored if final.get(cid, {}).get("cfp") != before[cid]["cfp"]]
     renamed = [cid for cid in restored if cid not in inexact and final[cid]["name"] != before[cid]["name"]]
     outside = {}
@@ -1429,6 +1547,80 @@ def _finish(st, error, stdout, undo_message):
         "undo_pushed": undo_pushed, "seconds": round(time.perf_counter() - t0, 4), "labels": face_labels(),
     }
 
+
+def _undo_put(pid, entry):
+    u = _state().undo
+    u[pid] = entry
+    while len(u) > 8:                                # 只留最近几次：旧的快照文件和副本删掉
+        _undo_drop(u.pop(next(iter(u))))
+
+
+def _undo_drop(entry):
+    paths = {entry.get("snap")} | {m.get("ai_path") for m in entry.get("items", {}).values()}
+    for path in paths - {None}:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _id_collection(idb):
+    for cname in _data_collections():
+        pool = getattr(bpy.data, cname, None)
+        if pool is not None and idb.name in pool and pool[idb.name] == idb:
+            return cname
+    return "meshes"
+
+
+def unmatch(args):
+    """人说"不是同一个"（design_v0.5.md 14.5）：把一次认回拆开。原来的对象（旧编号）从执行前的快照放回；
+    AI 新建的那个（恢复之前的样子）放回场景，换一个新编号。只给这个对象用的数据块（例如它自己的网格）跟着
+    原来的对象回去，AI 那个用自己的一份；共用的（材质）还是共用。只拆这一个对象，子对象仍然挂在原来的对象下。
+    之后又改过的，不自动拆。"""
+    _set_data_units(args)
+    scene = _scene(args)
+    pid, old = args.get("permit_id"), args.get("old")
+    entry = _state().undo.get(pid) or {}
+    item = (entry.get("items") or {}).get(old)
+    if (item is None or not entry.get("snap") or not os.path.exists(entry["snap"])
+            or not os.path.exists(item.get("ai_path") or "")):
+        return {"status": "unavailable"}
+    cur = records(scene, values="all")
+    x = _find(scene, old)
+    if old not in cur or x is None or cur[old]["fp"] != item.get("final_fp"):
+        return {"status": "changed"}
+    own = [d for d in _data_refs([x]) if d.users == 1]          # 只给这个对象用的数据块
+    own_ids = {d.get(ID_KEY) for d in own if d.get(ID_KEY)}
+    # 1. 原来的对象：从快照放回，替换现在这个（引用转过去）；它私有的数据块用快照里的那份
+    loaded, extras, bef = _append(entry["snap"], [item["old_name"]])
+    restored = loaded.get(item["old_name"])
+    if restored is None:
+        return {"status": "unavailable"}
+    _put_in_place(scene, restored, old, item["old_name"], item["collections"])
+    for d in own:
+        if d.users == 0:
+            getattr(bpy.data, _id_collection(d)).remove(d)
+    _settle(scene, extras, bef, {}, tidy=False)
+    # 2. AI 新建的那个：从撤销文件放回，换新编号；它私有的数据块是新的一份（去掉旧编号），共用的照旧共用
+    loaded2, extras2, bef2 = _append(item["ai_path"], [item["ai_name"]])
+    ai = loaded2.get(item["ai_name"])
+    if ai is None:
+        return {"status": "unavailable"}
+    for cname in _data_collections():
+        for d in getattr(bpy.data, cname, ()):
+            if cname in bef2 and d.as_pointer() not in bef2[cname] and d.get(ID_KEY) in own_ids:
+                _unstamp(d)
+    _settle(scene, extras2, bef2, {}, tidy=False)
+    _unstamp(ai)
+    _set_collections(scene, ai, item["collections"])
+    new_id = "a-" + uuid.uuid4().hex[:10]
+    _stamp(ai, new_id)
+    ai.name = item["ai_name"]
+    ensure_ids(scene, prefix="a-")
+    del entry["items"][old]
+    if not entry["items"]:
+        _undo_drop(_state().undo.pop(pid))
+    return {"status": "ok", "before": cur, "after": records(scene, values="all"), "new": new_id}
 
 def cleanup_scenes(args):
     """删掉之前实验留下的场景，以及只属于这些场景的对象和它们用过的数据。只动名字以 prefix 开头的场景。"""

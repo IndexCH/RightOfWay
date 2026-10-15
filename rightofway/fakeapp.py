@@ -29,6 +29,10 @@ Agent 的代码是一段 Python，执行时只能用 scene：
 run_agent 的保护和恢复逻辑和 blender_side.run_agent（Unity 的 RunAgent 相同）一致：
 只照运行时开的许可单（protected、expected）执行，自己不判断哪些该保护。
 
+执行生命周期（design_v0.5.md 14.2）：每次执行按许可单编号记下结果（_journal），同一张许可单只执行一次；
+result 查回结果；boot 是"应用进程"的启动编号，restart() 模拟应用重新打开（记的结果、进行中的状态都没了）。
+人在应用里的请求（交还、"不是同一个"）记在 _requests 里，随下一次结果交回（design_v0.5.md 14.4、14.5）。
+
 三个开关模拟不同的应用：
     restore_deleted=False  恢复不了被删掉的对象（和现在的 Unity 接入一样）
     unique_names=True      名字不许重复，重名的自动加 ".001"（和 Blender 一样）；默认允许重名（和 Unity 一样）
@@ -116,6 +120,13 @@ class FakeApp:
         self._alias: dict[str, str] = {}           # 应用编号 → 运行时编号（transfer_ids=False 时，每次调用由会话传进来）
         self._pending: dict[str, dict] = {}        # begin_agent 和 finish_agent 之间的状态
         self.notifications: list[str] = []         # 给人的提醒（notify）
+        self.actions: list[list[dict]] = []        # 提醒里给人的按钮（notify 的 actions）
+        self._journal: dict[str, dict] = {}        # 许可单编号 → {"status": done | begun | not_executed, ...}
+        self._requests: list[dict] = []            # 人在应用里的请求（交还、"不是同一个"），随下一次结果交回
+        self._undo: dict[str, dict] = {}           # 认回的撤销材料：许可单编号 → {旧编号: {"old": 快照, "ai": AI 的版本}}
+        self._boots = 0
+        self.boot = self._new_boot()
+        self.document = f"fake-{id(self):x}"
         self._n = 0
 
     # ------------------------------------------------------------------
@@ -186,6 +197,26 @@ class FakeApp:
 
     def select(self, *names: str) -> None:
         self.selection = {self.find(n) for n in names}
+
+    def request(self, kind: str, cid: str, name: str = "", **extra) -> None:
+        """人在应用里点了提醒里的按钮：kind = release（交还）或 unmatch（不是同一个）。cid 是运行时编号。"""
+        self._requests.append({"kind": kind, "id": cid, "name": name, **extra})
+
+    def restart(self) -> None:
+        """模拟应用重新打开：场景还在（假设存过盘），记的执行结果、进行中的状态、没交回的请求都没了。"""
+        self._journal.clear()
+        self._pending.clear()
+        self._requests.clear()
+        self._undo.clear()
+        self.boot = self._new_boot()
+
+    def _new_boot(self) -> str:
+        self._boots += 1
+        return f"boot-{id(self):x}-{self._boots}"
+
+    def _take_requests(self) -> list[dict]:
+        out, self._requests = self._requests, []
+        return out
 
     # ------------------------------------------------------------------
     # 编号：应用编号和运行时编号（transfer_ids=False 时两者可能不同）
@@ -270,7 +301,8 @@ class FakeApp:
         names = [self.objects[a]["name"], self.objects[b]["name"]]
         del self.objects[a], self.objects[b]
         out = {"names": names, "identity": True, "transfer_ids": self.transfer_ids, "notify": True, "atomic": True,
-               "measured": True}
+               "measured": True, "journal": True, "requests": True, "unmatch": True,
+               "boot": self.boot, "document": self.document}
 
         def fresh():
             t = FakeApp(self.restore_deleted, self.unique_names, self.transfer_ids)
@@ -292,13 +324,27 @@ class FakeApp:
         return out
 
     def notify(self, args: dict) -> dict:
-        """给人的提醒：假应用记下来（测试用）。"""
+        """给人的提醒：假应用记下来（测试用）。actions 是提醒里给人的按钮（交还、不是同一个）。"""
         self.notifications.append(str(args.get("text", "")))
+        self.actions.append(list(args.get("actions") or []))
         return {"shown": True}
 
     def poll(self, args: dict) -> dict:
         self._set_alias(args)
-        return {"records": self.records(), "labels": self.labels()}
+        return {"records": self.records(), "labels": self.labels(), "boot": self.boot,
+                "requests": self._take_requests()}
+
+    def result(self, args: dict) -> dict:
+        """查回一次执行的结果（design_v0.5.md 14.2）：按许可单编号记的；应用重新打开过就没有了。"""
+        e = self._journal.get(args.get("permit_id") or "")
+        return {"boot": self.boot, "entry": json.loads(json.dumps(e)) if e is not None else None}
+
+    def _journal_put(self, pid: Optional[str], entry: dict) -> None:
+        if not pid:
+            return
+        self._journal[pid] = entry
+        while len(self._journal) > 32:
+            self._journal.pop(next(iter(self._journal)))
 
     def _identity(self, before: dict, args: dict) -> tuple[dict, list[str]]:
         """认回同一个对象（和 blender_side._identity 一样，规则在 identity.py）：
@@ -323,11 +369,11 @@ class FakeApp:
                 if (r is not None and cid not in olds and cid in live
                         and (r.get("kind") == "data") == (phase == "data")):
                     olds[cid], kinds[cid] = {"name": r["name"], "type": r["type"], "parent": r.get("parent")}, "rebind"
-            if phase == "object":
-                for cid, row in sorted((args.get("no_recreate") or {}).items()):
-                    if cid not in before and cid not in live:
-                        olds[cid], kinds[cid] = ({"name": row.get("name"), "type": row.get("type"),
-                                                  "parent": row.get("parent")}, "tomb")
+            for cid, row in sorted((args.get("no_recreate") or {}).items()):   # 墓碑：对象、数据块各在自己那一轮
+                if (cid not in before and cid not in live
+                        and (row.get("kind") == "data") == (phase == "data")):
+                    olds[cid], kinds[cid] = ({"name": row.get("name"), "type": row.get("type"),
+                                              "parent": row.get("parent")}, "tomb")
             fresh = {}
             for a, o in self.objects.items():
                 if self._lid(a) not in before and bool(o.get("data")) == (phase == "data"):
@@ -360,7 +406,8 @@ class FakeApp:
         return out, tombs
 
     def _remove_recreated(self, tombs: list[str], created: set[str]) -> list[str]:
-        """拦下补回人删掉的对象：删掉配上墓碑的新对象，以及这次新建、只给它用的数据块。"""
+        """拦下补回人删掉的东西：删掉配上墓碑的新对象（以及这次新建、只给它用的数据块），或者新数据块
+        （用它的对象，引用清空，和人删掉它时一样）。"""
         removed = []
         for cid in tombs:
             a = self._aid(cid)
@@ -374,12 +421,19 @@ class FakeApp:
                 t = o["faces"].get(face)
                 if t in self.objects and self.objects[t].get("data") and self._lid(t) in created and not users.get(t):
                     del self.objects[t]
-        self._drop_dangling()
+            self._drop_dangling()
         return removed
 
     def run_agent(self, args: dict) -> dict:
+        pid = args.get("permit_id")
+        if pid and pid in self._journal:                # 同一张许可单只执行一次：再发来就交回记下的结果
+            e = self._journal[pid]
+            if e.get("status") == "done":
+                return {**e["result"], "replayed": True}
+            raise RuntimeError(f"许可单 {pid} 已经用过（{e.get('status')}）")
         st = self._begin(args)
         if "status" in st:
+            self._journal_put(pid, {"status": "not_executed", "result": st})
             return st
         out, error = io.StringIO(), None
         try:
@@ -387,22 +441,29 @@ class FakeApp:
                 exec(args["code"], {"scene": AgentScene(self), "__name__": "__rightofway_agent__"})
         except Exception:
             error = traceback.format_exc(limit=3)
-        return self._finish(st, error, out.getvalue())
+        res = self._finish(st, error, out.getvalue())
+        self._journal_put(pid, {"status": "done", "result": res})
+        return res
 
     def begin_agent(self, args: dict) -> dict:
         """不是脚本的修改（例如 MCP 代理转发的类型化工具调用）的前一半：核对、快照，不执行代码。"""
+        pid = args.get("permit_id")
         st = self._begin(args)
         if "status" in st:
+            self._journal_put(pid, {"status": "not_executed", "result": st})
             return st
         self._n += 1
         token = f"t-{self._n}"
         self._pending[token] = st
+        self._journal_put(pid, {"status": "begun", "token": token})
         return {"status": "begun", "token": token}
 
     def finish_agent(self, args: dict) -> dict:
         """后一半：和 run_agent 执行完代码之后一样认回、恢复、核对。"""
         st = self._pending.pop(args["token"])
-        return self._finish(st, args.get("error"), "")
+        res = self._finish(st, args.get("error"), "")
+        self._journal_put(st["args"].get("permit_id"), {"status": "done", "result": res})
+        return res
 
     def _begin(self, args: dict) -> dict:
         t0 = time.perf_counter()
@@ -414,9 +475,10 @@ class FakeApp:
             changed = sorted((set(before) ^ set(expected))
                              | {cid for cid in before if cid in expected and before[cid]["fp"] != expected[cid]})
             sel = args.get("expected_selection")
-            if changed or (sel is not None and sorted(sel) != selected()):
+            # 人刚在提醒里点了按钮（交还、不是同一个）也算人的新决定：先交回去，运行时照着重开许可单（14.4）
+            if changed or (sel is not None and sorted(sel) != selected()) or self._requests:
                 return {"status": "replan", "changed": changed, "before": before,
-                        "selected": selected(), "labels": self.labels()}
+                        "selected": selected(), "labels": self.labels(), "requests": self._take_requests()}
         protected = {cid: set(v) for cid, v in args.get("protected", {}).items()}
         protected = {cid: a for cid, a in protected.items() if cid in before and a}
         keep_alive = [c for c in args.get("keep_alive", []) if c in before and c not in protected]
@@ -433,6 +495,10 @@ class FakeApp:
         identity, tombs = ({}, [])
         if args.get("reidentify") and do_protect:
             identity, tombs = self._identity(before, args)
+        # 认回的撤销材料（design_v0.5.md 14.5）：推断带上了人的修改的（旧对象有要保持的部分），留下旧对象的快照
+        # 和 AI 新建的那个（恢复之前）的样子；人说"不是同一个"时拆回两个
+        undo = {old: {"old": snap[old], "ai": self._snap(old)}
+                for old, kind in (identity.get("kinds") or {}).items() if kind in ("gone", "rebind") and old in snap}
         after_raw = self.records()
 
         full, partial, lost, merged = [], {}, [], {}
@@ -476,6 +542,12 @@ class FakeApp:
         if do_protect:
             self.selection = {self._aid(c) for c in sel_before if self._aid(c) in self.objects}
         final = self.records()
+        if undo and args.get("permit_id"):
+            for old, m in undo.items():
+                m["final_fp"] = (final.get(old) or {}).get("fp")
+            self._undo[args["permit_id"]] = undo
+            while len(self._undo) > 32:
+                self._undo.pop(next(iter(self._undo)))
         inexact = [cid for cid in restored if final.get(cid, {}).get("cfp") != before[cid]["cfp"]] + lost
         return {
             "status": "ok", "before": before, "after_raw": after_raw, "after": final,
@@ -486,7 +558,38 @@ class FakeApp:
             "recreated": recreated, "aliases": self.aliases(), "error": error,
             "stdout": stdout[-4000:], "undo_pushed": False,
             "seconds": round(time.perf_counter() - t0, 4), "labels": self.labels(),
+            "requests": self._take_requests(), "boot": self.boot,
         }
+
+    def unmatch(self, args: dict) -> dict:
+        """人说"不是同一个"（design_v0.5.md 14.5）：把一次认回拆开。原来的对象（旧编号）放回执行前的样子，
+        AI 新建的那个放回 AI 的版本，换一个新编号。只拆这一个对象（子对象仍然挂在原来的对象下）；
+        之后又改过的，不自动拆（返回 changed）。"""
+        self._set_alias(args)
+        pid, old = args.get("permit_id"), args.get("old")
+        m = (self._undo.get(pid) or {}).get(old)
+        if m is None:
+            return {"status": "unavailable"}
+        cur = self.records()
+        if old not in cur or cur[old]["fp"] != m["final_fp"]:
+            return {"status": "changed"}
+        a = self._aid(old)
+        self._n += 1
+        new_a = f"a-{self._n}"
+        ai = self._unsnap(m["ai"])
+        if self.transfer_ids or a == old:
+            self.objects[old] = self._unsnap(m["old"])            # 原来的放回旧编号
+        else:
+            self._alias.pop(a, None)                                # 编号不能转交：去掉映射，旧对象用旧编号放回
+            del self.objects[a]
+            self.objects[old] = self._unsnap(m["old"])
+        if self.unique_names:
+            ai["name"] = self._free_name(ai["name"], bool(ai.get("data")))
+        self.objects[new_a] = ai
+        del self._undo[pid][old]
+        self._drop_dangling()
+        return {"status": "ok", "before": cur, "after": self.records(), "new": self._lid(new_a),
+                "aliases": self.aliases()}
 
     def aliases(self) -> dict[str, str]:
         """现在场景里、编号和运行时不同的对象：应用编号 → 运行时编号（交给会话保存）。"""
@@ -543,7 +646,7 @@ class FakeBridge:
     def call(self, fn: str, args: Optional[dict] = None) -> dict:
         handlers = {"poll": self.app.poll, "run_agent": self.app.run_agent, "probe": self.app.probe,
                     "begin_agent": self.app.begin_agent, "finish_agent": self.app.finish_agent,
-                    "notify": self.app.notify}
+                    "notify": self.app.notify, "result": self.app.result, "unmatch": self.app.unmatch}
         if fn not in handlers:
             raise ValueError(f"FakeApp 不支持 {fn}")
         return json.loads(json.dumps(handlers[fn](args or {})))

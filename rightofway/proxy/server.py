@@ -49,10 +49,20 @@ async def serve_stdio(proxy) -> None:
         await server.run(read, write, server.create_initialization_options())
 
 
+def ledger_path(document: Optional[str]) -> Optional[str]:
+    """账本默认存在 ~/.rightofway/ledgers/ 下，按文档（接入代码报的"哪个文件的哪个场景"）分开（design_v0.5.md 14.3）。"""
+    if not document:
+        return None
+    import hashlib
+    import os
+    name = hashlib.sha1(document.encode("utf-8")).hexdigest()[:16] + ".json"
+    return os.path.join(os.path.expanduser("~"), ".rightofway", "ledgers", name)
+
+
 def make_proxy(upstream: list[str], app: str = "blender", bridge: str = "mcp", host: str = "127.0.0.1",
                port: int = 9876, code_tool: Optional[str] = None, code_param: Optional[str] = None,
                agent: str = "agent", granularity: str = "aspect", reidentify: bool = True,
-               existing: str = "open", env: Optional[dict] = None):
+               existing: str = "open", env: Optional[dict] = None, ledger: Optional[str] = "auto"):
     from ..blender.bridge import SocketBridge
     from ..blender.shared_session import SharedSession
     from ..runtime import Runtime
@@ -72,8 +82,12 @@ def make_proxy(upstream: list[str], app: str = "blender", bridge: str = "mcp", h
         br = MCPBridge(client, code_tool, code_param or "code", FakeSource() if app == "fake" else BlenderSource())
     session = SharedSession(Runtime(reidentify=reidentify), br, agent=agent, granularity=granularity,
                             initial_owner=existing)
-    session.start()
-    return Proxy(session, client, code_tool=code_tool, code_param=code_param, agent=agent)
+    # 账本存在哪里：auto 按连接时测出的文档（哪个文件的哪个场景）决定
+    session.start(ledger=ledger_path if ledger == "auto" else (None if ledger in (None, "off") else ledger))
+    proxy = Proxy(session, client, code_tool=code_tool, code_param=code_param, agent=agent)
+    if session.start_alert:
+        proxy.tell_human(session.start_alert)
+    return proxy
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -97,6 +111,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--existing", choices=["open", "human"], default="open",
                     help="开始时场景里已有的内容：open 表示 AI 可以改（默认）；human 表示都算人改过的，人交还之前 AI 不能改")
     ap.add_argument("--env", action="append", default=[], metavar="KEY=VALUE", help="给上游加的环境变量")
+    ap.add_argument("--ledger", default="auto",
+                    help="账本存在哪里：auto（默认，~/.rightofway/ledgers/ 下按文件和场景分开）、文件路径，或者 off（不存）")
     args = ap.parse_args(argv)
     if not upstream:
         ap.error("缺少上游的启动命令，例如：python -m rightofway.proxy -- uvx blender-mcp")
@@ -105,7 +121,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     import anyio
     proxy = make_proxy(upstream, app=args.app, bridge=args.bridge, host=args.host, port=args.port,
                        code_tool=args.code_tool, code_param=args.code_param, agent=args.agent,
-                       granularity=args.granularity, reidentify=args.reidentify, existing=args.existing, env=env)
+                       granularity=args.granularity, reidentify=args.reidentify, existing=args.existing, env=env,
+                       ledger=args.ledger)
     logging.getLogger("rightofway.proxy").info(
         "已连接上游：%d 个工具，执行代码的工具：%s；能力：%s", len(proxy.upstream), proxy.code_tool,
         {k: v for k, v in proxy.s.capabilities.items() if k != "names"})

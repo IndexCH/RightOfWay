@@ -65,6 +65,25 @@ def test_code_tool_is_detected_and_goes_through_the_permit(made):
     assert check_session(p.s) == []
 
 
+def test_blocked_rebuild_offers_the_human_a_release_button(made):
+    """design_v0.5.md 14.4：人删掉的，AI 想建回来被拦下；提醒里带"允许重建"的按钮，人点了才放开。"""
+    app, p = made(unique_names=True)
+    app.delete("Rock_2")
+    rebuild = sf._code(sf._REBUILD, plan=sf.PLAN_ADJUST)
+    r = p.call_tool("execute_code", {"code": rebuild})
+    assert r.isError and r.meta["rightofway"]["identity"]["recreate_blocked"] == ["Rock_2"]
+    assert app.notifications and "建回来" in app.notifications[-1]
+    button = next(a for a in app.actions[-1] if a["kind"] == "release")
+    assert button["label"].startswith("允许 AI 重建") and not _named(app, "Rock_2")
+    app.request("release", button["id"], "Rock_2")                       # 人点了按钮
+    r2 = p.call_tool("execute_code", {"code": rebuild})
+    assert len(_named(app, "Rock_2")) == 1 and "交还" in _text(r2)
+
+
+def _named(app, name):
+    return [o for o in app.objects.values() if o["name"] == name]
+
+
 def test_read_tool_gets_what_the_agent_missed(made):
     app, p = made(unique_names=True)
     sf.human_a(app)

@@ -22,8 +22,9 @@ Current tools handle this by asking the model nicely (put the user's edits in th
 - **Per property, not per object.** Conflicts are judged per *face* of an object: location, scale, material, mesh, modifiers… You move a leaf while the agent recolors all leaves for autumn: both changes stay. Faces are read automatically from the application's own data description (Blender RNA, Unity serialization); nothing is hand-defined per app. Data shared by several objects (a material, a mesh) is a unit of its own: recolour a shared material once and it is recorded once, on the material, and restored onto that same material.
 - **What you're working on is off-limits.** Once you start editing an object it's occupied, and agent steps that depend on it wait. Optionally, simply selecting an object reserves it.
 - **Stale writes don't land.** An agent's change based on an outdated view is voided instead of overwriting newer work.
-- **Deleted and recreated is still the same object.** Agents often clear the scene and rebuild it. The runtime re-identifies each new object with the old one by name, type and parent (the app's duplicate-name suffix is learned by a self-test at connection time; ambiguous cases are not matched), so your edits survive and nothing is duplicated.
-- **What you deleted stays deleted.** If the agent recreates an object you deleted before it saw the deletion, the runtime removes the recreation and tells the agent. The parents of objects you edited can't be deleted either.
+- **Deleted and recreated is still the same object.** Agents often clear the scene and rebuild it. The runtime re-identifies each new object with the old one by name, type and parent (the app's duplicate-name suffix is learned by a self-test at connection time; ambiguous cases are not matched), so your edits survive and nothing is duplicated. This is an inference, not a proof: when it carries your edits over to a new object you're alerted once, and if it's wrong, clicking "Not the same object" splits them back into two objects.
+- **What you deleted can't come back until you hand it back.** If the agent recreates an object you deleted (whether or not it saw the deletion), the runtime removes the recreation and tells the agent. The alert has an "Allow rebuild" button; only after you click it can the agent rebuild the object, and the agent's code can't forge that click. The parents of objects you edited can't be deleted either.
+- **Lost results and restarts don't corrupt the record.** If an execution's result doesn't come back, the runtime asks the app for it before recording anything; changes it still can't attribute are protected as yours, and you're alerted. The ledger is saved to disk, so a restarted proxy carries on where it left off.
 - **The agent is told what it missed, with values.** Every time it reads or acts, it gets something like:
   ```
   Since you last looked at the scene:
@@ -99,10 +100,12 @@ sequenceDiagram
 ```
 
 - **How your edits reach the ledger (steps 5–8).** The proxy doesn't poll in the background. Every execution carries the fingerprints the runtime expects; if they don't match, nothing runs and the current state comes back (optimistic concurrency). The session layer records the difference as your edits and asks for a new permit, up to 3 retries. Reading the scene (read-only tools, `rightofway_observe`) also picks up your edits.
-- **The permit (step 8)** lists the faces to keep (edited by you, or recently changed by or reserved for another agent), the ancestors that can't be deleted, tombstones (objects you deleted that this agent hasn't seen deleted yet), and the re-identification rule.
+- **Gate and permit (steps 3–4, 7–8).** Before a permit is issued, one gate decides, in one place: nothing starts while you've paused all agents, while an earlier execution's result is still unknown, or while this agent is paused after a breach. The permit lists the faces to keep (edited by you, or recently changed by or reserved for another agent), the ancestors that can't be deleted, tombstones (objects you deleted and haven't handed back), and the re-identification rule. Every permit ends exactly once: settled, closed (nothing ran), or, when its result can't be recovered, recorded as unattributed.
 - **Execution (steps 9–10)** runs in one go on the app's main thread, so you can't interleave with it and every change in between is the agent's.
 - **Settlement (steps 11–12)** looks only at the actual state, never at what the permit hoped for. A face that had to be kept and is unchanged is kept; one that changed is a breach, recorded as it happened, and you are alerted and the agent is paused. Every other face is committed from the final state. The ledger's unit is a face: each property of each object, plus each property of the materials, meshes and other data blocks it uses. The integration pairs re-identified objects; the runtime recomputes the pairing with the same rule from `identity.py` and checks it.
-- **Feedback (steps 13–15)** is generated only from the settlement: text for the model in `content`, the structured result in `_meta.rightofway`, and `isError=true` whenever part of the call didn't land.
+- **Feedback (steps 13–15)** is generated only from the settlement: text for the model in `content`, the structured result in `_meta.rightofway`, and `isError=true` whenever part of the call didn't land. Alerts for you carry buttons: "Allow rebuild" (hand back an object you deleted) and "Not the same object" (split one re-identification).
+- **Lost results (the connection drops after step 9).** The integration records each result under its permit id, and a permit runs at most once. If the result is recovered, it is settled as usual and the agent's changes count as the agent's; if the app never ran it, the permit is closed; if it can't be recovered (the app was reopened), whatever differs can't be attributed, so it is protected as your edit and you're alerted. Until that is cleared up, no new execution starts and nothing seen in the meantime is counted as your edit.
+- **The ledger is saved to disk.** By default the proxy keeps it under `~/.rightofway/ledgers/`, one per file and scene. After a restart it first clears up executions whose results never arrived, then compares against the scene; changes made while the proxy wasn't running are also protected as your edits.
 
 Besides code execution, the proxy handles two other kinds of call:
 
@@ -157,13 +160,17 @@ When you delete an object and the agent's step would put it back (3 of 11 deleti
 
 ### Known issues
 
-- **Unity can't restore an object the agent deleted yet.** This is reported truthfully: the runtime records the deletion as it actually happened, marks it as a breach, alerts you, and pauses the agent until you resume it. A hidden-backup restore for Unity is the next step. The Unity side also lacks re-identification, wrapping of typed tool calls and in-app alerts; those work in Blender and the simulated apps. Unity's connection self-test is written to report that it lacks them, but like the rest of the v0.5 Unity changes it hasn't been run in Unity yet.
+- **Unity can't restore an object the agent deleted yet.** This is reported truthfully: the runtime records the deletion as it actually happened, marks it as a breach, alerts you, and pauses the agent until you resume it. A hidden-backup restore for Unity is the next step. The Unity side also lacks re-identification, wrapping of typed tool calls, in-app alerts and a record of execution results (so when a result is lost, every difference is treated as unattributed); those work in Blender and the simulated apps. Unity's connection self-test is written to report that it lacks them, but like the rest of the v0.5 Unity changes it hasn't been run in Unity yet.
 - **The MCP proxy's handling of the app's own typed tools is not atomic.** It checks before and after the call, so anything you change in the app in between is attributed to the agent. Code-execution tools and the proxy's own small tools (`rightofway_set_property` etc.) are atomic.
 - **Derived changes and intent conflicts are reported, not fixed.** If a leaf is restored to the height you set, a bird the agent placed above it may float in mid-air: the agent is told to treat the leaf's current height as the target and recheck, but the runtime doesn't move the bird.
+- **It guards against agents' habits and mistakes, not deliberate circumvention.** The agent's code runs in the same Blender process as the integration code, so in principle it can change anything (for example, register a timer that acts after the check). Guarding against deliberate circumvention needs the agent's code to run in another process (shadow execution).
+- **The ledger is rewritten whole.** After long use the file grows and each save gets slower; it will become an append-only log.
+
+Fixed on 2026-10-12: with all agents paused by you, the new pipeline still ran the agent's code and then failed while recording it, so the change was later counted as yours; when an execution's result was lost, the agent's changes were counted as yours; after a proxy restart your earlier edits were no longer protected; once the agent had seen your deletion, its second rebuild went through.
 
 Fixed on 2026-10-09: clear-and-rebuild breaking object identity (re-identification, on by default); agents rebuilding objects you deleted (blocked); deleting the parent of an object you edited (ancestors can't be deleted); a shared material split into a private copy per object (shared data blocks are units of their own). Fixed in v0.5 step 3: deleting an object you touched is judged for the whole object, so the agent is no longer told the deletion partly took effect.
 
-**Not verified yet:** the v0.5 Unity integration code (experiments C and E need rerunning in Unity), real LLM agents, a real computer-use agent, live sync between two Blender GUIs, edit mode and Ctrl+Z in the Blender GUI, and large scenes.
+**Not verified yet:** the v0.5 Unity integration code (experiments C and E need rerunning in Unity), real disconnects and app crashes (tested with simulated transport failures and reopening), the alert buttons in the Blender GUI (headless tests simulate the click), real LLM agents, a real computer-use agent, live sync between two Blender GUIs, edit mode and Ctrl+Z in the Blender GUI, and large scenes.
 
 ## Quick start
 
@@ -174,7 +181,7 @@ git clone https://github.com/IndexCH/RightOfWay.git
 cd RightOfWay
 python -m venv .venv
 .venv/bin/pip install -e ".[dev,proxy]"    # Windows: .venv\Scripts\pip install -e ".[dev,proxy]"
-.venv/bin/python -m pytest                  # 211 tests; the bpy and mcp ones skip when those aren't installed
+.venv/bin/python -m pytest                  # 232 tests; the bpy and mcp ones skip when those aren't installed
 python examples/demo_game_assets.py         # narrated walkthrough of the runtime, no Blender needed
 ```
 
@@ -194,7 +201,7 @@ After installing `.[proxy]`, replace the blender server in Claude Desktop's `cla
                             "args": ["-m", "rightofway.proxy", "--", "uvx", "blender-mcp"]}}}
 ```
 
-Everything after `--` is the command that used to start the Blender MCP server, unchanged; Blender itself still just needs the BlenderMCP add-on with its server started. The proxy logs to stderr, and alerts such as breaches also pop up inside Blender. Add `--bridge socket` to talk to the add-on directly instead of through the upstream code tool. To see it work without Claude: `python -m experiments.exp_p_proxy` (simulated upstream) or `--upstream "uvx blender-mcp"` (a running Blender).
+Everything after `--` is the command that used to start the Blender MCP server, unchanged; Blender itself still just needs the BlenderMCP add-on with its server started. The proxy logs to stderr, and alerts such as breaches also pop up inside Blender, with the "Allow rebuild" and "Not the same object" buttons in them. The ledger is saved under `~/.rightofway/ledgers/` by default; `--ledger off` turns that off and `--ledger PATH` saves it to a given file. Add `--bridge socket` to talk to the add-on directly instead of through the upstream code tool. To see it work without Claude: `python -m experiments.exp_p_proxy` (simulated upstream) or `--upstream "uvx blender-mcp"` (a running Blender).
 
 Each experiment needs its application ready (Blender with the [Blender MCP add-on](https://github.com/ahujasid/blender-mcp) server started; a second Blender on port 9877 for live sync; Unity 6 with the AI Assistant package for Unity). Groups that aren't ready are skipped with the reason. Step-by-step instructions (in Chinese) are in [docs/experiments.md](docs/experiments.md).
 
@@ -217,12 +224,13 @@ rightofway/              runtime (Python package)
 └── unity/               Unity integration through Unity's own MCP (Unity_RunCommand)
 experiments/             experiments A, B, C (Unity), D (two agents), E (agent deletes an object you edited),
                          H (realistic agent habits), P (through the MCP proxy), S (shadow execution trial) and run_all.py
-tests/                   211 tests, including the invariant checks
+tests/                   232 tests, including the invariant checks
 spec/spec_v0.4.md        protocol spec (Chinese, draft); section 0 lists the design principles
-spec/design_v0.5.md      v0.5 architecture redesign (Chinese; steps 1–3 implemented; section 13: hardening from the survey)
+spec/design_v0.5.md      v0.5 architecture redesign (Chinese; steps 1–3 implemented; section 13: hardening from the survey; section 14: execution lifecycle, identity and intent)
 spec/related_work.md     how this relates to existing papers, protocols and tools
 spec/prior_art_solutions.md  how other systems handle the same four problems (Chinese, 2026-10-08)
 docs/overview.md         plain-language walkthrough of the protocol (Chinese)
+docs/experiments.md      step-by-step experiment instructions (Chinese)
 ```
 
 ## How it relates to other work
@@ -238,7 +246,7 @@ Details and sources are in [spec/related_work.md](spec/related_work.md).
 
 ## Roadmap
 
-0. **v0.5 architecture** ([design](spec/design_v0.5.md)): every operation goes through one pipeline (permit → execute → verify → commit → report), with invariant checks that the scene, the record and the feedback agree. Steps 1–3 are done, and so is the hardening suggested by the survey of similar systems (re-identification, blocking recreations, protected ancestors, shared data blocks, feedback with the new targets, loop detection, capability probing; section 13). Next is the Unity side: rerun experiments C and E in Unity to verify the v0.5 changes, then hidden-backup restore and re-identification.
+0. **v0.5 architecture** ([design](spec/design_v0.5.md)): every operation goes through one pipeline (permit → execute → verify → commit → report), with invariant checks that the scene, the record and the feedback agree. Steps 1–3 are done, and so is the hardening suggested by the survey of similar systems (re-identification, blocking recreations, protected ancestors, shared data blocks, feedback with the new targets, loop detection, capability probing; section 13). The execution lifecycle is now unified (one gate, unknown results, a ledger saved to disk), re-identification is an inference you can undo, and what you deleted can't be rebuilt until you hand it back (section 14). Next is the Unity side: rerun experiments C and E in Unity to verify the v0.5 changes, then hidden-backup restore and re-identification.
 1. **MCP proxy**: done (`python -m rightofway.proxy`). Next: real LLM agents through Claude Desktop, compared against prompt-only protection.
 2. Shadow execution (trialled: same outcomes, 4–5× slower per step) is kept for apps that can't undo changes.
 3. A real computer-use agent on its own desktop, connected to live sync.

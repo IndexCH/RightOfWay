@@ -102,17 +102,23 @@ BUILD_ONLY = sf._code(sf._REBUILD.replace(CLEAR, ""), plan=sf.PLAN_ADJUST)
 
 
 @pytest.mark.parametrize("kw", [dict(unique_names=True), dict(restore_deleted=False, transfer_ids=False)])
-def test_recreating_what_the_human_deleted_is_undone_until_the_agent_has_seen_it(kw):
+def test_what_the_human_deleted_stays_deleted_until_handed_back(kw):
+    """design_v0.5.md 14.4：人删掉的，人交还之前 Agent 不能补回。"知道你删了"不等于"你允许它建回来"。"""
     app, s = _scene(**kw)
+    rock = s.find("Rock_2")
     app.delete("Rock_2")                                                        # Agent 没看到
     s.poll()
     rep = s.run_agent(REBUILD, "清空重建")
     assert rep.recreate_blocked == ["Rock_2"] and not _named(app, "Rock_2")
     assert "没有补回来" in rep.text and rep.outcome == "committed"
     assert check_session(s, rep) == []
-    again = s.run_agent(REBUILD, "又一次清空重建")                               # 已经被告知：再新建算有意的
-    assert again.recreate_blocked == [] and len(_named(app, "Rock_2")) == 1
-    assert check_session(s, again) == []
+    again = s.run_agent(REBUILD, "又一次清空重建")                               # 已经被告知、看到了删除：照样拦下
+    assert again.recreate_blocked == ["Rock_2"] and not _named(app, "Rock_2")
+    assert "交还" in again.text and check_session(s, again) == []
+    s.hand_back(rock)                                                           # 人交还
+    third = s.run_agent(REBUILD, "交还之后再重建")
+    assert third.recreate_blocked == [] and len(_named(app, "Rock_2")) == 1
+    assert check_session(s, third) == []
 
 
 def test_no_tombstone_for_an_object_the_agent_never_saw():

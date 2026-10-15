@@ -135,6 +135,7 @@ class OpStatus(str, Enum):
     REJECTED_OCCUPIED = "rejected_occupied"
     REJECTED_RESERVED = "rejected_reserved"            # R23：预留给了另一个 Agent
     REJECTED_SUSPENDED = "rejected_suspended"          # 这个 Agent 上次违规后被暂停，等人处理
+    REJECTED_IN_DOUBT = "rejected_in_doubt"            # 有一次 Agent 执行的结果还没查清（design_v0.5.md 14.2）
     BREACH = "breach"                                  # 违规：要保持的部分在应用里被改了，没能恢复；按实际状态记账
     REJECTED_BY_HUMAN = "rejected_by_human"
     REJECTED_STEP_ASSIGNMENT = "rejected_step_assignment"  # 步骤已被人认领或分配给人
@@ -243,6 +244,12 @@ class Permit:
     no_recreate: dict[str, dict] = field(default_factory=dict)  # 墓碑：人删掉、这个 Agent 还没看到的对象 → {name, type, parent}
     # 不许删、但面可以改的应用对象：要保持的对象的祖先（design_v0.5.md 12.6）→ {"reason": ..., "ancestor": True}
     keep_alive: dict[str, dict] = field(default_factory=dict)
+    # 这张许可单走到哪一步了（design_v0.5.md 14.1）。每张必须正好结束一次：
+    #   issued → dispatched → settled（照实际状态记账）
+    #                       → closed（没有执行：场景变了要重开、执行前就拒、或者查清了根本没执行）
+    #                       → in_doubt（发出去了，结果没收到）→ settled / closed / unattributed（查不回来，差异记为来源不明）
+    #   refused（准入就没过：人暂停了全部 AI、这个 AI 被暂停、或者有一次执行结果还没查清）
+    state: str = "issued"
 
     @property
     def no_delete(self) -> set[str]:
@@ -290,8 +297,10 @@ class Settlement:
     reserved: list[str] = field(default_factory=list)          # R23：这次给这个 Agent 的预留
     suspended: bool = False                                    # 因为违规，这个 Agent 被暂停了
     # 认回同一个对象（运行时核对过的）：旧对象编号 → {"name", "level": exact|suffix|global,
-    #   "kind": gone（删掉又新建）| rebind（之前想删、被保留的，又新建了）| tomb（补回人删掉的，已拦下）}
+    #   "kind": gone（删掉又新建）| rebind（之前想删、被保留的，又新建了）| tomb（补回人删掉的，已拦下），
+    #   "inferred": True（按名字、类型、父对象推断的，不是应用自己保持下来的身份；人可以撤销，design_v0.5.md 14.5）}
     reidentified: dict[str, dict] = field(default_factory=dict)
     identity_errors: list[str] = field(default_factory=list)   # 接入代码交回的配对和规则不一致
+    holds: list[str] = field(default_factory=list)             # 拦下的补回：人删掉、还没交还的对象（应用对象编号）
     loops: dict[str, int] = field(default_factory=dict)        # 反复改改不动的单元 → 最近几次执行里被保持了几次
     loop_alert: list[str] = field(default_factory=list)        # 这次新进入循环、已提醒人的单元
