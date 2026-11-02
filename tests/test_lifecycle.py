@@ -6,8 +6,11 @@
   查不回来（应用重新打开过）的差异记为来源不明，按人的修改保护；查清之前不把差异算成人的，也不开始新的执行。
   同一张许可单只执行一次。
 - 账本落盘：重启后接着用；代理没运行期间的变化记为来源不明；执行到一半代理退出的，重启后查清。
+  人的交还、让 AI 继续，马上落盘（只有交还、场景没变时也一样）。
 - 人删掉的，人交还之前不能补回（数据块：删的时候还有人用才算）；交还来自应用里的按钮，AI 的代码伪造不了。
 - 认回是推断：告诉人，人可以说"不是同一个"，拆回两个对象。
+- 收尾出错（14.8）：执行前先记"开始了"；收尾（认回、恢复、核对）出错时按场景的实际状态记账，
+  该恢复、没恢复成的是违规；连实际状态都交不回来的，是"执行了，结果说不清"，不是"没执行"。
 """
 import pytest
 
@@ -199,6 +202,146 @@ def test_the_same_permit_is_never_executed_twice():
     first = app.run_agent(dict(args))
     second = app.run_agent(dict(args))
     assert _val(app, "Trunk", "scale") == 2.0 and second.get("replayed") and not first.get("replayed")
+    del app._journal["permit-x"]                                       # 结果被挤出日志：也不会再执行一次
+    with pytest.raises(RuntimeError):
+        app.run_agent(dict(args))
+    assert _val(app, "Trunk", "scale") == 2.0
+
+
+# ---------------------------------------------------------------------------
+# 14.8 收尾出错；开始了、没交回结果
+# ---------------------------------------------------------------------------
+def _raise(*_a, **_k):
+    raise RuntimeError("注入：收尾出错")
+
+
+def test_a_wrap_up_error_is_settled_by_the_actual_state_not_called_not_executed():
+    """评审复现的那一次：AI 把高度从 1.4 改成 1.6，收尾（恢复、核对）抛异常。不能说"没执行"，
+    也不能在下一次轮询时把 1.6 算成人的：按场景的实际状态记成 AI 的。"""
+    app, s = _scene()
+    app._finish = _raise
+    rep = s.run_agent("scene.set('Leaf_3', 'location', [0.1, 0.2, 1.6])", "AI 抬高")
+    del app._finish
+    assert rep.status == "ok" and "没有执行" not in rep.text and "收尾" in rep.text and rep.finish_error
+    assert s.is_error(rep) and s.payload(rep)["finish_error"] and "收尾出错" in rep.alert
+    assert _val(app, "Leaf_3", "location")[2] == 1.6
+    assert not s.poll() and _author(s, "Leaf_3", "location") == ("agent", None)
+    assert check_ledger(s.rt, s.scene_records(), s.granularity) == []
+
+
+def test_a_wrap_up_error_before_restoring_the_humans_edit_is_a_breach():
+    """收尾在恢复人改过的面之前出错：人的值没回来。按实际状态记为违规，提醒人，暂停这个 AI（P1、P5）。"""
+    app, s = _scene()
+    sf._move_leaf3(app)
+    s.poll()
+    app._unsnap_value = _raise                                         # 按面恢复的那一步出错
+    rep = s.run_agent("scene.set('Leaf_3', 'location', [0, 0, 1.6]); scene.set('Leaf_3', 'scale', 1.3)", "改到人的")
+    del app._unsnap_value
+    assert rep.outcome == "breach" and rep.suspended and rep.finish_error and "收尾出错" in rep.alert
+    assert _val(app, "Leaf_3", "location")[2] == 1.6                    # 如实：场景里就是 AI 的值
+    assert s.run_agent("scene.set('Leaf_1', 'scale', 1.1)", "暂停中").status == "refused"
+    assert check_ledger(s.rt, s.scene_records(), s.granularity) == []
+
+
+def test_when_even_the_actual_state_cannot_be_reported_it_is_executed_with_unknown_result():
+    """收尾出错，连实际状态也交不回来：日志记 failed。查回来是"执行了，结果说不清"，不是"没执行"；
+    差异按人的修改保护，人改过的部分变了的，当作可能的违规：提醒人，暂停 AI。"""
+    app, s = _scene()
+    sf._move_leaf3(app)
+    s.poll()
+    app._finish, app._actual = _raise, _raise
+    rep = s.run_agent("scene.set('Leaf_3', 'location', [0, 0, 1.6]); scene.set('Trunk', 'scale', 1.3)", "全坏了")
+    del app._finish, app._actual
+    assert app._journal[list(s.rt.permits)[-1]]["status"] == "failed"
+    assert rep.status == "unknown" and "没有执行" not in rep.text and "收尾出错" in rep.text
+    assert _author(s, "Trunk", "scale")[0] == "external:unattributed"        # 说不准是谁的：不算成人的
+    assert rep.suspended and "Leaf_3" in rep.alert and "可能是 AI 改了" in rep.alert
+    refused = s.run_agent("scene.set('Leaf_1', 'scale', 1.1)", "之后")
+    assert refused.status == "refused" and "可能改到了" in refused.text
+    s.resume_agent()
+    assert s.run_agent("scene.set('Leaf_1', 'scale', 1.1)", "人看过之后").status == "ok"
+
+
+@pytest.mark.parametrize("step", ["_remove_recreated", "_identity"])
+def test_a_rebuild_of_what_the_human_deleted_that_survives_a_wrap_up_error_is_a_breach(step):
+    """收尾出错，补回的 Rock_2 没被删掉：墓碑被违反了。运行时按自己的认回规则认出这是补回，记为违规，
+    不当成普通的新建（认回成功、只是没删掉；或者认回那一步就出错了，Rock_2 还是新编号）。"""
+    app, s = _scene()
+    app.delete("Rock_2")
+    s.poll()
+    setattr(app, step, _raise)
+    rep = s.run_agent(REBUILD, "清空重建")
+    delattr(app, step)
+    assert rep.finish_error and rep.outcome == "breach" and rep.suspended
+    assert "Rock_2" in {s._group_name(u.split("#")[0]) for u in rep.breach}
+    assert len(_named(app, "Rock_2")) == 1                              # 如实：场景里确实建回来了
+    assert check_ledger(s.rt, s.scene_records(), s.granularity) == []
+
+
+def _lose_result(app, mutate):
+    """执行照常，然后用 mutate(日志, 许可单编号) 模拟"结果没记下来"，再让传输报错。"""
+    real = app.run_agent
+
+    def run(args):
+        real(args)
+        mutate(app._journal, args.get("permit_id"))
+        raise BridgeError("超时")
+    return run
+
+
+def test_started_without_a_result_is_never_called_not_executed():
+    app, s = _scene()
+    app.run_agent = _lose_result(app, lambda j, pid: j.__setitem__(pid, {"status": "started"}))
+    rep = s.run_agent(SCALE.format(v=1.7), "开始了，没结果")
+    del app.run_agent
+    assert rep.status == "unknown" and "执行开始了" in rep.text and "没有执行" not in rep.text
+    assert _author(s, "Trunk", "scale")[0] == "external:unattributed" and not rep.suspended
+    assert not s.rt.in_doubt
+
+
+def test_a_result_pushed_out_of_the_journal_is_not_called_not_executed():
+    app, s = _scene()
+    app.run_agent = _lose_result(app, lambda j, pid: j.pop(pid))       # 收到过，结果已经不在日志里
+    rep = s.run_agent(SCALE.format(v=1.7), "被挤出日志")
+    del app.run_agent
+    assert rep.status == "unknown" and "不在日志里" in rep.text
+    assert _author(s, "Trunk", "scale")[0] == "external:unattributed"
+
+
+def test_without_start_records_a_missing_entry_proves_nothing():
+    """接入代码执行前不记"开始了"（旧版本）：查不到记录不能说明没执行。"""
+    app, s = _scene(lambda a: Flaky(a))
+    s.capabilities["journal"] = True
+    s.bridge.before = lambda fn: fn == "run_agent"
+    rep = s.run_agent(SCALE.format(v=1.7), "没送到")
+    s.bridge.before = None
+    assert rep.status == "unknown" and "不能说明没执行" in rep.text and not s.rt.in_doubt
+
+
+def test_a_check_that_fails_before_running_is_correctly_not_executed():
+    app, s = _scene()
+    app._begin = _raise                                                # 执行前的核对就出错：AI 的代码没跑
+    rep = s.run_agent(SCALE.format(v=1.7), "核对出错")
+    del app._begin
+    assert rep.status == "not_executed" and _val(app, "Trunk", "scale") == 1.0 and not s.rt.in_doubt
+
+
+@pytest.mark.parametrize("how", ["wrap_up", "state_lost"])
+def test_a_tool_call_whose_finish_fails_in_the_app_does_not_wait_forever(how):
+    """工具调用之后的收尾在应用里做不了（收尾出错、连实际状态也交不回来；或者收尾用的状态没了）：
+    接入代码记 failed，查回来是"执行了，结果说不清"，不会一直等下去，也不会说没执行。"""
+    app, s = _scene(lambda a: Flaky(a))
+    s.capabilities["around"] = True
+    if how == "wrap_up":
+        app._finish, app._actual = _raise, _raise
+        tool = lambda: app.set("Trunk", "scale", 1.8)              # noqa: E731
+    else:
+        tool = lambda: (app.set("Trunk", "scale", 1.8), app._pending.clear())   # noqa: E731
+    rep, _ = s.run_tool(tool, label="工具", targets=[s.find("Trunk")])
+    for k in ("_finish", "_actual"):
+        app.__dict__.pop(k, None)
+    assert rep.status == "unknown" and "收尾出错" in rep.text and not s.rt.in_doubt
+    assert _author(s, "Trunk", "scale")[0] == "external:unattributed"
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +368,40 @@ def test_changes_while_rightofway_was_not_running_are_protected(tmp_path):
     assert "Trunk" in s2.start_alert and _author(s2, "Trunk", "scale")[1] == "external:offline"
     rep = s2.run_agent(SCALE.format(v=1.0), "想改回去")
     assert _val(app, "Trunk", "scale") == 2.5 and "RightOfWay 没运行期间" in rep.text
+
+
+def test_a_release_alone_survives_a_restart(tmp_path):
+    """人只点了"允许重建"、场景没变，代理马上重启：交还还在（之前 poll 只在场景变了时落盘）。"""
+    ledger = str(tmp_path / "ledger.json")
+    app, s = _scene(ledger=ledger)
+    rock = s.find("Rock_2")
+    app.delete("Rock_2")
+    s.poll()
+    assert s.run_agent(REBUILD, "清空重建").recreate_blocked == ["Rock_2"]
+    app.request("release", rock, "Rock_2")
+    assert not s.poll()                                                # 场景没变，只有交还
+    s2 = SharedSession(Runtime(), FakeBridge(app))                     # 代理马上重启
+    s2.start(ledger=ledger)
+    rep = s2.run_agent(REBUILD, "重启之后")
+    assert rep.recreate_blocked == [] and len(_named(app, "Rock_2")) == 1
+
+
+def test_hand_back_and_resume_are_saved_at_once(tmp_path):
+    ledger = str(tmp_path / "ledger.json")
+    app = FakeApp(unique_names=True, restore_deleted=False)            # 恢复不了删除：AI 删掉人改过的就是违规
+    s = SharedSession(Runtime(), FakeBridge(app))
+    s.start(ledger=ledger)
+    s.run_agent(sf.ai_build(), "build")
+    app.set("Rock_1", "scale", 2.0)
+    app.set("Leaf_1", "scale", 3.0)
+    s.poll()
+    assert s.run_agent("scene.delete('Rock_1')", "删掉人改过的").suspended
+    s.resume_agent()                                                   # 人看过了，让它继续
+    s.hand_back(s.find("Leaf_1"))                                      # 人把 Leaf_1 交还
+    s2 = SharedSession(Runtime(), FakeBridge(app))
+    s2.start(ledger=ledger)
+    rep = s2.run_agent("scene.set('Leaf_1', 'scale', 1.0)", "重启之后")
+    assert rep.status == "ok" and rep.conflicts == [] and _val(app, "Leaf_1", "scale") == 1.0
 
 
 def test_an_execution_interrupted_by_a_crash_is_settled_after_restart(tmp_path):
@@ -330,14 +507,62 @@ def test_inference_never_loosens_protection():
 # ---------------------------------------------------------------------------
 def _blender(**kw):
     bpy = pytest.importorskip("bpy")
-    from rightofway.blender.bridge import InProcessBridge
+    from rightofway.blender.bridge import InProcessBridge, blender_source, parse_output
     from experiments import scenario_tree as sc
+
+    class Faulty(InProcessBridge):
+        """可以往发进 Blender 的代码里注入故障：inject 是一段在调用之前执行的代码（例如把某个函数换成抛异常的）。"""
+        inject = ""
+
+        def call(self, fn, args):
+            import json
+            payload = json.dumps(json.dumps(args, ensure_ascii=True))
+            extra = self.inject if fn == "run_agent" else ""
+            return parse_output(self.execute(blender_source() + "\n" + extra
+                                             + f"\n\n_rightofway_out({fn}(json.loads({payload})))\n"))
     InProcessBridge.reset()
-    br = InProcessBridge()
+    br = Faulty()
     s = SharedSession(Runtime(**kw), br)
     s.start()
     s.run_agent(sc.ai_build(), "build")
     return bpy, br, s, sc
+
+
+def _breaks(fn):
+    return f"def {fn}(*a, **k):\n    raise RuntimeError('注入：收尾出错')\n"
+
+
+def test_blender_wrap_up_error_is_settled_by_the_actual_state():
+    bpy, br, s, sc = _blender()
+    br.inject = _breaks("_restore_selection")                         # 恢复之后、交回结果之前出错
+    rep = s.run_agent("import bpy\nbpy.data.objects['Leaf_3'].location.z = 1.6\n", "AI 抬高")
+    br.inject = ""
+    assert rep.status == "ok" and rep.finish_error and "没有执行" not in rep.text
+    assert round(bpy.data.objects["Leaf_3"].location.z, 3) == 1.6
+    assert not s.poll()
+    unit = s.rt.objects[f"{s.find('Leaf_3')}#location"]
+    assert unit.versions[-1].author_id == "agent" and unit.human_touched is None
+
+
+def test_blender_wrap_up_error_before_restoring_is_a_breach_and_leaves_no_copies():
+    bpy, br, s, sc = _blender()
+    br.execute(sc.human_edit("move", "Leaf_3"))
+    s.poll()
+    br.inject = _breaks("apply_faces")                                # 按面恢复那一步出错
+    rep = s.run_agent("import bpy\nleaf = bpy.data.objects['Leaf_3']\nleaf.location.z = 1.6\nleaf.scale.x = 1.3\n",
+                      "改到人的")
+    br.inject = ""
+    assert rep.outcome == "breach" and rep.suspended and rep.finish_error
+    assert round(bpy.data.objects["Leaf_3"].location.z, 3) == 1.6       # 如实：场景里就是 AI 的值
+    assert sorted(o.name for o in bpy.data.objects if o.name.startswith("Leaf_3")) == ["Leaf_3"]
+    assert check_ledger(s.rt, s.scene_records(), s.granularity) == []
+
+
+def test_blender_agent_calling_exit_is_only_an_error_in_its_code():
+    bpy, br, s, sc = _blender()
+    rep = s.run_agent("import bpy, sys\nbpy.data.objects['Trunk'].scale.x = 1.2\nsys.exit(1)\n", "exit")
+    assert rep.status == "ok" and "SystemExit" in (rep.error or "") and not s.rt.in_doubt
+    assert round(bpy.data.objects["Trunk"].scale.x, 3) == 1.2
 
 
 def test_blender_lost_result_is_queried_back():

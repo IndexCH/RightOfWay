@@ -126,6 +126,8 @@ class AgentReport:
     derived: list[dict] = field(default_factory=list)
     # 给人的按钮（design_v0.5.md 14.4、14.5）：{"kind": "release" | "unmatch", "id": 对象编号, "label", "permit"?}
     actions: list[dict] = field(default_factory=list)
+    # 执行之后的收尾（认回、恢复、核对）出错了（14.8）：这时按场景的实际状态记账，这里是出错的那一行
+    finish_error: Optional[str] = None
 
 
 @dataclass
@@ -281,8 +283,8 @@ class SharedSession:
             self.app_boot = res["boot"]
         self.view = recs
         self._set_selected(cid for cid, r in recs.items() if r.get("selected"))
-        self._apply_requests(res)
-        if d or reopened or res.get("releases"):
+        applied = self._apply_requests(res)
+        if d or reopened or applied:                  # 人只点了"交还"、场景没变，也要落盘（重启后交还还在）
             self._save()
         return d
 
@@ -610,6 +612,7 @@ class SharedSession:
         """结果没收到时，查清之后结算要用的东西。可以落盘（只有基本类型），代理重启后也能接着查。"""
         cmds = prep.commands
         return {"permit": permit.permit_id, "agent": agent, "label": label, "protect": protect, "plan": plan,
+                "keep_alive": sorted(permit.keep_alive) if protect else [],
                 "view": dict(self.view), "since": time.time(), "boot": self.app_boot,
                 "prep": {"code": "", "refused": sorted(prep.refused), "refused_deletes": sorted(prep.refused_deletes),
                          "commands": cmds, "executed": [cmds.index(e) for e in prep.executed] if cmds else []}}
@@ -690,8 +693,15 @@ class SharedSession:
                 rep.text += "\n命令：\n" + "\n".join("- " + x for x in cl)
         if res.get("forged_release"):
             rep.text += "\n注意：你的代码改了交还记录（只有人能交还），已经撤销。"
+        if res.get("finish_error"):                   # 收尾出错（14.8）：上面的账是按场景的实际状态记的
+            rep.finish_error = res["finish_error"].strip().splitlines()[-1]
+            rep.text += ("\n注意：执行之后 RightOfWay 的收尾（认回、恢复、核对）出错了（" + rep.finish_error + "）。"
+                         "上面是按场景的实际状态记的账：该恢复、没恢复成的部分记为违规。")
         self._apply_requests(res)
         rep.alert = self._alert(rep, before, raw)
+        if rep.finish_error:
+            rep.alert = "\n".join(x for x in (rep.alert, f"注意：AI 的一次执行之后，RightOfWay 的收尾出错了"
+                                                          f"（{rep.finish_error}）。已按场景的实际状态记账。") if x)
         offers = self._offers(rep, permit) if protect else []
         if offers:
             rep.alert = "\n".join(x for x in [rep.alert] + offers if x)
@@ -742,6 +752,9 @@ class SharedSession:
         return out
 
     def _requery(self, pid: str, d: dict, permit) -> AgentReport:
+        """查清一次结果没收到的执行（design_v0.5.md 14.2、14.8）。只有两种情况能说"没执行"：
+        应用记了 not_executed；或者接入代码在执行前就记"开始了"（journal 2），而这次启动以来根本没收到过这张许可单。
+        开始了、没交回结果（started、failed、补做收尾也做不了）的，是"执行了，结果说不清"，不是"没执行"。"""
         agent = d["agent"]
         head = "你之前有一次执行的结果没收到（" + str(d.get("reason") or "") + "），现在查清了："
         if not self.capabilities.get("journal"):
@@ -750,27 +763,49 @@ class SharedSession:
         q = self.bridge.call("result", self._args(permit_id=pid))
         entry, boot = q.get("entry"), q.get("boot")
         status = (entry or {}).get("status")
+        same_boot = boot is not None and boot == d.get("boot")
         if status == "done":
             rep = self._complete(permit, self._prep_from(d), entry["result"], d["label"], d["protect"], agent, d["plan"])
             rep.text = head + "\n" + rep.text
             return rep
         token = d.get("token") or (entry or {}).get("token")
-        if status == "begun" and token:
-            res = self.bridge.call("finish_agent", self._args(token=token, error="结果没收到之后补做的收尾"))
+        if status == "begun" and token and same_boot:
+            try:
+                res = self.bridge.call("finish_agent", self._args(token=token, error="结果没收到之后补做的收尾"))
+            except Exception:                          # noqa: BLE001
+                # 收尾在应用里出错，接入代码会记 failed；还是 begun 说明请求没到应用（传输的问题）：继续等
+                e2 = self.bridge.call("result", self._args(permit_id=pid)).get("entry") or {}
+                if e2.get("status") == "failed":
+                    recs = self.bridge.call("poll", self._args())["records"]
+                    return self._unattributed(pid, d, permit, recs, "工具调用之后的收尾出错，结果交不回来", boot,
+                                              executed=True)
+                if e2.get("status") != "done":
+                    raise
+                res = e2["result"]
             rep = self._complete(permit, self._prep_from(d), res, d["label"], d["protect"], agent, d["plan"])
             rep.text = head + "\n" + rep.text
             return rep
-        if status == "not_executed" or (entry is None and boot is not None and boot == d.get("boot")):
+        never_arrived = (entry is None and same_boot and not q.get("seen")
+                         and (self.capabilities.get("journal") or 0) >= 2)
+        if status == "not_executed" or never_arrived:
             self.rt.close_permit(permit, [])           # 应用没执行（没收到，或者执行前场景变了）
             self._apply_requests((entry or {}).get("result") or {})
             return AgentReport(status="not_executed", agent=agent, text=head + "那次没有执行，场景没有被它改动。需要的话请重新执行。")
         recs = self.bridge.call("poll", self._args())["records"]
-        why = "应用重新打开过，记的结果没了" if boot is not None and boot != d.get("boot") else "执行状态说不清"
+        if status in ("started", "failed", "begun") or (same_boot and q.get("seen")):
+            why = {"started": "执行开始了，但没有交回结果", "failed": "执行了，但收尾出错，结果交不回来",
+                   "begun": "工具调用开始了，收尾的状态没了"}.get(status, "收到过这张许可单，结果已经不在日志里")
+            return self._unattributed(pid, d, permit, recs, why, boot, executed=True)
+        why = ("应用重新打开过，记的结果没了" if boot is not None and not same_boot
+               else "接入代码执行前不记\"开始了\"，查不到结果不能说明没执行" if entry is None else "执行状态说不清")
         return self._unattributed(pid, d, permit, recs, why, boot)
 
-    def _unattributed(self, pid: str, d: dict, permit, recs: Records, why: str, boot: Optional[str] = None) -> AgentReport:
+    def _unattributed(self, pid: str, d: dict, permit, recs: Records, why: str, boot: Optional[str] = None,
+                      executed: bool = False) -> AgentReport:
         """查不回来：发出前运行时以为的场景（d["view"]）和现在不一样的地方，说不准是这次执行改的还是人改的。
-        如实记为来源不明，按人的修改保护（人交还之后 AI 才能改），提醒人。"""
+        如实记为来源不明，按人的修改保护（人交还之后 AI 才能改），提醒人。
+        executed：确知 AI 的代码执行了（开始了、没交回结果，14.8）。这时许可单里要保持、现在又不一样的部分，
+        可能是 AI 改了、没恢复成：和违规一样，单独告诉人，暂停这个 AI，等人看过再继续。"""
         diff = self._absorb_human(d["view"], recs, source="unattributed")
         self._learn(recs)
         self.view = recs
@@ -779,17 +814,46 @@ class SharedSession:
         names = sorted({display(diff.created.get(c) or diff.deleted.get(c) or (diff.modified.get(c) or (None, {}))[1], c)
                         for c in diff.ids})
         groups = sorted(diff.ids)
-        self.rt.resolve_unattributed(permit, groups)
+        suspect = self._suspect(d, recs) if executed else []
+        self.rt.resolve_unattributed(permit, groups, suspect=suspect)
         what = "、".join(names[:12]) + ("……" if len(names) > 12 else "") if names else "没有变化"
+        if names:
+            text = (f"场景里这些地方和执行前不一样，说不准是你改的还是人改的，已按人的修改保护，你现在不能改：{what}。"
+                    "人交还之后才能再改。")
+        else:
+            text = "场景和执行前一样。" if executed else "场景和执行前一样，那次应该没有执行。"
         rep = AgentReport(status="unknown", agent=d["agent"], text=(
-            f"你之前有一次执行的结果没收到（{d.get('reason') or ''}），查不回来（{why}）。"
-            + (f"场景里这些地方和执行前不一样，说不准是你改的还是人改的，已按人的修改保护，你现在不能改：{what}。"
-               "人交还之后才能再改。" if names else "场景和执行前一样，那次应该没有执行。")))
+            f"你之前有一次执行的结果没收到（{d.get('reason') or ''}），查不回来（{why}）。" + text))
         if names:
             rep.alert = (f"注意：AI 的一次执行结果没收到，也查不回来（{why}）。场景里这些地方和执行前不一样，"
                          f"说不准是 AI 还是你改的，已按你的修改保护：{what}。如果是 AI 改的、你同意它继续改，请交还给它。")
             rep.actions = [{"kind": "release", "id": c, "label": f"交还 {self._group_name(c)}"} for c in groups[:5]]
+        if suspect:
+            sn = "、".join(self._group_name(g) for g in suspect)
+            rep.suspended = d["agent"] in self.rt.suspended
+            rep.text += (f"\n那次执行可能改到了按规则不能动的 {sn}，没能确认恢复。"
+                         + ("你已被暂停，等人检查之后才能继续。" if rep.suspended else ""))
+            rep.alert = "\n".join(x for x in (rep.alert, (
+                f"注意：按规则要保持的 {sn} 现在和那次执行前不一样，可能是 AI 改了、没能恢复（收尾没完成）。请检查。"
+                + ("AI 已暂停，处理好之后让它继续（resume_agent）。" if rep.suspended else ""))) if x)
         return rep
+
+    def _suspect(self, d: dict, recs: Records) -> list[str]:
+        """许可单里要保持的部分（以及不许删的祖先），现在和发出前不一样的对象（14.8）。"""
+        view, out = d["view"], set()
+        for g, faces in (d.get("plan") or {}).items():
+            b, a = view.get(g), recs.get(g)
+            if b is None:
+                continue
+            if a is None:
+                out.add(g)
+            elif "*" in faces:
+                if a.get("fp") != b.get("fp"):
+                    out.add(g)
+            elif any((a.get("aspects") or {}).get(f) != (b.get("aspects") or {}).get(f) for f in faces):
+                out.add(g)
+        out |= {g for g in d.get("keep_alive") or () if g in view and g not in recs}
+        return sorted(out)
 
     def _offers(self, rep: AgentReport, permit) -> list[str]:
         """给人的提醒和按钮（每件事只提醒一次）：拦下了补回人删掉的对象 → "允许重建"（14.4）；
@@ -828,6 +892,10 @@ class SharedSession:
         elif why == "in_doubt":
             text = ("这次没有执行：之前有一次执行的结果还没收到，查清之前不会开始新的执行"
                     "（说不准哪些变化是谁做的）。稍后再试。")
+        elif refused.get("possible"):
+            names = "、".join(self._group_name(g) for g in refused.get("objects", []))
+            text = (f"这次没有执行：你之前有一次执行没交回结果，可能改到了按规则不能动的 {names}，已被暂停。"
+                    "等人检查之后才能继续。")
         else:
             names = "、".join(self._group_name(g) for g in refused.get("objects", []))
             text = f"这次没有执行：你上一次的操作违规（{names}），已被暂停。等人处理之后才能继续。"
@@ -927,22 +995,27 @@ class SharedSession:
     # ------------------------------------------------------------------
     # 人交还（design_v0.5.md 14.4）
     # ------------------------------------------------------------------
-    def _apply_requests(self, res: dict) -> None:
+    def _apply_requests(self, res: dict) -> bool:
         """人在应用里点了提醒里的按钮（接入代码记下，随结果交回）：
           release  交还：例如允许 AI 重建人删掉的对象（14.4），或者改来源不明的部分；
           unmatch  不是同一个：把一次认回拆开（14.5）。
-        只有人能点：AI 的代码在执行期间改了这些记录的，接入代码会撤销并报告（forged_release）。"""
+        只有人能点：AI 的代码在执行期间改了这些记录的，接入代码会撤销并报告（forged_release）。
+        返回有没有照着做（做了的都已落盘：hand_back、unmatch 自己存）。"""
+        applied = False
         for r in res.get("requests") or ():
             cid = r.get("id")
             if not cid:
                 continue
             name = r.get("name") or self._group_name(cid)
             if r.get("kind", "release") == "release":
-                self.hand_back(cid)
                 for a in self.agent_names:
                     self._notes.setdefault(a, []).append(f"人把 {name} 交还给了 AI：现在可以改它了（被人删掉的，也可以重建了）。")
+                self.hand_back(cid)
+                applied = True
             elif r.get("kind") == "unmatch":
                 self.unmatch(cid, r.get("permit"))
+                applied = True
+        return applied
 
     def unmatch(self, old: str, permit_id: Optional[str] = None) -> str:
         """人说"不是同一个"（design_v0.5.md 14.5）：认回是按名字、类型、父对象推断的，可以撤销。
@@ -1097,6 +1170,7 @@ class SharedSession:
             "commands": [{"index": e["index"], "status": e["status"],
                           **{k: e[k] for k in ("reason", "faces", "error") if e.get(k)}} for e in rep.commands],
             "error": rep.error.strip().splitlines()[-1] if rep.error else None,
+            "finish_error": rep.finish_error,
         }
 
     @staticmethod
@@ -1104,7 +1178,8 @@ class SharedSession:
         """这次调用对 AI 来说算不算"出错"（MCP 的 isError：模型可以据此自我纠正）：没执行、违规、
         有没生效的部分、命令失败、脚本出错。"""
         return (rep.status != "ok" or rep.outcome == "breach" or bool(rep.conflicts) or bool(rep.recreate_blocked)
-                or any(e["status"] in ("refused", "partial", "failed") for e in rep.commands) or bool(rep.error))
+                or any(e["status"] in ("refused", "partial", "failed") for e in rep.commands) or bool(rep.error)
+                or bool(rep.finish_error))
 
     def _report_from(self, rep: AgentReport, st, before: Records, raw: Records, after: Records) -> None:
         """报告里的"生效 / 没生效 / 违规"全部取自运行时的核对结果。"""
@@ -1200,8 +1275,9 @@ class SharedSession:
         return f"注意：{who} {what}。这是你改过、按规则不能动的，但没能自动恢复；现在的状态已照实记下。{undo}{tail}"
 
     def resume_agent(self, agent: Optional[str] = None) -> None:
-        """人处理完违规之后，让这个 AI 继续。"""
+        """人处理完违规之后，让这个 AI 继续。人的决定，马上落盘。"""
         self.rt.resume_agent(self.human, agent or self.agent)
+        self._save()
 
     def _submit(self, agent: str, uid: str, permit, step_id: str, content: dict) -> bool:
         """把 AI 对一个单元的修改记进运行时，基准版本是许可单里这个 AI 看到的版本。返回是否生效。"""
@@ -1420,7 +1496,7 @@ class SharedSession:
     # 人的操作
     # ------------------------------------------------------------------
     def hand_back(self, cid: str) -> None:
-        """人把整个对象交还给 AI：同时结束占用。"""
+        """人把整个对象交还给 AI：同时结束占用。人的决定，马上落盘（只有交还、场景没变时也一样）。"""
         for uid in [u for u in self.rt.objects if split_unit(u)[0] == cid]:
             obj = self.rt.objects.get(uid)
             if obj is None:
@@ -1429,6 +1505,7 @@ class SharedSession:
                 self.rt.release(self.human, uid)
             if obj.human_touched is not None:
                 self.rt.hand_back(self.human, uid)
+        self._save()
 
     def scene_records(self) -> Records:
         """现在场景里的记录，和这个会话用同样的观察方式（例如数据块是否单独成单元）。核对、评估时用。"""

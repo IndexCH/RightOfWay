@@ -1026,8 +1026,9 @@ def probe(args):
     names = [a.name, b.name]
     bpy.data.objects.remove(a)
     bpy.data.objects.remove(b)
+    # journal 2：执行前先记"开始了"、记得收到过的每张许可单（design_v0.5.md 14.8），"查不到任何记录"才说明没执行
     out = {"names": names, "identity": True, "transfer_ids": True, "notify": True, "atomic": True, "measured": True,
-           "journal": True, "requests": True, "unmatch": True, "boot": _state().boot,
+           "journal": 2, "requests": True, "unmatch": True, "boot": _state().boot,
            # 文档：哪个文件的哪个场景。账本落盘时按它对上（design_v0.5.md 14.3）；没存过盘的文件只在这次打开期间有效
            "document": (bpy.data.filepath or ("unsaved:" + _state().boot)) + "|" + _scene(args).name}
     out.update(_self_test(base))
@@ -1250,40 +1251,104 @@ def run_agent(args):
     """
     pid = args.get("permit_id")
     state = _state()
-    if pid and pid in state.journal:                 # 同一张许可单只执行一次：再发来就交回记下的结果（14.2）
-        e = state.journal[pid]
-        if e.get("status") == "done":
-            return dict(e["result"], replayed=True)
-        raise RuntimeError(f"许可单 {pid} 已经用过（{e.get('status')}）")
-    st = _begin(args)
+    e = state.journal.get(pid) if pid else None
+    if e is not None and e.get("status") == "done":   # 同一张许可单只执行一次：再发来就交回记下的结果（14.2）
+        return dict(e["result"], replayed=True)
+    _receive(pid)
+    st = _begin_logged(pid, args)
     if "status" in st:
         st["requests"] = _take_requests()
         _journal_put(pid, {"status": "not_executed", "result": st})
         return st                                    # replan / deferred：没有执行
+    # 真正执行之前先记"开始了"（14.8）：从这一刻起，查不到结果就不能说"没执行"
+    _journal_put(pid, {"status": "started", "time": time.time()})
     requests_before = [dict(r) for r in state.requests]
     out = io.StringIO()
     error = None
     try:
         with contextlib.redirect_stdout(out):
             exec(args["code"], {"bpy": bpy, "__name__": "__rightofway_agent__"})
-    except Exception:
+    except (Exception, SystemExit):                  # AI 的代码出错、或者调用了 exit()：只算它的代码出错，不能让 Blender 退出
         error = traceback.format_exc(limit=3)
     # 只有人能交还、说"不是同一个"：AI 的代码改了这些请求的，撤销并报告（14.4）
     forged = _state().requests != requests_before
     if forged:
         _state().requests[:] = requests_before
-    res = _finish(st, error, out.getvalue(), "RightOfWay: AI 脚本")
+    res = _wrap_up(pid, st, error, out.getvalue(), "RightOfWay: AI 脚本")
     res["forged_release"] = forged
     res["requests"] = _take_requests()
     _journal_put(pid, {"status": "done", "result": res})
     return res
 
 
+def _begin_logged(pid, args):
+    """执行前的核对、快照出错：AI 的代码还没执行，日志记 not_executed（查回来就是"没执行"），再把错误抛出去。"""
+    try:
+        return _begin(args)
+    except Exception:
+        _journal_put(pid, {"status": "not_executed", "error": traceback.format_exc(limit=3), "result": {}})
+        raise
+
+
+def _wrap_up(pid, st, error, stdout, undo_message):
+    """收尾：正常是 _finish；_finish 出错时按场景的实际状态交回（_actual），运行时照实记账（design_v0.5.md 14.8）。
+    实际状态也交不回来：日志记 failed（执行了，结果交不回来），再把错误抛出去。"""
+    try:
+        return _finish(st, error, stdout, undo_message)
+    except Exception:
+        finish_error = traceback.format_exc(limit=4)
+    try:
+        return _actual(st, error, stdout, finish_error)
+    except Exception:
+        _journal_put(pid, {"status": "failed", "error": finish_error})
+        raise
+
+
+def _actual(st, error, stdout, finish_error):
+    """收尾出错之后：不再恢复（恢复本身可能就是出错的那一步），只交回执行前和现在的实际状态。
+    要保持、但没恢复成的部分，运行时按实际状态记为违规（P1）。执行前的快照文件不再需要，删掉。"""
+    args, before = st["args"], st["before"]
+    p = st.get("progress") or {}
+    _set_data_units(args)
+    scene = _scene(args)
+    if "objects" in p:                               # 恢复到一半：从快照读进来、还没放进场景的副本清掉（尽力而为）
+        try:
+            in_scene = set(o.as_pointer() for o in scene.objects)
+            for o in [o for o in bpy.data.objects if o.as_pointer() not in p["objects"] and o.as_pointer() not in in_scene]:
+                bpy.data.objects.remove(o, do_unlink=True)
+            for coll, ptrs in p["pointers"].items():
+                pool = getattr(bpy.data, coll)
+                for x in [x for x in pool if x.as_pointer() not in ptrs and x.users == 0]:
+                    pool.remove(x)
+        except Exception:
+            pass
+    ai_created = ensure_ids(scene, prefix="a-")
+    final = records(scene, values={cid: r["aspects"] for cid, r in before.items()})
+    snap_path = st.get("snap_path")
+    if snap_path and not p.get("undo"):
+        try:
+            os.remove(snap_path)
+        except OSError:
+            pass
+    return {
+        "status": "ok", "before": before, "after_raw": p.get("raw") or final, "after": final,
+        "protected": {k: sorted(v) for k, v in st["protected"].items()}, "selected": st["selected"],
+        "restored": list(p.get("restored") or []), "merged": dict(p.get("merged") or {}), "fallback": [],
+        "inexact": [], "renamed": [], "dangling": [], "candidates": [], "outside": {},
+        "identity": p.get("identity") or {}, "recreated": list(p.get("recreated") or []),
+        "ai_created": sorted(set(p.get("ai_created") or []) | set(ai_created)), "error": error,
+        "finish_error": finish_error, "stdout": stdout[-4000:], "undo_pushed": False,
+        "seconds": round(time.perf_counter() - st["t0"], 4), "labels": face_labels(),
+    }
+
+
 def _state():
     """跨调用的状态。每次调用都在新的命名空间里执行，所以放在 sys.modules 里
     （bpy.app.driver_namespace 也能跨调用，但 pip 装的 bpy 退出时会因此卡住）：
       pending   begin_agent 和 finish_agent 之间的状态；
-      journal   按许可单编号记的执行结果（design_v0.5.md 14.2）：结果没收到时查回来，同一张许可单只执行一次；
+      journal   按许可单编号记的执行结果（design_v0.5.md 14.2、14.8）：started（执行前就记）、begun、done、
+                failed（执行了、结果交不回来）、not_executed；结果没收到时查回来，同一张许可单只执行一次；
+      seen      这次启动以来收到过的许可单编号（结果被挤出日志之后，也知道收到过、不能说没执行）；
       boot      这个 Blender 进程的启动编号：变了说明 Blender 重新打开过，记的结果都没了；
       requests  人在 RightOfWay 提醒里点的按钮（交还、不是同一个，14.4、14.5），随下一次结果交回；
       undo      认回的撤销材料（14.5）：许可单编号 → {旧编号: 快照文件、AI 版本的副本……}。"""
@@ -1292,7 +1357,7 @@ def _state():
     mod = sys.modules.get("_rightofway_state")
     if mod is None:
         mod = sys.modules["_rightofway_state"] = types.ModuleType("_rightofway_state")
-    for key, make in (("pending", dict), ("journal", dict), ("requests", list), ("undo", dict)):
+    for key, make in (("pending", dict), ("journal", dict), ("seen", dict), ("requests", list), ("undo", dict)):
         if not hasattr(mod, key):
             setattr(mod, key, make())
     if not hasattr(mod, "boot"):
@@ -1305,12 +1370,26 @@ def _pending():
 
 
 def _journal_put(pid, entry):
+    """记一条。超过上限时先挤掉已经结束的（done、not_executed）；开始了、还没交回结果的留着。"""
     if not pid:
         return
     j = _state().journal
     j[pid] = entry
-    while len(j) > 32:
-        j.pop(next(iter(j)))
+    while len(j) > 64:
+        done = [k for k, v in j.items() if v.get("status") in ("done", "not_executed")]
+        j.pop(done[0] if done else next(iter(j)))
+
+
+def _receive(pid):
+    """收到一张许可单：同一张只执行一次（日志里有，或者收到过、结果已经被挤出日志），记下收到过（14.8）。"""
+    if not pid:
+        return
+    st = _state()
+    if pid in st.journal or pid in st.seen:
+        raise RuntimeError(f"许可单 {pid} 已经用过（{(st.journal.get(pid) or {}).get('status', '结果已不在日志里')}）")
+    st.seen[pid] = True
+    while len(st.seen) > 4096:
+        st.seen.pop(next(iter(st.seen)))
 
 
 def _take_requests():
@@ -1320,8 +1399,10 @@ def _take_requests():
 
 
 def result(args):
-    """查回一次执行的结果（design_v0.5.md 14.2）。Blender 重新打开过（boot 变了）就没有了。"""
-    return {"boot": _state().boot, "entry": _state().journal.get((args or {}).get("permit_id") or "")}
+    """查回一次执行的结果（design_v0.5.md 14.2、14.8）。Blender 重新打开过（boot 变了）就没有了。
+    seen：这次启动以来收到过这张许可单（结果可能已经被挤出日志）。"""
+    pid = (args or {}).get("permit_id") or ""
+    return {"boot": _state().boot, "entry": _state().journal.get(pid), "seen": pid in _state().seen}
 
 
 def _ensure_operator():
@@ -1353,25 +1434,31 @@ def begin_agent(args):
     和 run_agent 一样核对、快照，但不执行代码；返回 {"status": "begun", "token"}，之后调用 finish_agent。
     两次调用之间应用里发生的一切都算这个 Agent 做的（不是原子的；代理在两次调用之间只做那一次工具调用）。"""
     pid = args.get("permit_id")
-    st = _begin(args)
+    _receive(pid)
+    st = _begin_logged(pid, args)
     if "status" in st:
         st["requests"] = _take_requests()
         _journal_put(pid, {"status": "not_executed", "result": st})
         return st
     token = uuid.uuid4().hex
     _pending()[token] = st
-    _journal_put(pid, {"status": "begun", "token": token})
+    _journal_put(pid, {"status": "begun", "token": token})     # 返回之后的变化都算这个 Agent 的（和 started 一样）
     return {"status": "begun", "token": token}
 
 
 def finish_agent(args):
     """后一半：和 run_agent 执行完代码之后一样，认回、恢复、核对，返回同样的结果。"""
     st = _pending().pop(args["token"], None)
-    if st is None:
+    if st is None:                                   # 开始了，收尾用的状态却没了：执行了，结果交不回来（14.8）
+        j = _state().journal
+        pid = next((k for k, v in j.items() if v.get("token") == args["token"]), None)
+        if pid and j[pid].get("status") == "begun":
+            _journal_put(pid, {"status": "failed", "error": "找不到 begin_agent 的状态"})
         raise RuntimeError("找不到 begin_agent 的状态（Blender 重启过，或者已经 finish 过）")
-    res = _finish(st, args.get("error"), "", "RightOfWay: AI 工具")
+    pid = st["args"].get("permit_id")
+    res = _wrap_up(pid, st, args.get("error"), "", "RightOfWay: AI 工具")
     res["requests"] = _take_requests()
-    _journal_put(st["args"].get("permit_id"), {"status": "done", "result": res})
+    _journal_put(pid, {"status": "done", "result": res})
     return res
 
 
@@ -1425,10 +1512,12 @@ def _finish(st, error, stdout, undo_message):
     _set_data_units(args)
     scene = _scene(args)
     vl = _view_layer(scene)
-    ai_created = ensure_ids(scene, prefix="a-")
+    p = st["progress"] = {}                          # 做到哪一步了：收尾出错时 _actual 用（14.8）
+    ai_created = p["ai_created"] = ensure_ids(scene, prefix="a-")
     identity, tombs = ({}, [])
     if args.get("reidentify") and do_protect:
         identity, tombs = _identity(scene, before, ai_created, args)
+        p["identity"] = identity
     taken = {new for new, _ in identity.get("pairs", {}).values()}
     ai_created = [c for c in ai_created if c not in taken]
     # 认回的撤销材料（design_v0.5.md 14.5）：推断带上了要保持的部分的对象，把 AI 新建的那个（恢复之前的样子）
@@ -1448,8 +1537,9 @@ def _finish(st, error, stdout, undo_message):
             bpy.data.libraries.write(ai_path, set(keep_objs), fake_user=False)
             for m in undo.values():
                 m["ai_path"] = ai_path
+            p["undo"] = True                         # 快照文件拆开时还要用，出错了也不删
     before_faces = {cid: r["aspects"] for cid, r in before.items()}
-    after = records(scene, values=before_faces)
+    after = p["raw"] = records(scene, values=before_faces)
 
     # 哪些要整个换回，哪些只把冲突的面换回（数据块和对象分开处理，数据块先恢复）
     full, partial, data_full, data_partial = [], {}, [], {}
@@ -1473,6 +1563,9 @@ def _finish(st, error, stdout, undo_message):
             full.append(cid)
 
     restored, merged, candidates, fallback, report = [], {}, [], [], {}
+    p["restored"], p["merged"] = restored, merged
+    # 恢复开始前已有的对象、数据块：恢复到一半出错时，_actual 据此清掉从快照里读进来、还没放进场景的副本
+    p["objects"], p["pointers"] = set(o.as_pointer() for o in bpy.data.objects), _pointers()
     keep = args.get("keep_candidates", False)
     if snap_path and (data_full or data_partial):
         _restore_data(scene, snap_path, before, after, data_full, data_partial, restored, merged, fallback, report)
@@ -1517,7 +1610,7 @@ def _finish(st, error, stdout, undo_message):
             os.remove(snap_path)
         except OSError:
             pass
-    recreated = _remove_recreated(scene, tombs, set(ai_created)) if tombs else []
+    recreated = p["recreated"] = _remove_recreated(scene, tombs, set(ai_created)) if tombs else []
 
     if do_protect and args.get("restore_selection", True):
         _restore_selection(scene, vl, sel_state)     # 选中状态是人的界面状态，AI 的脚本改了就还原

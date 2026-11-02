@@ -3,7 +3,7 @@
 在项目根目录运行：
     python -m experiments.run_all                  全部实验，模拟人的操作（不用动手）
     python -m experiments.run_all --human real     全部实验，真人操作（每一项开始前会提示，输入 s 跳过）
-    python -m experiments.run_all --only A,D       只跑某几组：T（测试）、A、B、C、D、E、F、H、P、S
+    python -m experiments.run_all --only A,D       只跑某几组：T（测试）、A、B、C、D、E、F、H、K、P、S
     python -m experiments.run_all --quick          每组只跑主要的那一种
 
 各组要准备的（没准备好的会自动跳过，并说明原因）：
@@ -18,6 +18,7 @@
                                    这是测量（重叠多频繁、重建会不会出现两份），不判通过与否，结果另外列一张表
     P  经过 MCP 代理              pip install -e ".[proxy]"；上游是假的应用 MCP 服务器，不用别的软件
     S  影子执行（试验）            同 B（两个 Blender，或者 --b-backend local 用 bpy）；测量，只看能不能跑完
+    K  人和 Claude Code 同时改代码  什么都不用准备（Agent 是脚本，工具行为照 Claude Code，hooks 在本进程里调用）
 
 每一项有保护的实验都会在每次操作后检查三条不变量（场景、账本、告诉 AI 的话是否一致），记在"不变量违反"一列。
 
@@ -107,6 +108,7 @@ def plan(args) -> list[Item]:
         Item("H", "实验 H 人改一处、撞上 AI 这一步的概率：Blender", exp("exp_h_habits", "--backend", args.a_backend, "--sweep"),
              main=False, real_capable=False, needs="A", results=None),
         Item("P", "实验 P 经过 MCP 代理：假的应用 MCP 服务器", exp("exp_p_proxy"), real_capable=False),
+        Item("K", "实验 K 代码：人和 Claude Code 同时改（模拟）", exp("exp_k_code"), real_capable=False, needs="-"),
         Item("S", "实验 S 影子执行（试验）：直接执行 vs 影子执行", exp("exp_s_shadow", "--backend",
              "local" if args.b_backend == "local" else "socket"), main=False, real_capable=False, needs="B", results=None),
     ]
@@ -188,6 +190,8 @@ def verdict(row: dict) -> str:
     over, lost = _int(row.get("人的修改被覆盖")), _int(row.get("AI的修改丢失"))
     err, resur = _int(row.get("恢复或合并出错")), _int(row.get("被删对象被AI重建"))
     inv, breach = _int(row.get("不变量违反")), _int(row.get("违规"))
+    if "测量" in row.get("做法", ""):
+        return "测量（不判）" + (f"：{row.get('备注')}" if row.get("备注") else "")
     if row.get("做法", "").startswith("对照"):
         return "如预期：出了问题" if over + lost > 0 else "意外：对照组没出问题"
     ok = over == 0 and lost == 0 and err == 0 and inv == 0 and breach == 0
@@ -227,7 +231,7 @@ def main(argv=None) -> int:
     use_utf8_console()
     ap = argparse.ArgumentParser(description="重跑全部测试和实验")
     ap.add_argument("--human", choices=["sim", "real"], default="sim")
-    ap.add_argument("--only", default="", help="只跑某几组，逗号分隔：T,A,B,C,D,E,F,H")
+    ap.add_argument("--only", default="", help="只跑某几组，逗号分隔：T,A,B,C,D,E,F,H,K,P,S")
     ap.add_argument("--quick", action="store_true", help="每组只跑主要的一种")
     ap.add_argument("--a-backend", choices=["socket", "inprocess"], default="socket",
                     help="实验 A、D：socket 连接打开着的 Blender（默认）；inprocess 用 pip 装的 bpy")

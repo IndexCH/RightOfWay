@@ -2,11 +2,11 @@
 
 **Human edits always win — enforced by a runtime, not by prompting.**
 
-RightOfWay is a protocol and reference runtime for humans and AI agents editing the same things at the same time: a Blender scene, a Unity scene, a document. The runtime sits between the agent and the application. When the agent's work collides with what a person just did, the person's edit is kept, the agent's conflicting change is rolled back, and the agent is told exactly what happened.
+RightOfWay is a protocol and reference runtime for humans and AI agents editing the same things at the same time: a Blender scene, a Unity scene, the code in a repository. The runtime sits between the agent and the application. When the agent's work collides with what a person just did, the person's edit is kept, the agent's conflicting change is rolled back, and the agent is told exactly what happened.
 
 It needs no changes to the application. It works through what the application already offers: existing MCP servers (Blender MCP, Unity MCP) or plain files.
 
-> **Status: research preview.** The rules, the runtime, and the Blender integration work and are tested. The MCP proxy that puts RightOfWay in front of Claude Desktop or any MCP client works too, and has been run against the real BlenderMCP server. The v0.4 Unity integration ran in Unity; the v0.5 changes to it haven't been verified in Unity yet. The agents in the experiments are still scripted, not real LLMs. The spec is currently written in Chinese; an English version is planned.
+> **Status: research preview.** The rules, the runtime, and the Blender integration work and are tested. The MCP proxy that puts RightOfWay in front of Claude Desktop or any MCP client works too, and has been run against the real BlenderMCP server. The v0.4 Unity integration ran in Unity; the v0.5 changes to it haven't been verified in Unity yet. The code integration (you and Claude Code editing the same files, enforced by Claude Code's hooks) works against a simulated Claude Code; it hasn't been run with the real one yet. The agents in the experiments are still scripted, not real LLMs. The spec is currently written in Chinese; an English version is planned.
 >
 > 中文说明见 [README.zh-CN.md](README.zh-CN.md)。
 
@@ -24,7 +24,7 @@ Current tools handle this by asking the model nicely (put the user's edits in th
 - **Stale writes don't land.** An agent's change based on an outdated view is voided instead of overwriting newer work.
 - **Deleted and recreated is still the same object.** Agents often clear the scene and rebuild it. The runtime re-identifies each new object with the old one by name, type and parent (the app's duplicate-name suffix is learned by a self-test at connection time; ambiguous cases are not matched), so your edits survive and nothing is duplicated. This is an inference, not a proof: when it carries your edits over to a new object you're alerted once, and if it's wrong, clicking "Not the same object" splits them back into two objects.
 - **What you deleted can't come back until you hand it back.** If the agent recreates an object you deleted (whether or not it saw the deletion), the runtime removes the recreation and tells the agent. The alert has an "Allow rebuild" button; only after you click it can the agent rebuild the object, and the agent's code can't forge that click. The parents of objects you edited can't be deleted either.
-- **Lost results and restarts don't corrupt the record.** If an execution's result doesn't come back, the runtime asks the app for it before recording anything; changes it still can't attribute are protected as yours, and you're alerted. The ledger is saved to disk, so a restarted proxy carries on where it left off.
+- **Lost results, wrap-up errors and restarts don't corrupt the record.** If an execution's result doesn't come back, the runtime asks the app for it before recording anything; if the wrap-up after an execution fails, it records the scene's actual state; changes it still can't attribute are protected as yours, and you're alerted. The ledger is saved to disk, so a restarted proxy carries on where it left off.
 - **The agent is told what it missed, with values.** Every time it reads or acts, it gets something like:
   ```
   Since you last looked at the scene:
@@ -36,6 +36,7 @@ Current tools handle this by asking the model nicely (put the user's edits in th
 - **What didn't land becomes the new target.** The feedback states the current values as facts to adopt into the agent's plan, and asks it to recheck anything it derived from the old values. If the agent keeps trying to change something it can't, you get an alert.
 - **Several agents at once.** The human outranks every agent. Between agents, the first to commit wins; the later one's conflicting part is voided, it is told the current values, and it gets a short reservation to retry so two agents don't keep undoing each other.
 - **In front of your AI client.** The MCP proxy: Claude Desktop (or any MCP client) connects to RightOfWay, and RightOfWay connects to the app's existing MCP server (e.g. BlenderMCP). Code-execution tools, the app's own typed tools and the proxy's small tools all go through the same rules; results that were partly refused come back with `isError` and a structured explanation.
+- **Code, with Claude Code.** You edit in your editor while Claude Code edits the same files. Lines you changed and saved, and haven't committed or handed back, can't be changed by the agent: an Edit or Write that would touch them is refused whole, with the lines and their current content; if a command (`git checkout`, a formatter) changed them, that file is put back and the agent's version saved. Enforced by Claude Code's hooks; nothing changes in Claude Code or your editor. See [Code](#code-you-and-claude-code-in-the-same-files).
 - **Computer-use agents too.** An agent that clicks around needs its own screen, so it works on its own copy in its own app window. The runtime keeps the two copies in sync live through the apps' existing MCP servers: no saving, no reopening files. Apps with no interface at all fall back to merging saved files.
 
 ## Principles
@@ -104,7 +105,8 @@ sequenceDiagram
 - **Execution (steps 9–10)** runs in one go on the app's main thread, so you can't interleave with it and every change in between is the agent's.
 - **Settlement (steps 11–12)** looks only at the actual state, never at what the permit hoped for. A face that had to be kept and is unchanged is kept; one that changed is a breach, recorded as it happened, and you are alerted and the agent is paused. Every other face is committed from the final state. The ledger's unit is a face: each property of each object, plus each property of the materials, meshes and other data blocks it uses. The integration pairs re-identified objects; the runtime recomputes the pairing with the same rule from `identity.py` and checks it.
 - **Feedback (steps 13–15)** is generated only from the settlement: text for the model in `content`, the structured result in `_meta.rightofway`, and `isError=true` whenever part of the call didn't land. Alerts for you carry buttons: "Allow rebuild" (hand back an object you deleted) and "Not the same object" (split one re-identification).
-- **Lost results (the connection drops after step 9).** The integration records each result under its permit id, and a permit runs at most once. If the result is recovered, it is settled as usual and the agent's changes count as the agent's; if the app never ran it, the permit is closed; if it can't be recovered (the app was reopened), whatever differs can't be attributed, so it is protected as your edit and you're alerted. Until that is cleared up, no new execution starts and nothing seen in the meantime is counted as your edit.
+- **Lost results (the connection drops after step 9).** The integration records "started" before it runs the agent's code, records each result under its permit id, and runs a permit at most once. If the result is recovered, it is settled as usual and the agent's changes count as the agent's; only if the app never received the permit is it closed; a run that started but left no result is treated like one that can't be recovered (the app was reopened): whatever differs can't be attributed, so it is protected as your edit and you're alerted. Until that is cleared up, no new execution starts and nothing seen in the meantime is counted as your edit.
+- **Wrap-up errors (step 10).** If the wrap-up after an execution (re-identification, restoring, checking) fails, the integration stops restoring and reports the scene's actual state; the runtime records it as it is: anything that had to be kept but wasn't restored is a breach (you're alerted, the agent is paused), the rest counts as the agent's.
 - **The ledger is saved to disk.** By default the proxy keeps it under `~/.rightofway/ledgers/`, one per file and scene. After a restart it first clears up executions whose results never arrived, then compares against the scene; changes made while the proxy wasn't running are also protected as your edits.
 
 Besides code execution, the proxy handles two other kinds of call:
@@ -122,6 +124,19 @@ What an integration can do (restore a face, restore a deletion, wrap a tool call
 | Uses the pipeline above | yes | not yet: per-unit submit, per object | not yet: per-unit submit, per object |
 
 Design details are in [spec/design_v0.5.md](spec/design_v0.5.md), and a plain-language walkthrough of the protocol in [docs/overview.md](docs/overview.md) (both in Chinese).
+
+## Code: you and Claude Code in the same files
+
+The same rules, with lines as the unit. Nothing is language-specific: a file is a sequence of lines, compared without line endings; binary and very large files count as one line.
+
+- **Who changed which lines.** Each line in the ledger carries the change that last wrote it, and follows its line through later edits; deleted lines leave a marker between the lines around them. Whenever a hook runs, anything that changed on disk outside the agent's own tool calls is yours. Only saved content counts: with auto save on (VS Code: `"files.autoSave": "afterDelay"`), all your edits are seen.
+- **What the agent can't change.** Lines you changed and haven't handed back or committed, including the places where you deleted lines; lines another agent (or a `git` checkout or pull you ran) changed after this agent last read the file, until it reads it again; and RightOfWay's own hook configuration. Inserting next to your lines, or editing other lines of the same file, is fine.
+- **Edit and Write are checked before they run.** The hook computes the file after the edit; if it would touch protected lines, the whole call is refused, so no edit lands half-applied, and the agent is told which lines, who changed them, their current content, and how to ask you to hand them back.
+- **Commands are checked after.** What a Bash command will change isn't known in advance. If it changed protected lines in a file, that file is put back as it was before the command and the agent's version is saved; other files keep the command's changes, so a command can end up half-applied (for example a rename across files), and the agent is told so. A command that ran longer than 3 seconds may overlap with your own saves, so changes that aren't from git are recorded as unattributed and protected like yours instead of being undone.
+- **Handing back.** Type `交还 src/app.py:10-20` (or `rightofway release src/app.py:10-20`, or `交还 全部` for everything) in the chat; a message that is only the command doesn't reach the agent. Committing also hands back what you committed; a commit made by the agent's own command doesn't.
+- **Fails closed.** If the hook itself fails, edits and commands are refused rather than let through unchecked.
+
+Design details: [spec/design_code.md](spec/design_code.md) (Chinese).
 
 ## Results so far
 
@@ -142,6 +157,16 @@ Same task in experiments A–D: the agent builds a small scene (tree, leaves, ro
 | P: through the MCP proxy | with RightOfWay, simulated app MCP server | 0 | 0 | 0 (recreation blocked) |
 
 **Invariants:** every protected run of A, B, D, E and P passes all three. In E with the simulated Unity integration the leaf is lost, because that integration can't undo a deletion; the runtime records it as a breach, tells the agent and you, and pauses the agent. The file fallback is not covered by the invariant checks yet.
+
+**Code (experiment K).** The agent has read the code; you then change three things in `shop.py` (a price factor, deleting a function, adding one), and the agent takes its next step from what it read. Agents are scripts whose tools behave like Claude Code's; when refused, they reread and change only the rest.
+
+| Agent habit | Your edits overwritten, with RightOfWay | Without protection |
+|---|---|---|
+| Precise edits (one of them back to its planned value on your line) | 0 | 1 |
+| Rewrite the whole file | 0 | 3 (the deleted function is back too) |
+| Discard changes (`git checkout -- shop.py`) | 0 | 3 |
+| Two agents (A edits, B rewrites the file from what it read) | 0, A's edit kept too | 3, and A's edit lost |
+| Rename across files with a command (measurement) | 0; `shop.py` put back, `report.py` renamed: half-applied, and the agent is told | 0 |
 
 The v0.4 Unity integration was checked in a real Unity 6.4 editor through Unity's own MCP: the human's leaf height survived, the agent's autumn colour applied, a selected object was left alone, and nothing outside the experiment scene changed (57 tracked objects, about 0.07 s per agent step). The Unity integration code changed in v0.5 (executing the runtime's permit, the connection self-test) hasn't been run in Unity yet; only its C# syntax is checked.
 
@@ -165,12 +190,16 @@ When you delete an object and the agent's step would put it back (3 of 11 deleti
 - **Derived changes and intent conflicts are reported, not fixed.** If a leaf is restored to the height you set, a bird the agent placed above it may float in mid-air: the agent is told to treat the leaf's current height as the target and recheck, but the runtime doesn't move the bird.
 - **It guards against agents' habits and mistakes, not deliberate circumvention.** The agent's code runs in the same Blender process as the integration code, so in principle it can change anything (for example, register a timer that acts after the check). Guarding against deliberate circumvention needs the agent's code to run in another process (shadow execution).
 - **The ledger is rewritten whole.** After long use the file grows and each save gets slower; it will become an append-only log.
+- **Code: only saved edits count, and commands aren't atomic.** Unsaved edits in your editor aren't seen (your editor won't silently lose them either: it warns when you save over a changed file). Your saves during a quick command (up to 3 seconds) count as the command's. A command can end up half-applied across files. Partial reads count as reading the whole file.
+- **Multi-object operations aren't undone as a whole.** If the agent merges A into B and then deletes A, and A is yours, A is put back but B keeps the merged result (A's content appears twice). Each property is right on its own, but the operation as a whole isn't; the agent is told. How to group changes that must land or be undone together is still being decided.
+
+Fixed on 2026-10-15: a wrap-up error after an execution was reported as "not executed", and the agent's change was later counted as yours; clicking "Allow rebuild" without any scene change wasn't saved, so a restarted proxy blocked the rebuild again.
 
 Fixed on 2026-10-12: with all agents paused by you, the new pipeline still ran the agent's code and then failed while recording it, so the change was later counted as yours; when an execution's result was lost, the agent's changes were counted as yours; after a proxy restart your earlier edits were no longer protected; once the agent had seen your deletion, its second rebuild went through.
 
 Fixed on 2026-10-09: clear-and-rebuild breaking object identity (re-identification, on by default); agents rebuilding objects you deleted (blocked); deleting the parent of an object you edited (ancestors can't be deleted); a shared material split into a private copy per object (shared data blocks are units of their own). Fixed in v0.5 step 3: deleting an object you touched is judged for the whole object, so the agent is no longer told the deletion partly took effect.
 
-**Not verified yet:** the v0.5 Unity integration code (experiments C and E need rerunning in Unity), real disconnects and app crashes (tested with simulated transport failures and reopening), the alert buttons in the Blender GUI (headless tests simulate the click), real LLM agents, a real computer-use agent, live sync between two Blender GUIs, edit mode and Ctrl+Z in the Blender GUI, and large scenes.
+**Not verified yet:** the code integration with the real Claude Code (tested with a simulated one; some hook input fields aren't fully documented) and on Windows, the v0.5 Unity integration code (experiments C and E need rerunning in Unity), real disconnects and app crashes (tested with simulated transport failures and reopening), the alert buttons in the Blender GUI (headless tests simulate the click), real LLM agents, a real computer-use agent, live sync between two Blender GUIs, edit mode and Ctrl+Z in the Blender GUI, and large scenes.
 
 ## Quick start
 
@@ -181,7 +210,7 @@ git clone https://github.com/IndexCH/RightOfWay.git
 cd RightOfWay
 python -m venv .venv
 .venv/bin/pip install -e ".[dev,proxy]"    # Windows: .venv\Scripts\pip install -e ".[dev,proxy]"
-.venv/bin/python -m pytest                  # 232 tests; the bpy and mcp ones skip when those aren't installed
+.venv/bin/python -m pytest                  # 284 tests; the bpy and mcp ones skip when those aren't installed
 python examples/demo_game_assets.py         # narrated walkthrough of the runtime, no Blender needed
 ```
 
@@ -203,6 +232,16 @@ After installing `.[proxy]`, replace the blender server in Claude Desktop's `cla
 
 Everything after `--` is the command that used to start the Blender MCP server, unchanged; Blender itself still just needs the BlenderMCP add-on with its server started. The proxy logs to stderr, and alerts such as breaches also pop up inside Blender, with the "Allow rebuild" and "Not the same object" buttons in them. The ledger is saved under `~/.rightofway/ledgers/` by default; `--ledger off` turns that off and `--ledger PATH` saves it to a given file. Add `--bridge socket` to talk to the add-on directly instead of through the upstream code tool. To see it work without Claude: `python -m experiments.exp_p_proxy` (simulated upstream) or `--upstream "uvx blender-mcp"` (a running Blender).
 
+### Using it with Claude Code (code)
+
+In the project you work on, with RightOfWay installed in a Python environment:
+
+```bash
+/path/to/RightOfWay/.venv/bin/python -m rightofway.code install   # writes the hooks into .claude/settings.local.json
+```
+
+Then start a new Claude Code session there (`/hooks` lists them). Turn on auto save in your editor. In the chat, `交还 src/app.py:10-20` hands lines back; `python -m rightofway.code status` lists what's protected, `release` hands back from the terminal, `uninstall` removes the hooks. The ledger lives under `~/.rightofway/code/`, outside your project. To see it work without Claude Code: `python -m experiments.exp_k_code`.
+
 Each experiment needs its application ready (Blender with the [Blender MCP add-on](https://github.com/ahujasid/blender-mcp) server started; a second Blender on port 9877 for live sync; Unity 6 with the AI Assistant package for Unity). Groups that aren't ready are skipped with the reason. Step-by-step instructions (in Chinese) are in [docs/experiments.md](docs/experiments.md).
 
 ## Repository layout
@@ -214,6 +253,10 @@ rightofway/              runtime (Python package)
 ├── invariants.py        checks that the scene, the runtime's record and the agent's feedback agree
 ├── fakeapp.py           an in-memory app speaking the same protocol (code or typed commands), for tests without Blender or Unity
 ├── proxy/               MCP proxy: python -m rightofway.proxy -- <command that starts the app's MCP server>
+├── code/                code integration: python -m rightofway.code install (Claude Code hooks)
+│   ├── ledger.py        who changed which lines, and the rules (the only place that decides)
+│   ├── hooks.py         Claude Code's hook events: check before edits, settle after edits and commands, tell the agent
+│   └── fakeagent.py     a scripted agent whose tools behave like Claude Code's (tests, experiment K)
 ├── blender/             Blender integration: no changes to Blender or its MCP add-on
 │   ├── blender_side.py  integration code sent into Blender with each call: carries out the permit, re-identifies, restores, reports the actual state; also sync and merge
 │   ├── shared_session.py  session layer (mode 1): runs each call through the pipeline; per-agent views, "what you missed" (R22), multiple agents (R23)
@@ -223,10 +266,12 @@ rightofway/              runtime (Python package)
 │   └── local_server.py  a bpy process that speaks the Blender MCP add-on protocol (for headless tests)
 └── unity/               Unity integration through Unity's own MCP (Unity_RunCommand)
 experiments/             experiments A, B, C (Unity), D (two agents), E (agent deletes an object you edited),
-                         H (realistic agent habits), P (through the MCP proxy), S (shadow execution trial) and run_all.py
-tests/                   232 tests, including the invariant checks
+                         H (realistic agent habits), K (code with Claude Code), P (through the MCP proxy),
+                         S (shadow execution trial) and run_all.py
+tests/                   284 tests, including the invariant checks
 spec/spec_v0.4.md        protocol spec (Chinese, draft); section 0 lists the design principles
 spec/design_v0.5.md      v0.5 architecture redesign (Chinese; steps 1–3 implemented; section 13: hardening from the survey; section 14: execution lifecycle, identity and intent)
+spec/design_code.md      code integration design (Chinese): lines as the unit, Claude Code hooks
 spec/related_work.md     how this relates to existing papers, protocols and tools
 spec/prior_art_solutions.md  how other systems handle the same four problems (Chinese, 2026-10-08)
 docs/overview.md         plain-language walkthrough of the protocol (Chinese)
@@ -246,12 +291,13 @@ Details and sources are in [spec/related_work.md](spec/related_work.md).
 
 ## Roadmap
 
-0. **v0.5 architecture** ([design](spec/design_v0.5.md)): every operation goes through one pipeline (permit → execute → verify → commit → report), with invariant checks that the scene, the record and the feedback agree. Steps 1–3 are done, and so is the hardening suggested by the survey of similar systems (re-identification, blocking recreations, protected ancestors, shared data blocks, feedback with the new targets, loop detection, capability probing; section 13). The execution lifecycle is now unified (one gate, unknown results, a ledger saved to disk), re-identification is an inference you can undo, and what you deleted can't be rebuilt until you hand it back (section 14). Next is the Unity side: rerun experiments C and E in Unity to verify the v0.5 changes, then hidden-backup restore and re-identification.
+0. **v0.5 architecture** ([design](spec/design_v0.5.md)): every operation goes through one pipeline (permit → execute → verify → commit → report), with invariant checks that the scene, the record and the feedback agree. Steps 1–3 are done, and so is the hardening suggested by the survey of similar systems (re-identification, blocking recreations, protected ancestors, shared data blocks, feedback with the new targets, loop detection, capability probing; section 13). The execution lifecycle is now unified (one gate, unknown results, wrap-up errors recorded by the actual state, a ledger saved to disk), re-identification is an inference you can undo, and what you deleted can't be rebuilt until you hand it back (section 14). Next is the Unity side: rerun experiments C and E in Unity to verify the v0.5 changes, then hidden-backup restore and re-identification.
 1. **MCP proxy**: done (`python -m rightofway.proxy`). Next: real LLM agents through Claude Desktop, compared against prompt-only protection.
-2. Shadow execution (trialled: same outcomes, 4–5× slower per step) is kept for apps that can't undo changes.
-3. A real computer-use agent on its own desktop, connected to live sync.
-4. A user study: do people intervene more, and does per-property protection match what they meant?
-5. English spec; more applications through their existing MCP servers.
+2. **Code**: done for Claude Code through its hooks, tested with a simulated Claude Code (experiment K). Next: run it with the real Claude Code, then a VS Code extension for unsaved edits and MCP file tools for other clients.
+3. Shadow execution (trialled: same outcomes, 4–5× slower per step) is kept for apps that can't undo changes.
+4. A real computer-use agent on its own desktop, connected to live sync.
+5. A user study: do people intervene more, and does per-property protection match what they meant?
+6. English spec; more applications through their existing MCP servers.
 
 ## Contributing
 

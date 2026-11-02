@@ -696,16 +696,23 @@ class Runtime:
             self._emit("permit/in_doubt", permitId=permit.permit_id, agent=permit.agent, reason=reason)
             self._emit("alert/human", kind="in_doubt", agent=permit.agent, permitId=permit.permit_id, reason=reason)
 
-    def resolve_unattributed(self, permit: Permit, objects: Iterable[str]) -> None:
-        """结果查不回来（应用重启过、接入代码不记结果）：差异已经由接入层记为来源不明（record_external），这里结束许可单。"""
+    def resolve_unattributed(self, permit: Permit, objects: Iterable[str], suspect: Iterable[str] = ()) -> None:
+        """结果查不回来（应用重启过、接入代码不记结果）：差异已经由接入层记为来源不明（record_external），这里结束许可单。
+        suspect：确知执行了（开始了、没交回结果，design_v0.5.md 14.8），许可单里要保持、现在又不一样的对象。
+        可能是 Agent 改了、没恢复成：和违规一样提醒人、暂停这个 Agent（pause_on_breach 时），人看过再让它继续。"""
         if permit.state not in self.OPEN_STATES:
             raise ProtocolError(f"{permit.permit_id} 已经结束（{permit.state}）")
         self.in_doubt.pop(permit.permit_id, None)
         permit.state = "unattributed"
-        objs = sorted(set(objects))
-        self._emit("permit/unattributed", permitId=permit.permit_id, agent=permit.agent, objects=objs)
+        objs, sus = sorted(set(objects)), sorted(set(suspect))
+        self._emit("permit/unattributed", permitId=permit.permit_id, agent=permit.agent, objects=objs, suspect=sus)
         if objs:
             self._emit("alert/human", kind="unattributed", agent=permit.agent, permitId=permit.permit_id, objects=objs)
+        if sus:
+            self._emit("alert/human", kind="possible_breach", agent=permit.agent, permitId=permit.permit_id, objects=sus)
+            if self.pause_on_breach:
+                self.suspended[permit.agent] = {"permitId": permit.permit_id, "objects": sus, "possible": True}
+                self._emit("agent/suspended", agent=permit.agent, permitId=permit.permit_id, objects=sus)
 
     def close_permit(self, permit: Permit, refused: Iterable[str], state: str = "closed") -> list[str]:
         """一次执行结束：settled（settle 调用）或 closed（没有执行）。每张许可单正好结束一次。
@@ -742,7 +749,8 @@ class Runtime:
           算作 Agent 想改、按许可单保持，同样要核对场景里确实没变。
         identity：接入代码认回同一个对象的结果（{"pairs", "kinds", "fresh"}），由运行时按同一条规则重算核对。
           配上的旧编号在 raw / final 里已经是新对象的内容，所以照常按面核对：人改过的面要么还是人的，要么是违规。
-          补回人删掉的对象（墓碑）被接入代码删掉了：记为保持（kept，"recreate"）。
+          补回人删掉的对象（墓碑）被接入代码删掉了：记为保持（kept，"recreate"）；按规则是补回、最后却还在的
+          （例如接入代码收尾出错，design_v0.5.md 14.8）：记为违规。
         账本只记实际看到的（P1）：结束后账本里每个单元都和 final 一样。"""
         if permit.state not in self.OPEN_STATES:
             raise ProtocolError(f"{permit.permit_id} 已经结束（{permit.state}），不能再结算")
@@ -756,8 +764,13 @@ class Runtime:
             self._emit("step/state", stepId=step.step_id, state=step.state.value)
         before_groups = {group_of(u) for u in before}
         raw_groups = {group_of(u) for u in raw}
+        tomb_hits: set[str] = set()
         if permit.reidentify is not None:
-            self._settle_identity(st, permit, before, raw, identity, pre_deleted)
+            expected = self._settle_identity(st, permit, before, raw, identity, pre_deleted)
+            # 按运行时自己的规则，补回了墓碑（人删掉、还没交还）的对象：接过旧编号的、或者还是新编号的（14.8）
+            for old, (new, _level) in expected.items():
+                if old in permit.no_recreate and old not in before_groups:
+                    tomb_hits |= {old, new}
         tomb_groups = {g for g, v in st.reidentified.items() if v["kind"] == "tomb"}
         refused_delete = {g for g in before_groups - raw_groups if g in permit.no_delete}
         group_reason = {g: dict(k) for g, k in permit.keep_alive.items()}
@@ -784,6 +797,10 @@ class Runtime:
                 if f is None:
                     if r is not None and group_of(uid) in tomb_groups:          # 补回人删掉的对象，已被删掉
                         st.kept[uid] = {"reason": KEEP_HUMAN, "recreate": True}
+                    continue
+                if group_of(uid) in tomb_hits:     # 补回人删掉的对象，最后还在（例如接入代码收尾出错）：违规
+                    st.breach[uid] = {"reason": KEEP_HUMAN, "recreate": True, "deleted": False}
+                    self._settle_breach(op_id, agent, actor, uid, f, b, step_id)
                     continue
                 self._settle_create(op_id, agent, uid, f, step_id, produce_type)
                 (st.created if r is not None and _fp(f) == _fp(r) else st.side_effects).append(uid)
@@ -858,10 +875,11 @@ class Runtime:
                        times={u: st.loops[u] for u in new}, window=self.loop_window)
 
     def _settle_identity(self, st: Settlement, permit: Permit, before: dict[str, Any], raw: dict[str, Any],
-                         identity: Optional[dict], pre_deleted: set[str]) -> None:
+                         identity: Optional[dict], pre_deleted: set[str]) -> dict:
         """核对接入代码认回的结果（design_v0.5.md 12.4）：只用执行前、执行后（恢复前）的记录，按许可单里的同一条规则
         自己重算一遍（rightofway/identity.py 的 verify）。一致的记进 st.reidentified 和认回记录（带置信等级）；
-        不一致的照实记下、提醒人。账本仍按场景的实际状态记（P1）；这是接入代码的问题，不暂停 Agent。"""
+        不一致的照实记下、提醒人。账本仍按场景的实际状态记（P1）；这是接入代码的问题，不暂停 Agent。
+        返回按规则应有的配对 {旧编号: [新编号, 等级]}：结算据此认出没被删掉的墓碑补回（14.8）。"""
         identity = identity or {}
         pairs = {o: list(v) for o, v in (identity.get("pairs") or {}).items()}
         kinds = identity.get("kinds") or {}
@@ -891,6 +909,7 @@ class Runtime:
         if errors:
             self._emit("alert/human", kind="identity", agent=permit.agent, permitId=permit.permit_id,
                        errors=list(errors))
+        return expected
 
     def mark_unmatched(self, actor_id: str, permit_id: str, old: str, new: str) -> None:
         """人说"不是同一个"（design_v0.5.md 14.5）：接入层已经把对象拆开、记好账，这里在认回记录上注明撤销了。"""

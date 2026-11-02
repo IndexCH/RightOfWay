@@ -47,6 +47,7 @@ python -m experiments.run_all --quick          # 每组只跑主要的一种
 | H | 按真实 AI 的写法重跑 A、D、E（整体调整、清空重建、类型化批量命令）；人改一处撞上的概率；不认回同一个对象的对照 | 模拟那几项不用准备；Blender 那几项同 A |
 | P | 经过 MCP 代理的同一份：AI 客户端只连代理 | `.[proxy]`；上游是假的应用 MCP 服务器，不用别的软件 |
 | S | 影子执行（试验）：AI 的脚本先在另一个 Blender 里执行，只把允许的同步过来 | 同 B |
+| K | 代码：人和 Claude Code 同时改同一份代码（精确修改、整份重写、git checkout、跨文件改名、两个 AI），有保护和对照组 | 无（Agent 是脚本，工具行为照 Claude Code，hooks 在本进程里调用） |
 
 - 没准备好的组会跳过并说明原因。
 - 旧的 `experiments/results/results.csv` 会改名备份，这次的结果写进新的；加 `--keep-results` 就接着追加。
@@ -87,6 +88,7 @@ python -m experiments.exp_h_habits --backend fake-unity --no-reidentify   # 实�
 python -m experiments.exp_p_proxy                  # 实验 P：经过 MCP 代理（假的上游，不需要任何软件）
 python -m experiments.exp_p_proxy --upstream "uvx blender-mcp"   # 实验 P：开着的 Blender + 现成的 BlenderMCP 服务器（要装 uv）
 python -m experiments.exp_s_shadow --backend socket   # 实验 S：影子执行，两个 Blender（9876、9877）；不加参数是两个 bpy 进程
+python -m experiments.exp_k_code                   # 实验 K：代码（不需要任何软件，有 git 就行）
 ```
 
 去掉 `--human sim` 就是真人操作；加 `--no-protocol` 是对照组；加 `--granularity object` 是按整个对象判断。
@@ -97,6 +99,17 @@ python -m experiments.exp_s_shadow --backend socket   # 实验 S：影子执行�
 - 实验 H 的 AI 有四种写法：精确修改（原来的脚本）、整体调整（遍历所有物体统一设置）、清空重建（全删掉再按计划重搭）、类型化批量命令（像 Unity MCP 的 `batch_execute`，每批最多 25 条，`--max-batch` 可以改小）。批量命令只在模拟应用上跑。`--sweep` 在 Blender 上要三分钟左右。
 - 模拟应用的两种：`fake` 和 Blender 一样（能恢复删除、重名自动加 `.001`、编号能转交）；`fake-unity` 和 Unity 一样（恢复不了删除、允许重名、编号由应用分配，认回时记一条编号映射）。
 - 实验 P 用开着的 Blender 时，也会新建一个"RightOfWay实验_代理_…"场景并切换过去，不动你原来的场景。
+- 实验 K 在临时目录里新建一个 git 仓库，跑完删掉，不碰你的文件。"跨文件改名"那一行是测量（不判通过与否）：它展示命令只能事后核对、可能只生效一半（`spec/design_code.md` 3.3）。
+
+## 接真的 Claude Code 试一下（代码）
+
+1. 在一个试验用的项目里（git 仓库），用装了 RightOfWay 的 Python 运行 `python -m rightofway.code install`，然后开一个新的 Claude Code 会话，输入 `/hooks` 确认 RightOfWay 的 hooks 在。
+2. 让 Claude Code 读一个文件；你在编辑器里改其中一行并存盘；再让它"按原来的计划"改那一行，或者整份重写这个文件：应该被拒，并说出是哪一行、现在的内容。
+3. 让它执行 `git checkout -- 那个文件`：文件应该被放回你的版本，Claude Code 收到说明，你看到一条提醒。
+4. 在对话里输入 `交还 文件:行号`，再让它改：这次应该可以。
+5. 用 `python -m rightofway.code status` 看现在哪些行受保护；`uninstall` 去掉 hooks。
+
+有出入的地方（例如 hook 收到的字段和文档不一样）请记下来，这部分还没在真的 Claude Code 上验证过。
 
 ## 手动检查（只有在界面里才能确认）
 
@@ -123,6 +136,7 @@ python -m experiments.exp_s_shadow --backend socket   # 实验 S：影子执行�
 | R18 | 观察粒度、值的文字 | `blender_side.py`：`records`、`object_values`；`UnitySide.cs.txt`：`Records`、`Show` |
 | R19、R20 | 违反契约、变化日志 | `runtime.py` |
 | R21 | 权威副本；旧文件不覆盖新内容 | `runtime.py`；`filemerge.py`：`_base`、`infer_base` |
+| 代码 | 按行记谁改的；人的行、按旧印象写的行不能改；交还、提交 | `code/ledger.py`：`observe`、`check`、`settle_edit`、`settle_bash`、`release`、`release_committed`；`code/hooks.py` |
 | R22 | 告知 Agent 它错过的变化，带值 | `shared_session.py`：`observe`、`run_agent`；`changes.py` |
 | R23 | 多个 Agent：后到的让先到的，预留 | `runtime.py`：`admit`、`close_permit`、`_claim_conflict` |
 | 许可单 | 每次 Agent 执行前由运行时决定哪些要保持；接入代码只照单执行，场景和许可单不符就 replan | `runtime.py`：`admit`；`blender_side.py`、`UnitySide.cs.txt`、`fakeapp.py`：`run_agent` |

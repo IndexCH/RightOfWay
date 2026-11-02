@@ -29,7 +29,8 @@ Agent 的代码是一段 Python，执行时只能用 scene：
 run_agent 的保护和恢复逻辑和 blender_side.run_agent（Unity 的 RunAgent 相同）一致：
 只照运行时开的许可单（protected、expected）执行，自己不判断哪些该保护。
 
-执行生命周期（design_v0.5.md 14.2）：每次执行按许可单编号记下结果（_journal），同一张许可单只执行一次；
+执行生命周期（design_v0.5.md 14.2、14.8）：每次执行按许可单编号记下结果（_journal），真正执行之前先记 started，
+同一张许可单只执行一次（收到过的编号记在 _seen）；收尾出错时按实际状态交回（finish_error），连实际状态都交不回来记 failed；
 result 查回结果；boot 是"应用进程"的启动编号，restart() 模拟应用重新打开（记的结果、进行中的状态都没了）。
 人在应用里的请求（交还、"不是同一个"）记在 _requests 里，随下一次结果交回（design_v0.5.md 14.4、14.5）。
 
@@ -121,7 +122,9 @@ class FakeApp:
         self._pending: dict[str, dict] = {}        # begin_agent 和 finish_agent 之间的状态
         self.notifications: list[str] = []         # 给人的提醒（notify）
         self.actions: list[list[dict]] = []        # 提醒里给人的按钮（notify 的 actions）
-        self._journal: dict[str, dict] = {}        # 许可单编号 → {"status": done | begun | not_executed, ...}
+        # 许可单编号 → {"status": started | begun | done | failed | not_executed, ...}（design_v0.5.md 14.2、14.8）
+        self._journal: dict[str, dict] = {}
+        self._seen: dict[str, bool] = {}           # 这次启动以来收到过的许可单编号（结果被挤出日志之后也知道收到过）
         self._requests: list[dict] = []            # 人在应用里的请求（交还、"不是同一个"），随下一次结果交回
         self._undo: dict[str, dict] = {}           # 认回的撤销材料：许可单编号 → {旧编号: {"old": 快照, "ai": AI 的版本}}
         self._boots = 0
@@ -205,6 +208,7 @@ class FakeApp:
     def restart(self) -> None:
         """模拟应用重新打开：场景还在（假设存过盘），记的执行结果、进行中的状态、没交回的请求都没了。"""
         self._journal.clear()
+        self._seen.clear()
         self._pending.clear()
         self._requests.clear()
         self._undo.clear()
@@ -300,8 +304,9 @@ class FakeApp:
         a, b = self.add(PROBE_NAME, {}, prefix="p-"), self.add(PROBE_NAME, {}, prefix="p-")
         names = [self.objects[a]["name"], self.objects[b]["name"]]
         del self.objects[a], self.objects[b]
+        # journal 2：执行前先记"开始了"、记得收到过的每张许可单（14.8），所以"查不到任何记录"才能说明没执行
         out = {"names": names, "identity": True, "transfer_ids": self.transfer_ids, "notify": True, "atomic": True,
-               "measured": True, "journal": True, "requests": True, "unmatch": True,
+               "measured": True, "journal": 2, "requests": True, "unmatch": True,
                "boot": self.boot, "document": self.document}
 
         def fresh():
@@ -335,16 +340,32 @@ class FakeApp:
                 "requests": self._take_requests()}
 
     def result(self, args: dict) -> dict:
-        """查回一次执行的结果（design_v0.5.md 14.2）：按许可单编号记的；应用重新打开过就没有了。"""
-        e = self._journal.get(args.get("permit_id") or "")
-        return {"boot": self.boot, "entry": json.loads(json.dumps(e)) if e is not None else None}
+        """查回一次执行的结果（design_v0.5.md 14.2、14.8）：按许可单编号记的；应用重新打开过就没有了。
+        seen：这次启动以来收到过这张许可单（结果可能已经被挤出日志）。"""
+        pid = args.get("permit_id") or ""
+        e = self._journal.get(pid)
+        return {"boot": self.boot, "entry": json.loads(json.dumps(e)) if e is not None else None,
+                "seen": pid in self._seen}
 
     def _journal_put(self, pid: Optional[str], entry: dict) -> None:
+        """记一条。超过上限时先挤掉已经结束的（done、not_executed）；开始了、还没交回结果的留着。"""
         if not pid:
             return
         self._journal[pid] = entry
-        while len(self._journal) > 32:
-            self._journal.pop(next(iter(self._journal)))
+        while len(self._journal) > 64:
+            done = [k for k, v in self._journal.items() if v.get("status") in ("done", "not_executed")]
+            self._journal.pop(done[0] if done else next(iter(self._journal)))
+
+    def _receive(self, pid: Optional[str]) -> None:
+        """收到一张许可单：同一张只执行一次（日志里有，或者收到过、结果已经被挤出日志），记下收到过。"""
+        if not pid:
+            return
+        if pid in self._journal or pid in self._seen:
+            e = self._journal.get(pid) or {}
+            raise RuntimeError(f"许可单 {pid} 已经用过（{e.get('status', '结果已不在日志里')}）")
+        self._seen[pid] = True
+        while len(self._seen) > 4096:
+            self._seen.pop(next(iter(self._seen)))
 
     def _identity(self, before: dict, args: dict) -> tuple[dict, list[str]]:
         """认回同一个对象（和 blender_side._identity 一样，规则在 identity.py）：
@@ -425,30 +446,35 @@ class FakeApp:
         return removed
 
     def run_agent(self, args: dict) -> dict:
+        """执行生命周期（design_v0.5.md 14.2、14.8）：核对通过、真正执行 AI 的代码之前，先在日志里记"开始了"；
+        从这一刻起，查不到结果就不能说"没执行"。执行之后的收尾（认回、恢复、核对）出错时，按场景的实际状态交回
+        （finish_error），由运行时照实记账；连实际状态都交不回来，日志记 failed。"""
         pid = args.get("permit_id")
-        if pid and pid in self._journal:                # 同一张许可单只执行一次：再发来就交回记下的结果
-            e = self._journal[pid]
-            if e.get("status") == "done":
-                return {**e["result"], "replayed": True}
-            raise RuntimeError(f"许可单 {pid} 已经用过（{e.get('status')}）")
-        st = self._begin(args)
+        e = self._journal.get(pid) if pid else None
+        if e is not None and e.get("status") == "done":  # 同一张许可单只执行一次：再发来就交回记下的结果
+            return {**e["result"], "replayed": True}
+        self._receive(pid)
+        st = self._begin_logged(pid, args)
         if "status" in st:
             self._journal_put(pid, {"status": "not_executed", "result": st})
             return st
+        self._journal_put(pid, {"status": "started", "time": time.time()})
         out, error = io.StringIO(), None
         try:
             with contextlib.redirect_stdout(out):
                 exec(args["code"], {"scene": AgentScene(self), "__name__": "__rightofway_agent__"})
-        except Exception:
+        except (Exception, SystemExit):                  # AI 的代码出错、或者调用了 exit()：都只算它的代码出错
             error = traceback.format_exc(limit=3)
-        res = self._finish(st, error, out.getvalue())
+        res = self._wrap_up(pid, st, error, out.getvalue())
         self._journal_put(pid, {"status": "done", "result": res})
         return res
 
     def begin_agent(self, args: dict) -> dict:
-        """不是脚本的修改（例如 MCP 代理转发的类型化工具调用）的前一半：核对、快照，不执行代码。"""
+        """不是脚本的修改（例如 MCP 代理转发的类型化工具调用）的前一半：核对、快照，不执行代码。
+        返回之后应用里的变化都算这个 Agent 的，所以日志记 begun（和 run_agent 的 started 一样）。"""
         pid = args.get("permit_id")
-        st = self._begin(args)
+        self._receive(pid)
+        st = self._begin_logged(pid, args)
         if "status" in st:
             self._journal_put(pid, {"status": "not_executed", "result": st})
             return st
@@ -460,10 +486,56 @@ class FakeApp:
 
     def finish_agent(self, args: dict) -> dict:
         """后一半：和 run_agent 执行完代码之后一样认回、恢复、核对。"""
-        st = self._pending.pop(args["token"])
-        res = self._finish(st, args.get("error"), "")
-        self._journal_put(st["args"].get("permit_id"), {"status": "done", "result": res})
+        st = self._pending.pop(args["token"], None)
+        if st is None:                                   # 开始了，收尾用的状态却没了：执行了，结果交不回来
+            pid = next((k for k, v in self._journal.items() if v.get("token") == args["token"]), None)
+            if pid and self._journal[pid].get("status") == "begun":
+                self._journal_put(pid, {"status": "failed", "error": "找不到 begin_agent 的状态"})
+            raise RuntimeError("找不到 begin_agent 的状态（应用重新打开过，或者已经 finish 过）")
+        pid = st["args"].get("permit_id")
+        res = self._wrap_up(pid, st, args.get("error"), "")
+        self._journal_put(pid, {"status": "done", "result": res})
         return res
+
+    def _begin_logged(self, pid: Optional[str], args: dict) -> dict:
+        """执行前的核对、快照出错：AI 的代码还没执行，日志记 not_executed（查回来就是"没执行"），再把错误抛出去。"""
+        try:
+            return self._begin(args)
+        except Exception:                                # noqa: BLE001
+            self._journal_put(pid, {"status": "not_executed", "error": traceback.format_exc(limit=3), "result": {}})
+            raise
+
+    def _wrap_up(self, pid: Optional[str], st: dict, error: Optional[str], stdout: str) -> dict:
+        """收尾：正常是 _finish；_finish 出错时按场景的实际状态交回（_actual），运行时照实记账（14.8）。
+        实际状态也交不回来：日志记 failed（执行了，结果交不回来），再把错误抛出去。"""
+        try:
+            return self._finish(st, error, stdout)
+        except Exception:                                # noqa: BLE001
+            finish_error = traceback.format_exc(limit=4)
+        try:
+            return self._actual(st, error, stdout, finish_error)
+        except Exception:                                # noqa: BLE001
+            self._journal_put(pid, {"status": "failed", "error": finish_error})
+            raise
+
+    def _actual(self, st: dict, error: Optional[str], stdout: str, finish_error: str) -> dict:
+        """收尾出错之后：不再恢复（恢复本身就是出错的那一步），只交回执行前和现在的实际状态。
+        要保持、但没恢复成的部分，运行时会按实际状态记为违规（P1）。"""
+        p = st.get("progress") or {}
+        before = st["before"]
+        final = self.records()
+        return {
+            "status": "ok", "before": before, "after_raw": p.get("raw") or final, "after": final,
+            "protected": {k: sorted(v) for k, v in st["protected"].items()},
+            "selected": sorted(self._lid(a) for a in self.selection),
+            "restored": list(p.get("restored") or []), "merged": dict(p.get("merged") or {}), "fallback": [],
+            "inexact": [], "lost": [], "renamed": [], "dangling": [], "candidates": [], "outside": {},
+            "ai_created": sorted(set(final) - set(before)), "identity": p.get("identity") or {},
+            "recreated": list(p.get("recreated") or []), "aliases": self.aliases(), "error": error,
+            "finish_error": finish_error, "stdout": stdout[-4000:], "undo_pushed": False,
+            "seconds": round(time.perf_counter() - st["t0"], 4), "labels": self.labels(),
+            "requests": self._take_requests(), "boot": self.boot,
+        }
 
     def _begin(self, args: dict) -> dict:
         t0 = time.perf_counter()
@@ -492,14 +564,16 @@ class FakeApp:
         args, before, protected, keep_alive = st["args"], st["before"], st["protected"], st["keep_alive"]
         do_protect, snap, sel_before, t0 = st["do_protect"], st["snap"], st["sel_before"], st["t0"]
         selected = lambda: sorted(self._lid(a) for a in self.selection)   # noqa: E731
+        p = st["progress"] = {}                         # 做到哪一步了：收尾出错时 _actual 用（14.8）
         identity, tombs = ({}, [])
         if args.get("reidentify") and do_protect:
             identity, tombs = self._identity(before, args)
+            p["identity"] = identity
         # 认回的撤销材料（design_v0.5.md 14.5）：推断带上了人的修改的（旧对象有要保持的部分），留下旧对象的快照
         # 和 AI 新建的那个（恢复之前）的样子；人说"不是同一个"时拆回两个
         undo = {old: {"old": snap[old], "ai": self._snap(old)}
                 for old, kind in (identity.get("kinds") or {}).items() if kind in ("gone", "rebind") and old in snap}
-        after_raw = self.records()
+        after_raw = p["raw"] = self.records()
 
         full, partial, lost, merged = [], {}, [], {}
         if do_protect:
@@ -520,7 +594,8 @@ class FakeApp:
             for cid in keep_alive:                  # 祖先：不许删，面照样可以改
                 if cid not in after_raw:
                     (full if self.restore_deleted else lost).append(cid)
-        restored = []
+        restored = p["restored"] = []
+        p["merged"] = merged
         for cid in full:
             a = self._aid(cid)
             if a not in self.objects:
@@ -538,7 +613,7 @@ class FakeApp:
         if full or partial:
             self._drop_dangling()                   # 恢复出来的对象，原来的父对象可能已经被 Agent 删掉了
         created = set(self.records()) - set(before)
-        recreated = self._remove_recreated(tombs, created) if tombs else []
+        recreated = p["recreated"] = self._remove_recreated(tombs, created) if tombs else []
         if do_protect:
             self.selection = {self._aid(c) for c in sel_before if self._aid(c) in self.objects}
         final = self.records()
