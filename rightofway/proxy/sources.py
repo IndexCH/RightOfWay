@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 from typing import Any, Iterable, Optional
 
-from ..blender.bridge import BridgeError
+from ..blender.bridge import NEED_SOURCE, BridgeError
 from ..blender.bridge import build_call as _blender_call
 from ..blender.bridge import parse_output as _blender_parse
 from ..blender.commands import command_results as _blender_results
@@ -27,9 +27,10 @@ CODE_PARAMS = ("code", "script", "source", "python", "csharp", "cs")       # 常
 
 class BlenderSource:
     language = "python"
+    cached = True          # 接入代码只发一次，缓存在 Blender 里（bridge.build_call）
 
-    def build(self, fn: str, args: dict) -> str:
-        return _blender_call(fn, args)
+    def build(self, fn: str, args: dict, cached: bool = False) -> str:
+        return _blender_call(fn, args, cached=cached)
 
     def parse(self, text: str) -> dict:
         return _blender_parse(text)
@@ -75,13 +76,23 @@ class MCPBridge:
     def __init__(self, client, code_tool: str, code_param: str = "code", source=None) -> None:
         self.client, self.code_tool, self.code_param = client, code_tool, code_param
         self.source = source or BlenderSource()
+        self._source_sent = False
 
-    def call(self, fn: str, args: Optional[dict] = None) -> dict:
-        res = self.client.call_tool(self.code_tool, {self.code_param: self.source.build(fn, args or {})})
-        text = _text(res)
+    def _run(self, fn: str, code: str) -> dict:
+        text = _text(self.client.call_tool(self.code_tool, {self.code_param: code}))
         if MARK_BEGIN not in text:
             raise BridgeError(f"应用的 MCP 服务器执行 {fn} 失败（{self.code_tool}）：{text[-1500:]}")
         return self.source.parse(text)
+
+    def call(self, fn: str, args: Optional[dict] = None) -> dict:
+        args = args or {}
+        if not getattr(self.source, "cached", False):
+            return self._run(fn, self.source.build(fn, args))
+        res = self._run(fn, self.source.build(fn, args, cached=self._source_sent))
+        if isinstance(res, dict) and res.get(NEED_SOURCE):       # 第一次、或者应用重新打开过：发全文
+            res = self._run(fn, self.source.build(fn, args))
+        self._source_sent = True
+        return res
 
     def compile_commands(self, commands: list, scene: Optional[str] = None) -> str:
         return self.source.compile_commands(commands, scene)

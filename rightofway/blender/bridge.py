@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextlib
 import glob
+import hashlib
 import io
 import json
 import os
@@ -47,15 +48,54 @@ class _Commands:
         return command_results(stdout)
 
 
+CODE_MODULE = "_rightofway_code"          # Blender 里缓存接入代码的地方（sys.modules，只在这次打开期间有效）
+NEED_SOURCE = "__rightofway_need_source__"   # 缓存里没有这一版接入代码：调用方要重发全文
+_SOURCE: dict = {}
+
+
 def blender_source() -> str:
     """发进 Blender 的源码：identity.py（只用标准库）在前，blender_side.py 在后。"""
-    return IDENTITY_PATH.read_text(encoding="utf-8") + "\n\n" + SOURCE_PATH.read_text(encoding="utf-8")
+    return _source()[0]
 
 
-def build_call(fn: str, args: dict) -> str:
-    """identity.py 和 blender_side.py 的全部源码，末尾加一行调用。参数先转成 JSON 字符串再嵌进去。"""
-    payload = json.dumps(json.dumps(args, ensure_ascii=True))   # 纯 ASCII，路径和中文都转义
-    return blender_source() + f"\n\n_rightofway_out({fn}(json.loads({payload})))\n"
+def _source() -> tuple[str, str]:
+    """源码和它的哈希（按两个文件的修改时间缓存，改了文件就重新读）。"""
+    key = tuple(os.stat(p).st_mtime_ns for p in (IDENTITY_PATH, SOURCE_PATH))
+    if _SOURCE.get("key") != key:
+        src = IDENTITY_PATH.read_text(encoding="utf-8") + "\n\n" + SOURCE_PATH.read_text(encoding="utf-8")
+        _SOURCE.update(key=key, src=src, hash=hashlib.sha1(src.encode("utf-8")).hexdigest()[:16])
+    return _SOURCE["src"], _SOURCE["hash"]
+
+
+def _payload(args: dict) -> str:
+    """参数：一层 JSON（纯 ASCII，路径和中文都转义），放在 Python 的原始字符串里原样交给 json.loads。
+    JSON 里恰好有三引号、或者以反斜杠结尾时，退回两层 JSON（先转成 JSON 字符串再嵌进去）。"""
+    text = json.dumps(args, ensure_ascii=True)
+    for q in ("'''", '"""'):
+        if q not in text and not text.endswith(("\\", q[0])):
+            return f"r{q}{text}{q}"
+    return json.dumps(text)
+
+
+def build_call(fn: str, args: dict, cached: bool = False) -> str:
+    """一次调用要执行的代码。
+    cached=False：identity.py 和 blender_side.py 的全部源码，末尾加一行调用；同时把这一版接入代码按哈希
+                  缓存在 Blender 里（sys.modules，不进文件）。
+    cached=True：只有一小段代码，调用缓存里的接入代码；缓存里没有这一版（第一次、Blender 重新打开过、
+                 接入代码改过）时返回 NEED_SOURCE，调用方再发一次全文（见 _CachedCalls）。"""
+    src, digest = _source()
+    payload = _payload(args)
+    if cached:
+        return ("import sys as _rw_s, json as _rw_j\n"
+                f"_rw_c = _rw_s.modules.get({CODE_MODULE!r})\n"
+                f"if getattr(_rw_c, 'hash', None) != {digest!r}:\n"
+                f"    print({MARK_BEGIN!r} + _rw_j.dumps({{{NEED_SOURCE!r}: True}}) + {MARK_END!r})\n"
+                "else:\n"
+                f"    _rw_c.ns['_rightofway_out'](_rw_c.ns[{fn!r}](_rw_j.loads({payload})))\n")
+    return (src + "\n\nimport sys as _rw_s, types as _rw_t\n"
+            f"_rw_c = _rw_s.modules[{CODE_MODULE!r}] = _rw_t.ModuleType({CODE_MODULE!r})\n"
+            f"_rw_c.hash, _rw_c.ns = {digest!r}, globals()\n"
+            f"_rightofway_out({fn}(json.loads({payload})))\n")
 
 
 def parse_output(text: str) -> dict:
@@ -66,7 +106,19 @@ def parse_output(text: str) -> dict:
     return json.loads(text[start + len(MARK_BEGIN):end])
 
 
-class SocketBridge(_Commands):
+class _CachedCalls:
+    """接入代码只在第一次（或者 Blender 重新打开过、接入代码改过）发全文，之后只发一小段调用代码。"""
+    _source_sent = False
+
+    def call(self, fn: str, args: dict) -> dict:
+        res = parse_output(self.execute(build_call(fn, args, cached=self._source_sent)))
+        if isinstance(res, dict) and res.get(NEED_SOURCE):
+            res = parse_output(self.execute(build_call(fn, args)))
+        self._source_sent = True
+        return res
+
+
+class SocketBridge(_CachedCalls, _Commands):
     """通过现成的 Blender MCP 插件执行代码。插件那边不需要任何修改。"""
 
     # 用 127.0.0.1 而不是 localhost：Windows 上 localhost 会先尝试 IPv6（::1），插件只监听 IPv4，
@@ -80,19 +132,7 @@ class SocketBridge(_Commands):
         try:
             with socket.create_connection((self.host, self.port), timeout=self.timeout) as sock:
                 sock.sendall(request)
-                buf = b""
-                while True:
-                    chunk = sock.recv(65536)
-                    if not chunk:
-                        break
-                    buf += chunk
-                    try:
-                        response = json.loads(buf.decode("utf-8"))
-                        break
-                    except (json.JSONDecodeError, UnicodeDecodeError):
-                        continue      # 插件的回复没有分隔符，收到完整的 JSON 为止
-                else:
-                    response = None
+                response = receive_json(sock)
         except OSError as e:
             raise BridgeError(
                 f"连不上 Blender MCP 插件（{self.host}:{self.port}）：{e}\n"
@@ -104,11 +144,33 @@ class SocketBridge(_Commands):
         result = response.get("result", {})
         return result.get("result", "") if isinstance(result, dict) else str(result)
 
-    def call(self, fn: str, args: dict) -> dict:
-        return parse_output(self.execute(build_call(fn, args)))
+
+_WS = b" \t\r\n"
 
 
-class InProcessBridge(_Commands):
+def receive_json(sock) -> Optional[dict]:
+    """收插件的回复：一个 JSON 对象，没有分隔符，只能收到能完整解析为止。
+    收的时候追加到 bytearray（不反复拷贝），只在收到的内容以 "}" 结尾时才试着解析一次：
+    整段解析的次数和消息大小无关（以前每收 64 KB 就整段解析一遍，耗时随消息大小平方增长）。
+    连接关闭了还没收到完整的 JSON，返回 None。"""
+    buf = bytearray()
+    while True:
+        chunk = sock.recv(1 << 20)
+        if not chunk:
+            return None
+        buf += chunk
+        end = len(buf)
+        while end and buf[end - 1] in _WS:
+            end -= 1
+        if not end or buf[end - 1] != 0x7D:      # "}"
+            continue
+        try:
+            return json.loads(buf)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+
+
+class InProcessBridge(_CachedCalls, _Commands):
     """当前 Python 能 import bpy 时，直接在本进程执行。行为和插件里的 execute_code 一样：
     每次用一个新的命名空间执行，捕获打印输出。"""
 
@@ -125,9 +187,6 @@ class InProcessBridge(_Commands):
         with contextlib.redirect_stdout(out):
             exec(code, {"bpy": bpy})
         return out.getvalue()
-
-    def call(self, fn: str, args: dict) -> dict:
-        return parse_output(self.execute(build_call(fn, args)))
 
     @staticmethod
     def reset() -> None:

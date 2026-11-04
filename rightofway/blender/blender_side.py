@@ -22,6 +22,10 @@
 方式一（poll、run_agent 带参数 data_units=True）里，对象引用的数据块（材质、网格、灯光数据……）各自是一个单元，
 有自己的编号和面；对象的面里只记"引用了哪个数据块"。这样人改一次共用材质只记一次，恢复时也写回同一个数据块。
 哪些数据块算数据块、它们有哪些面，同样从 RNA 读出，不手写。
+
+方式一的参数带 delta=True 时（design_v0.5.md 第 16 节）：增量观察，在 Blender 里缓存每个对象、数据块的记录，
+只重算可能变了的（_scan），按代号（gen / since）只交回变化。不带 delta 的调用（自测、实时同步、文件兜底、核对用的
+scene_records）照旧整份算，和以前完全一样。
 """
 import array
 import base64
@@ -36,6 +40,7 @@ import tempfile
 import time
 import traceback
 import uuid
+import zlib
 
 import bpy
 
@@ -89,9 +94,50 @@ def _content_props(struct):
         yield p
 
 
+_PROPS = {}
+
+
+def _content_ids(struct):
+    """_content_props 的 (属性名, 类型)，按 RNA 类型记住（同一类型的结构每次扫描要过成千上万次）。
+    属性个数变了（插件新注册了属性）就重新算。只给只读名字和类型的地方用。"""
+    try:
+        key = (type(struct), len(struct.bl_rna.properties))
+    except Exception:
+        return [(p.identifier, p.type) for p in _content_props(struct)]
+    hit = _PROPS.get(key)
+    if hit is None:
+        hit = _PROPS[key] = [(p.identifier, p.type) for p in _content_props(struct)]
+    return hit
+
+
 def _base_name(name):
     """去掉 Blender 自动加的 .001 后缀。"""
     return re.sub(r"\.\d{3}$", "", name)
+
+
+_STAMPING = None    # 增量扫描时：(前缀, 新编号, 新盖章的数据块)。和 ensure_ids 一样给对象引用的数据块盖章，只是边算边盖
+
+
+def _stamp_new(v):
+    prefix, new, made = _STAMPING
+    cid = prefix + uuid.uuid4().hex[:10]
+    v[ID_KEY] = cid
+    uid = getattr(v, "session_uid", None)
+    if uid is not None:
+        v[UID_KEY] = uid
+    new.append(cid)
+    made.append(v)
+
+
+_DEPS = None    # 增量观察：算一条记录时用到的别的数据块 {session_uid: (种类, 当时的值, 数据块)}；None 表示不记
+
+
+def _note(idb, kind, value):
+    """记下这条记录用到了 idb（增量观察据此判断它变了要不要重算这条记录，design_v0.5.md 第 16 节）。"""
+    try:
+        _DEPS[idb.session_uid] = (kind, value, idb)
+    except Exception:
+        pass
 
 
 def _ref(idb):
@@ -99,10 +145,14 @@ def _ref(idb):
     if idb is None:
         return None
     if isinstance(idb, bpy.types.Object):
-        return "obj:" + str(idb.get(ID_KEY) or idb.name)
-    if _is_unit_data(idb):
-        return "data:" + str(idb[ID_KEY])
-    return "id:" + type(idb).__name__ + ":" + _base_name(idb.name)
+        r = "obj:" + str(idb.get(ID_KEY) or idb.name)
+    elif _is_unit_data(idb):
+        r = "data:" + str(idb[ID_KEY])
+    else:
+        r = "id:" + type(idb).__name__ + ":" + _base_name(idb.name)
+    if _DEPS is not None:
+        _note(idb, "ref", r)
+    return r
 
 
 _DATA_UNITS = False      # 方式一：对象引用的数据块各自是一个单元（poll、run_agent 的参数 data_units）
@@ -167,6 +217,8 @@ def _bulk(coll):
                 buf = array.array("f" if p.type == "FLOAT" else "i", [0]) * (n * width)
                 coll.foreach_get(p.identifier, buf)
                 h.update(p.identifier.encode() + buf.tobytes())
+            if _TRACE is not None:
+                _TRACE.add((type(first).__name__, p.identifier))
         except Exception:
             continue                                   # 长度不固定的数组等，跳过
     return "bulk:" + h.hexdigest()[:12]
@@ -187,6 +239,8 @@ def _walk(v, depth, cache, in_object):
                 if v.library is None:
                     cache["collect"][v.as_pointer()] = v
                 return None
+            if _STAMPING is not None and _DATA_UNITS and v.library is None and not v.get(ID_KEY):
+                _stamp_new(v)                          # 增量扫描：对象引用的、还没编号的数据块，算到它时盖章
             if _is_unit_data(v):
                 return _ref(v)                         # 数据块单独成单元：对象这一面只记引用了哪个
             return [_ref(v), _id_content(v, cache)]
@@ -207,22 +261,29 @@ def _walk(v, depth, cache, in_object):
     return _val(v)
 
 
+_TRACE = None     # 自测用：算指纹时读了哪些 (结构类型, 属性)；None 表示不记
+
+
 def _walk_struct(s, depth, cache, in_object):
     if depth > MAX_DEPTH:
         return None
     out = {}
     is_id = isinstance(s, bpy.types.ID)
-    for p in _content_props(s):
-        if is_id and p.identifier == "name":
+    if _TRACE is not None:
+        _TRACE.add((type(s).__name__, "#walked"))
+    for pid, ptype in _content_ids(s):
+        if is_id and pid == "name":
             continue      # 数据块的名字属于"它是谁"（由引用记录），不属于内容
+        if _TRACE is not None:
+            _TRACE.add((type(s).__name__, pid))
         try:
-            v = getattr(s, p.identifier)
+            v = getattr(s, pid)
         except Exception:
             continue
-        if (p.type == "COLLECTION" and isinstance(s, bpy.types.ID) and len(v) > 0
+        if (ptype == "COLLECTION" and is_id and len(v) > 0
                 and isinstance(v[0], bpy.types.ID)):
             continue      # 数据块里的"引用列表"（例如网格的材质列表）在拥有它的对象那一面上已经算过
-        out[p.identifier] = _walk(v, depth, cache, in_object)
+        out[pid] = _walk(v, depth, cache, in_object)
     try:
         keys = [k for k in s.keys() if not k.startswith("rightofway_")]      # 自定义属性（几何节点的输入也在这里）
         if keys:
@@ -234,26 +295,58 @@ def _walk_struct(s, depth, cache, in_object):
 
 
 def _id_content(idb, cache):
+    """数据块的内容指纹（同一次调用里按指针缓存）。增量观察时，内容里用到的别的数据块也算这条记录用到的，
+    所以连同缓存一起记下，第二次用到时照样算进去。"""
+    global _DEPS
     key = ("content", idb.as_pointer())
-    if key not in cache:
-        cache[key] = _md5(_walk_struct(idb, 1, cache, in_object=False))
-    return cache[key]
+    hit = cache.get(key)
+    if hit is None:
+        outer = _DEPS
+        if outer is not None:
+            _DEPS = {}
+        try:
+            fp = _md5(_walk_struct(idb, 1, cache, in_object=False))
+        finally:
+            inner, _DEPS = _DEPS, outer
+        hit = cache[key] = (fp, inner)
+    if _DEPS is not None:
+        # 内嵌的（材质的节点树）、链接进来的：更新时 depsgraph 会报；别的（没有单独追踪的本地数据块）每次都重算
+        stable = bool(getattr(idb, "is_embedded_data", False)) or idb.library is not None
+        _note(idb, "content", stable)
+        if hit[1]:
+            _DEPS.update(hit[1])
+    return hit[0]
 
 
 _EXTRA_FACES = ("users_collection",)   # 对象属性里没有、但属于对象状态的：所在的集合
 
 
-def object_faces(o, cache):
-    """对象的每个面一个指纹。"""
+def object_faces(o, cache, old=None, raws=None):
+    """对象的每个面一个指纹。增量观察时给 old（上次每个面的 (原始值, 指纹)）和 raws（这次的记在这里）：
+    原始值没变的面直接用上次的指纹，不再算 JSON 和 MD5（指纹和全量算的完全一样）。"""
     faces = {}
-    for p in _content_props(o):
+    for pid, _ in _content_ids(o):
         try:
-            v = getattr(o, p.identifier)
+            v = getattr(o, pid)
         except Exception:
             continue
-        faces[p.identifier] = _md5(_walk(v, 0, cache, in_object=True))
-    faces["users_collection"] = _md5(sorted(c.name for c in o.users_collection))
+        raw = _walk(v, 0, cache, in_object=True)
+        faces[pid] = _fp_of(pid, raw, old, raws)
+    colls = list(o.users_collection)
+    if _DEPS is not None:
+        for c in colls:
+            _note(c, "name", c.name)
+    faces["users_collection"] = _fp_of("users_collection", sorted(c.name for c in colls), old, raws)
     return faces
+
+
+def _fp_of(face, raw, old, raws):
+    if raws is None:
+        return _md5(raw)
+    hit = old.get(face) if old else None
+    fp = hit[1] if hit is not None and hit[0] == raw else _md5(raw)
+    raws[face] = (raw, fp)
+    return fp
 
 
 def face_labels():
@@ -337,19 +430,17 @@ def _data_refs(objs):
 
 def _ensure_data_ids(objs, prefix):
     """给对象引用的数据块盖章。复制出来的数据块（ID.copy() 连自定义属性一起复制）带着原来的编号，这里区分开。"""
-    groups = {}
-    for idb, _ in _tracked_data():
-        groups.setdefault(idb[ID_KEY], []).append(idb)
-    for cid, group in groups.items():
-        if len(group) > 1:
-            keeper = next((d for d in group if d.get(UID_KEY) == getattr(d, "session_uid", None)), group[0])
-            for d in group:
-                if d is not keeper:
-                    del d[ID_KEY]
-    for idb, _ in _tracked_data():
-        uid = getattr(idb, "session_uid", None)
-        if uid is not None and idb.get(UID_KEY) != uid:
-            idb[UID_KEY] = uid
+    _dedupe_data()
+    return _stamp_refs(objs, prefix)
+
+
+def _dedupe_data():
+    """同一个编号有几个数据块（复制出来的）：留下原来那个（盖章时记的 session_uid 对得上的），别的去掉编号。"""
+    _dedupe_list(_tracked_data())
+
+
+def _stamp_refs(objs, prefix, made=None):
+    """这些对象引用的、还没有编号的数据块盖章。返回新编号；made 给了的话，盖了章的数据块也放进去。"""
     new = []
     for idb in _data_refs(objs):
         if not idb.get(ID_KEY):
@@ -358,21 +449,23 @@ def _ensure_data_ids(objs, prefix):
             uid = getattr(idb, "session_uid", None)
             if uid is not None:
                 idb[UID_KEY] = uid
+            if made is not None:
+                made.append(idb)
     return new
 
 
 def data_faces(idb, cache):
     """数据块的每个面一个指纹：它的每个顶层属性，引用别的数据块的只记引用，外加自定义属性。"""
     faces = {}
-    for p in _content_props(idb):
+    for pid, ptype in _content_ids(idb):
         try:
-            v = getattr(idb, p.identifier)
+            v = getattr(idb, pid)
         except Exception:
             continue
-        if (p.type == "COLLECTION" and len(v) > 0 and isinstance(v[0], bpy.types.ID)):
-            faces[p.identifier] = _md5([_ref(x) for x in v])       # 引用列表（例如网格上的材质）
+        if (ptype == "COLLECTION" and len(v) > 0 and isinstance(v[0], bpy.types.ID)):
+            faces[pid] = _md5([_ref(x) for x in v])       # 引用列表（例如网格上的材质）
             continue
-        faces[p.identifier] = _md5(_walk(v, 0, cache, in_object=False))
+        faces[pid] = _md5(_walk(v, 0, cache, in_object=False))
     try:
         keys = [k for k in idb.keys() if not k.startswith("rightofway_")]
         if keys:
@@ -389,21 +482,28 @@ def _data_display(idb):
     return f"{idb.name}（{tr(idb.bl_rna.name)}）"
 
 
-def _data_record(idb, cname, cache, values, known):
+def _rec_data(idb, cname, cache):
+    """一个数据块的记录（不带值）。全量（records）和增量（_scan）用的是同一个函数。"""
     aspects = data_faces(idb, cache)
     cfp, fp = _fps(aspects)
-    cid = idb[ID_KEY]
-    rec = {"id": cid, "name": idb.name, "type": "data:" + type(idb).__name__, "kind": "data", "coll": cname,
-           "display": _data_display(idb), "cfp": cfp, "fp": fp, "aspects": aspects, "parent": None,
-           "collections": [], "editing": False, "selected": False, "users": idb.users}
+    return {"id": idb[ID_KEY], "name": idb.name, "type": "data:" + type(idb).__name__, "kind": "data", "coll": cname,
+            "display": _data_display(idb), "cfp": cfp, "fp": fp, "aspects": aspects, "parent": None,
+            "collections": [], "editing": False, "selected": False, "users": idb.users}
+
+
+def _add_values(rec, x, old):
+    """给记录带上面的值（文字）：old 是上次看到的 {面: 指纹}，只带和它不一样的面；old 为 None 带全部。"""
+    aspects = rec["aspects"]
+    want = list(aspects) if old is None else [f for f, fp_ in aspects.items() if old.get(f) != fp_]
+    if want:
+        rec["values"] = object_values(x, [f for f in want if f != "[props]"] if rec.get("kind") == "data" else want)
+    return rec
+
+
+def _data_record(idb, cname, cache, values, known):
+    rec = _rec_data(idb, cname, cache)
     if values is not None:
-        if values == "all" or cid not in values:
-            want = list(aspects)
-        else:
-            old = values[cid]
-            want = [f for f, fp_ in aspects.items() if old.get(f) != fp_]
-        if want:
-            rec["values"] = object_values(idb, [f for f in want if f != "[props]"])
+        _add_values(rec, idb, None if values == "all" else values.get(rec["id"]))
     return rec
 
 
@@ -512,7 +612,26 @@ def ensure_ids(scene, prefix="h-", deterministic=False):
     deterministic=True 用于方式二：同一个文件无论打开几次，没盖章的对象都得到同样的编号
     （由名字算出）。前缀区分是人那一份（h-）还是 AI 那一份（a-）新建的，避免两边同名对象撞号。
     """
-    objs = sorted(_tracked(scene), key=lambda o: o.name)
+    new, objs = _ensure_obj_ids(scene, prefix, deterministic)
+    if _DATA_UNITS and not deterministic:
+        new += _ensure_data_ids(sorted(objs, key=lambda o: o.name), prefix)
+    return new
+
+
+def _ensure_obj_ids(scene, prefix, deterministic=False):
+    """ensure_ids 的对象部分（不管数据块）：去掉复制出来的重复编号，给没编号的盖章。返回 (新编号, 按名字排的对象)。"""
+    tracked = _tracked(scene)
+    if not deterministic:                            # 常见情况：都有编号、没有重复，也不用改记下的 session_uid
+        seen, ok = set(), True
+        for o in tracked:
+            cid = o.get(ID_KEY)
+            if not cid or cid in seen or o.get(UID_KEY) != o.session_uid:
+                ok = False
+                break
+            seen.add(cid)
+        if ok:
+            return [], tracked
+    objs = sorted(tracked, key=lambda o: o.name)
     groups = {}
     for o in objs:
         cid = o.get(ID_KEY)
@@ -534,9 +653,7 @@ def ensure_ids(scene, prefix="h-", deterministic=False):
             uid = getattr(o, "session_uid", None)
             if uid is not None and o.get(UID_KEY) != uid:
                 o[UID_KEY] = uid
-    if _DATA_UNITS and not deterministic:
-        new += _ensure_data_ids(objs, prefix)
-    return new
+    return new, objs
 
 
 def _view_layer(scene):
@@ -555,6 +672,22 @@ def _selected(o, vl):
         return False
 
 
+def _rec_obj(o, cache, old=None, raws=None):
+    """一个对象的记录（不带值、选中状态）。编辑模式中的对象先把网格同步出来再算指纹。全量和增量用的是同一个函数
+    （增量时带上 old / raws，见 object_faces）。"""
+    editing = o.mode == "EDIT"
+    if editing:
+        try:
+            o.update_from_editmode()
+        except Exception:
+            pass
+    aspects = object_faces(o, cache, old, raws)
+    cfp, fp = _fps(aspects)
+    return {"id": o.get(ID_KEY), "name": o.name, "type": o.type, "cfp": cfp, "fp": fp, "aspects": aspects,
+            "parent": (o.parent.get(ID_KEY) if o.parent else None),
+            "collections": sorted(c.name for c in o.users_collection), "editing": editing}
+
+
 def records(scene, values=None, only=None):
     """列出对象：{编号: {名字、类型、指纹……}}。编辑模式中的对象先把网格同步出来再算指纹。
 
@@ -568,28 +701,10 @@ def records(scene, values=None, only=None):
         cid = o.get(ID_KEY)
         if not cid or (only is not None and cid not in only):
             continue
-        editing = o.mode == "EDIT"
-        if editing:
-            try:
-                o.update_from_editmode()
-            except Exception:
-                pass
-        aspects = object_faces(o, cache)
-        cfp, fp = _fps(aspects)
-        rec = {
-            "id": cid, "name": o.name, "type": o.type, "cfp": cfp, "fp": fp, "aspects": aspects,
-            "parent": (o.parent.get(ID_KEY) if o.parent else None),
-            "collections": sorted(c.name for c in o.users_collection),
-            "editing": editing, "selected": _selected(o, vl),
-        }
+        rec = _rec_obj(o, cache)
+        rec["selected"] = _selected(o, vl)
         if values is not None:
-            if values == "all" or cid not in values:
-                want = list(aspects)
-            else:
-                old = values[cid]
-                want = [f for f, fp_ in aspects.items() if old.get(f) != fp_]
-            if want:
-                rec["values"] = object_values(o, want)
+            _add_values(rec, o, None if values == "all" else values.get(cid))
         out[cid] = rec
     if _DATA_UNITS:
         for idb, cname in _tracked_data():
@@ -605,6 +720,1092 @@ def _find(scene, cid, exclude=()):
         if o.get(ID_KEY) == cid and o.as_pointer() not in exclude:
             return o
     return None
+
+
+# ---------------------------------------------------------------------------
+# 增量观察（design_v0.5.md 第 16 节）
+#
+# 以前每次调用都把整个场景重算一遍（几百个对象就要几秒）。现在在 Blender 里缓存每个对象、数据块的记录，只重算可能变了的：
+#   - depsgraph_update_post 回调把更新了的数据块记为"脏"（_watching）；
+#   - depsgraph 不通知的改动（自定义属性、没有更新回调的属性……）在哪些地方，由自测测出来（_watch_test，不手写，P4），
+#     每次扫描都把这些地方取一遍（_sig），和上次不一样就重算；
+#   - 不在 depsgraph 里的（隐藏的对象、没人用的数据块）、不在物体模式的，每次都重算；
+#   - 记录里用到的别的数据块（引用的名字、内嵌的节点树……，_DEPS）也记下来，它们变了也重算；
+#   - 新建、删除、编号变了：每次把编号比一遍；
+#   - 回调不在了（打开过文件）、撤销/重做、depsgraph 换了：缓存作废，全部重算，和缓存比出变化；
+#   - 轮询时每隔一段做一次全量核对，增量漏掉的如实报告（missed），由会话记为来源不明。
+# 会话按代号（gen = [缓存编号, 第几版]）对齐：带上它上次对齐到的代号（since），只收这之后变了的记录。
+# ---------------------------------------------------------------------------
+VERIFY_EVERY = 100       # 轮询时，每这么多次扫描做一次全量核对
+MAX_CACHES = 4           # 最多给几个场景留缓存
+MAX_DEAD = 20000         # 删除记录最多留多少条（更早的代号就只能整份给）
+WATCH_DEPTH = 3          # 自测往下改几层（面 → 子结构、第一项 → 再往下）
+_PROBE_PROP = "rw_probe"
+
+
+def _unwatch():
+    """去掉回调（进程退出时；pip 装的 bpy 留着回调退出时会卡住）。"""
+    try:
+        for lst in (bpy.app.handlers.depsgraph_update_post, bpy.app.handlers.undo_post, bpy.app.handlers.redo_post):
+            for f in list(lst):
+                if getattr(f, "_rightofway", False):
+                    lst.remove(f)
+    except Exception:
+        pass
+
+
+def _watching():
+    """注册回调：depsgraph 每次更新，把更新了的数据块记为"脏"；撤销、重做，缓存作废。
+    只存在于运行期间、不进文件（P3）；不是 persistent 的，打开别的文件时 Blender 会去掉它们。
+    回调都在，返回 True；不在（第一次、打开过文件、被别的代码去掉了）就重新注册、丢掉所有缓存，返回 False。"""
+    st = _state()
+    lists = (bpy.app.handlers.depsgraph_update_post, bpy.app.handlers.undo_post, bpy.app.handlers.redo_post)
+    mine = st.obs_handlers
+    if mine and all(f in lst for f, lst in zip(mine, lists)):
+        return True
+    _unwatch()
+    import sys as _sys
+
+    def on_update(scene, depsgraph):
+        s = _sys.modules.get("_rightofway_state")
+        if s is None:
+            return
+        p = s.obs_pending
+        try:
+            for u in depsgraph.updates:
+                p.add(u.id.original.session_uid)
+        except Exception:
+            s.obs_reset += 1                          # 读不出是谁更新了：缓存作废
+        if len(p) > 1000000:
+            p.clear()
+            s.obs_reset += 1
+
+    def on_undo(*_args):
+        s = _sys.modules.get("_rightofway_state")
+        if s is not None:
+            s.obs_reset += 1
+
+    on_update._rightofway = on_undo._rightofway = True
+    st.obs_handlers = (on_update, on_undo, on_undo)
+    for f, lst in zip(st.obs_handlers, lists):
+        lst.append(f)
+    if not st.obs_atexit:
+        import atexit
+        atexit.register(_unwatch)
+        st.obs_atexit = True
+    st.obs.clear()
+    st.obs_pending.clear()
+    st.obs_reset += 1
+    return False
+
+
+def _take_pending(st):
+    """回调攒下的"脏"分给每个缓存（每个场景一个缓存，各自取走）。"""
+    p = st.obs_pending
+    if p:
+        for c in st.obs.values():
+            c["dirty"] |= p
+        p.clear()
+
+
+def _flush(vl):
+    """让 depsgraph 把攒着的更新报出来（回调随之记下脏的数据块）。返回这个视图层的 depsgraph。"""
+    if vl is None:
+        return None
+    try:
+        vl.update()
+        return vl.depsgraph
+    except Exception:
+        return None
+
+
+def _dg_ids(dg):
+    try:
+        return {x.original.session_uid for x in dg.ids}
+    except Exception:
+        return None
+
+
+def _new_cache():
+    return {"epoch": uuid.uuid4().hex[:8], "n": 0, "recs": {}, "rev": {}, "prev": {}, "dead": {}, "floor": 0,
+            "uid": {}, "deps": {}, "sig": {}, "dirty": set(), "reset": None, "dg": None, "sel": set(),
+            "labels": None, "labels_n": 0, "types": None, "scans": 0, "used": 0.0, "new": [], "raw": {}}
+
+
+def _type_key(x):
+    return "Object" if isinstance(x, bpy.types.Object) else type(x).__name__
+
+
+# --- 静默的地方：每次扫描都取一遍 -----------------------------------------------
+def _sig(x):
+    """x 上 depsgraph 不通知的那些地方现在的值（自测测出来的路径）。这种类型还没测过、或者测不了：None（每次重算）。"""
+    spec = _state().watch.get(_type_key(x))
+    if not spec or spec.get("volatile"):
+        return None
+    fn = spec.get("fn")
+    if fn is None:
+        spec["tree"] = spec.get("tree") or _compile(spec["paths"])
+        try:
+            fn = _sig_fn(spec["tree"])
+        except Exception:
+            fn = False
+        spec["fn"] = fn
+    if fn:
+        try:
+            return fn(x)
+        except Exception:
+            pass                                      # 哪一步出错了：逐步取（每一步单独记错误），结果一样
+    return _sig_tree(x, spec["tree"])
+
+
+def _sig_fn(tree):
+    """把路径树编成一个 Python 函数（每次扫描对每个对象都要取一遍，逐步解释太慢）。
+    结果和 _sig_tree 完全一样（出错时调用方退回 _sig_tree）。"""
+    import keyword
+    helpers, n = [], [0]
+
+    def new():
+        n[0] += 1
+        return n[0]
+
+    def attr(var, step):
+        return f"getattr({var}, {step!r})" if keyword.iskeyword(step) or not step.isidentifier() else f"{var}.{step}"
+
+    def gen(node, var, out, ind, lines):
+        for step, sub in node.items():
+            if step is None:
+                lines.append(f"{ind}{out}.append({var} if {var}.__class__ in _SC else _sv({var}))")
+                continue
+            lines.append(f"{ind}if {var} is None:")
+            lines.append(f"{ind}    {out}.append(None)")
+            lines.append(f"{ind}else:")
+            i2 = ind + "    "
+            if step == "*":
+                k = new()
+                body = [f"def _i{k}(v):", "    o = []"]
+                gen(sub, "v", "o", "    ", body)
+                body.append("    return o")
+                helpers.append("\n".join(body))
+                if all(c is not None and set(t) == {None} for c, t in sub.items()):
+                    lines.append(f"{i2}{out}.append([_sc({var}, c) for c in {list(sub)!r}] if len({var}) > BULK "
+                                 f"else [_i{k}(it) for it in {var}])")
+                else:
+                    lines.append(f"{i2}{out}.append([_i{k}(it) for it in {var}])")
+            elif step == "[props]":
+                lines.append(f"{i2}{out}.append(_ps({var}))")
+            elif step == "#name":
+                lines.append(f"{i2}{out}.append({var}.name)")
+            elif step == "#colls":
+                lines.append(f"{i2}{out}.append(sorted(c.name for c in {var}.users_collection))")
+            else:
+                k = new()
+                if step.startswith("@"):
+                    lines.append(f"{i2}v{k} = {var}.get({step[1:]!r})")
+                else:
+                    lines.append(f"{i2}v{k} = {attr(var, step)}")
+                lines.append(f"{i2}o{k} = []")
+                gen(sub, f"v{k}", f"o{k}", i2, lines)
+                lines.append(f"{i2}{out}.append(o{k})")
+
+    main = ["def _f(x):", "    o = []"]
+    gen(tree, "x", "o", "    ", main)
+    main.append("    return o")
+    env = {"_sv": _sig_val, "_sc": _sig_column, "_ps": _props_sig, "BULK": BULK,
+           "_SC": frozenset((bool, int, float, str, type(None)))}
+    exec(compile("\n\n".join(helpers + ["\n".join(main)]), "<rightofway_sig>", "exec"), env)
+    return env["_f"]
+
+
+def _compile(paths):
+    """路径按前缀合成一棵树：同一个前缀只取一次。"""
+    root = {}
+    for path in paths:
+        node = root
+        for step in path:
+            node = node.setdefault(step, {})
+        node[None] = True
+    return root
+
+
+def _sig_changed(c, cid, x):
+    old = c["sig"].get(cid)
+    return old is None or _sig(x) != old
+
+
+def _sig_tree(v, node):
+    out = []
+    for step, sub in node.items():
+        if step is None:
+            out.append(_sig_val(v))
+            continue
+        if v is None:
+            out.append(None)
+            continue
+        try:
+            if step == "*":
+                if len(v) > BULK and all(k is not None and set(t) == {None} for k, t in sub.items()):
+                    out.append([_sig_column(v, k) for k in sub])          # 大集合的几列：整块取
+                else:
+                    out.append([_sig_tree(item, sub) for item in v])
+            elif step == "[props]":
+                out.append(_props_sig(v))
+            elif step == "#name":
+                out.append(v.name)
+            elif step == "#colls":
+                out.append(sorted(c.name for c in v.users_collection))
+            elif step.startswith("@"):
+                out.append(_sig_tree(v.get(step[1:]), sub))          # 集合里按名字取的一项
+            else:
+                out.append(_sig_tree(getattr(v, step), sub))
+        except Exception as e:
+            out.append("!" + type(e).__name__)
+    return out
+
+
+def _sig_path(v, path, i):
+    """一条路径的值（自测里比较、量快慢用）。"""
+    if i == len(path):
+        return _sig_val(v)
+    if v is None:
+        return None
+    step = path[i]
+    if step == "*":
+        if i + 2 == len(path) and len(v) > BULK:
+            return _sig_column(v, path[i + 1])
+        return [_sig_path(item, path, i + 1) for item in v]
+    if step == "[props]":
+        return _props_sig(v)
+    if step == "#name":
+        return v.name
+    if step == "#colls":
+        return sorted(c.name for c in v.users_collection)
+    if step.startswith("@"):
+        return _sig_path(v.get(step[1:]), path, i + 1)
+    return _sig_path(getattr(v, step), path, i + 1)
+
+
+def _sig_val(v):
+    """一个值的快照（比较用；向量、数组复制出来，不留 Blender 里的引用）。"""
+    if v is None or isinstance(v, (bool, int, float, str)):
+        return v
+    if isinstance(v, bpy.types.ID):
+        return ("id", v.session_uid)
+    if isinstance(v, bpy.types.bpy_prop_collection):
+        if len(v) == 0:
+            return ()
+        if isinstance(v[0], bpy.types.ID):
+            return [("id", x.session_uid) for x in v]
+        return _walk(v, 0, {}, False)
+    if isinstance(v, bpy.types.bpy_struct):
+        return _walk_struct(v, 1, {}, False)
+    if isinstance(v, (set, frozenset)):
+        return tuple(sorted(str(x) for x in v))
+    try:
+        t = tuple(v)
+    except TypeError:
+        return str(v)
+    if t and hasattr(t[0], "__len__") and not isinstance(t[0], str):
+        return tuple(tuple(r) for r in t)
+    return t
+
+
+_FIXED = {}
+
+
+def _sig_column(coll, prop):
+    """大集合的一列：整块取出来算校验和。取不了整块（长度不固定的数组）就逐项取。"""
+    p = coll[0].bl_rna.properties.get(prop)
+    if p is None:
+        return None
+    n = len(coll)
+    if p.type in ("FLOAT", "INT", "BOOLEAN"):
+        width = max(1, getattr(p, "array_length", 0) or 1)
+        fixed = True
+        if getattr(p, "is_array", False):
+            key = (type(coll[0]).__name__, prop)
+            fixed = _FIXED.get(key)
+            if fixed is None:
+                try:                                   # 抽查几项（和 _bulk 一样）：长度不固定的数组逐项取
+                    fixed = all(len(getattr(coll[i], prop)) == width for i in {0, n // 4, n // 2, 3 * n // 4, n - 1})
+                except TypeError:
+                    fixed = False
+                if fixed is False:
+                    _FIXED[key] = False                # 长度不固定是这种属性本身的性质，记下来；固定的每次照样抽查
+        if fixed:
+            try:
+                if p.type == "BOOLEAN":
+                    buf = bytearray(n * width)
+                else:
+                    buf = array.array("f" if p.type == "FLOAT" else "i", [0]) * (n * width)
+                coll.foreach_get(prop, buf)
+                return (n, zlib.crc32(buf))
+            except Exception:
+                pass
+    return [_sig_val(getattr(x, prop)) for x in coll]
+
+
+def _props_sig(s):
+    try:
+        keys = [k for k in s.keys() if not k.startswith("rightofway_")]
+    except Exception:
+        return None
+    return sorted((k, repr(s[k].to_dict() if hasattr(s[k], "to_dict") else
+                           s[k].to_list() if hasattr(s[k], "to_list") else s[k])) for k in keys)
+
+
+# --- 用到的别的数据块 -------------------------------------------------------------
+def _capture(fn, *a):
+    """算一条记录，同时记下它用到的别的数据块。"""
+    global _DEPS
+    _DEPS = {}
+    try:
+        rec = fn(*a)
+    finally:
+        deps, _DEPS = _DEPS, None
+    return rec, deps
+
+
+def _deps_of(deps, own):
+    """只留种类和值，不留数据块本身。本地、没有单独追踪的数据块的内容：记下它静默的地方，之后照样核对。"""
+    out = {}
+    for u, (kind, val, idb) in deps.items():
+        if u == own:
+            continue
+        if kind == "content" and not val:
+            val = ["sig", _sig(idb)]
+        out[u] = (kind, val)
+    return out or None
+
+
+def _stale(deps, idmap, dirty, in_dg, tracked, moved):
+    """记录用到的别的数据块变了没有：内容（内嵌的节点树……）看回调；名字、引用每次直接比。"""
+    if not deps:
+        return False
+    for u, (kind, val) in deps.items():
+        if kind == "content":
+            if u in dirty:
+                return True
+            if val is True:
+                continue
+            x = idmap.get(u)
+            if x is None or u not in in_dg or val[1] is None or _sig(x) != val[1]:
+                return True
+            continue
+        if kind == "ref" and u in tracked and u not in moved:
+            continue                                  # 追踪着的对象、数据块按编号引用：编号没变，引用就没变
+        x = idmap.get(u)
+        if x is None:
+            return True
+        try:
+            if (x.name if kind == "name" else _ref(x)) != val:
+                return True
+        except Exception:
+            return True
+    return False
+
+
+def _dedupe_list(stamped):
+    """_dedupe_data 的做法，用在已经列出来的数据块上。"""
+    groups = {}
+    for idb, _ in stamped:
+        groups.setdefault(idb[ID_KEY], []).append(idb)
+    for cid, group in groups.items():
+        if len(group) > 1:
+            keeper = next((d for d in group if d.get(UID_KEY) == getattr(d, "session_uid", None)), group[0])
+            for d in group:
+                if d is not keeper:
+                    del d[ID_KEY]
+    for idb, _ in stamped:
+        if idb.get(ID_KEY):
+            uid = getattr(idb, "session_uid", None)
+            if uid is not None and idb.get(UID_KEY) != uid:
+                idb[UID_KEY] = uid
+
+
+# --- 扫描 -----------------------------------------------------------------------
+def _scan(scene, prefix, force=(), sweep=True, full=False, test=False):
+    """增量扫描。返回 (缓存, 现在的 {编号: 对象或数据块}, 这次变了的编号)。
+    缓存的 recs 就是现在整个场景的记录（不带值和选中状态；选中的编号在 sel 里），c["new"] 是这次新盖章的编号。
+    force：这些编号不管怎样都重算（许可单要保持的、刚恢复的）。
+    sweep=False：上次扫描之后只有自己的代码改过（认回、恢复），不再把静默的地方挨个取一遍；不在 depsgraph 里的照样重算。
+    full：全部重算（缓存作废、全量核对）。test：还没测过的类型先做自测（只在轮询时，不在执行前后）。"""
+    st = _state()
+    watching = _watching()
+    vl = _view_layer(scene)
+    dg = _flush(vl)
+    key = (scene.session_uid, _DATA_UNITS)
+    c = st.obs.get(key)
+    if c is None:
+        while len(st.obs) >= MAX_CACHES:
+            st.obs.pop(min(st.obs, key=lambda k: st.obs[k]["used"]))
+        c = st.obs[key] = _new_cache()
+    c["used"] = time.time()
+    _take_pending(st)
+    in_dg = _dg_ids(dg) if dg is not None else None
+    dgp = dg.as_pointer() if dg is not None else None
+    if not watching or in_dg is None or c["n"] == 0 or c["reset"] != st.obs_reset or c["dg"] != dgp:
+        full = True
+    c["reset"], c["dg"] = st.obs_reset, dgp
+    in_dg = in_dg or set()
+    dirty, c["dirty"] = c["dirty"], set()
+    if not sweep and not full:
+        # 上次扫描之后只有自己的代码改过（认回、恢复）：它改的对象、数据块都在 force 里，删掉的看编号，
+        # 引用了被换掉、删掉的东西的看 _stale。depsgraph 这时报的"更新"大多是结构变了（追加、删除、改指向）
+        # 引起的整体重建，每个对象都会报一遍，不能当成真的改了（否则 AI 改过的对象要再算一遍）
+        dirty = set()
+    c["scans"] += 1
+    # 1. 编号（和 ensure_ids 一样）：对象去重、盖章；数据块去重
+    new_ids, olist = _ensure_obj_ids(scene, prefix)
+    objs = {o.get(ID_KEY): o for o in olist}
+    idmap = {o.session_uid: o for o in bpy.data.objects}
+    stamped = []
+    for cname in _data_collections():
+        for idb in getattr(bpy.data, cname):
+            try:
+                idmap[idb.session_uid] = idb
+                if (_DATA_UNITS and idb.library is None and not getattr(idb, "is_embedded_data", False)
+                        and idb.get(ID_KEY)):
+                    stamped.append((idb, cname))
+            except Exception:
+                continue
+    for sc in bpy.data.scenes:
+        idmap[sc.collection.session_uid] = sc.collection
+    if stamped:
+        _dedupe_list(stamped)
+    tracked = set(c["uid"].values())
+    moved = set()
+    for cid, u in c["uid"].items():
+        x = idmap.get(u)
+        if x is None or x.get(ID_KEY) != cid:
+            moved.add(u)
+    # 2. 要重算的对象
+    R = set(objs) if full else set()
+    editing_data = set()
+    for cid, o in objs.items():
+        mode = o.mode
+        if mode != "OBJECT" and _DATA_UNITS and o.data is not None and o.data.library is None:
+            k = o.data.get(ID_KEY)
+            if k:
+                editing_data.add(k)                   # 编辑、雕刻……模式里的网格要同步出来才算数：每次重算
+        if full or cid in R:
+            continue
+        u = o.session_uid
+        if (c["uid"].get(cid) != u or u in dirty or u not in in_dg or mode != "OBJECT" or cid in force
+                or _stale(c["deps"].get(cid), idmap, dirty, in_dg, tracked, moved)
+                or (sweep and _sig_changed(c, cid, o))):
+            R.add(cid)
+    # 3. 全量时先给对象引用的、还没编号的数据块盖章（和 ensure_ids 一样）；增量时算对象的记录时边算边盖（第 4 步）
+    made = []
+    if _DATA_UNITS and full:
+        new_ids += _stamp_refs(sorted(objs.values(), key=lambda o: o.name), prefix, made)
+    datas = {}
+    for idb, cname in stamped + [(x, _id_collection(x)) for x in made]:
+        k = idb.get(ID_KEY)
+        if k:
+            datas[k] = (idb, cname)
+    if test:
+        _watch_pending(objs, datas)
+    # 4. 重算对象（按名字的顺序，盖章的顺序和 ensure_ids 一样）、和缓存比、记进缓存
+    global _STAMPING
+    cache = {}
+    n1 = c["n"] + 1
+    changed = set()
+
+    def commit(cid, x, rec, deps):
+        old = c["recs"].get(cid)
+        if old != rec:
+            changed.add(cid)
+            c["prev"][cid] = (c["rev"].get(cid), old)
+            c["recs"][cid] = rec
+            c["rev"][cid] = n1
+            c["dead"].pop(cid, None)
+        c["deps"][cid] = _deps_of(deps, x.session_uid)
+        c["sig"][cid] = _sig(x)
+
+    made2 = []
+    _STAMPING = (prefix, new_ids, made2) if not full else None
+    try:
+        for cid in sorted(R, key=lambda k: objs[k].name):
+            x = objs[cid]
+            raws = {}
+            rec, deps = _capture(_rec_obj, x, cache, c["raw"].get(cid), raws)
+            c["raw"][cid] = raws
+            commit(cid, x, rec, deps)
+    finally:
+        _STAMPING = None
+    for idb in made2:
+        datas[idb[ID_KEY]] = (idb, _id_collection(idb))
+    # 5. 要重算的数据块
+    for cid, (d, cname) in datas.items():
+        u = d.session_uid
+        old = c["recs"].get(cid)
+        if (full or old is None or c["uid"].get(cid) != u or u in dirty or u not in in_dg or cid in force
+                or cid in editing_data or old.get("users") != d.users or old.get("coll") != cname
+                or _stale(c["deps"].get(cid), idmap, dirty, in_dg, tracked, moved)
+                or (sweep and _sig_changed(c, cid, d))):
+            rec, deps = _capture(_rec_data, d, cname, cache)
+            commit(cid, d, rec, deps)
+    xs = dict(objs)
+    for cid, (d, _) in datas.items():
+        xs[cid] = d
+    for cid in [k for k in c["recs"] if k not in xs]:
+        changed.add(cid)
+        c["prev"][cid] = (c["rev"].pop(cid, None), c["recs"].pop(cid))
+        c["dead"][cid] = n1
+        c["deps"].pop(cid, None)
+        c["sig"].pop(cid, None)
+        c["raw"].pop(cid, None)
+    c["uid"] = {cid: x.session_uid for cid, x in xs.items()}
+    c["new"] = new_ids
+    if changed:
+        c["n"] = n1
+        if len(c["dead"]) > MAX_DEAD:                 # 太旧的删除记录不留：更早的代号只能整份给
+            for cid, r in sorted(c["dead"].items(), key=lambda kv: kv[1])[:len(c["dead"]) - MAX_DEAD // 2]:
+                del c["dead"][cid]
+                c["prev"].pop(cid, None)
+                c["floor"] = max(c["floor"], r)
+    c["sel"] = {cid for cid, o in objs.items() if _selected(o, vl)}
+    types = frozenset(type(d).__name__ for d, _ in datas.values())
+    if c["labels"] is None or types != c["types"]:
+        c["types"] = types
+        labels = face_labels()
+        if labels != c["labels"]:
+            c["labels"], c["labels_n"] = labels, c["n"]
+    return c, xs, changed
+
+
+def _emit(c, cid, old, xs):
+    """交给会话的一条记录：带上选中状态，和 old（{面: 指纹}，None 表示带全部）不一样的面带上值。"""
+    rec = dict(c["recs"][cid])
+    if rec.get("kind") != "data":
+        rec["selected"] = cid in c["sel"]
+    x = xs.get(cid)
+    if x is not None:
+        _add_values(rec, x, old)
+    return rec
+
+
+def _since_ok(c, since):
+    return (isinstance(since, (list, tuple)) and len(since) == 2 and since[0] == c["epoch"]
+            and isinstance(since[1], int) and c["floor"] <= since[1] <= c["n"])
+
+
+def _changed_since(c, since):
+    """since 之后变了的编号、删掉的编号。since 对不上（别的缓存、太旧）返回 None。"""
+    if not _since_ok(c, since):
+        return None
+    s = since[1]
+    return ([cid for cid, r in c["rev"].items() if r > s],
+            [cid for cid, r in c["dead"].items() if r > s and cid not in c["recs"]])
+
+
+def _old_at(c, cid, s):
+    """since 那一版时这条记录的面指纹：之后只变过一次时知道；不知道返回 None（调用方带上全部的值）。"""
+    p = c["prev"].get(cid)
+    if p is None or p[0] is None or p[1] is None or p[0] > s:
+        return None
+    return p[1]["aspects"]
+
+
+def _delta_out(c, since, xs):
+    """交给会话的观察：since 之后变了的记录（带变了的面的值）和删掉的编号；since 对不上就整份给。"""
+    out = {"delta": True, "gen": [c["epoch"], c["n"]], "sel": sorted(c["sel"])}
+    ch = _changed_since(c, since)
+    if ch is None:
+        out["full"] = True
+        out["records"] = {cid: _emit(c, cid, None, xs) for cid in c["recs"]}
+        out["labels"] = c["labels"]
+        return out
+    s = since[1]
+    out["changed"] = {cid: _emit(c, cid, _old_at(c, cid, s), xs) for cid in ch[0]}
+    out["deleted"] = sorted(ch[1])
+    if c["labels_n"] > s:
+        out["labels"] = c["labels"]
+    return out
+
+
+def _delta_vs(before, c, touched, xs):
+    """和 before（执行前的记录）比：touched 里变了的记录（带变了的面的值）、删掉的编号。"""
+    changed, deleted = {}, []
+    for cid in touched:
+        r, b = c["recs"].get(cid), before.get(cid)
+        if r is None:
+            if b is not None:
+                deleted.append(cid)
+        elif r != b:
+            changed[cid] = _emit(c, cid, b["aspects"] if b else None, xs)
+    return {"changed": changed, "deleted": sorted(deleted)}
+
+
+def _verify(scene, c, prefix):
+    """全量核对（兜底）：全部重算，和缓存比。不一样的就是增量漏掉的：照实记进缓存，报告出来。"""
+    _, _, changed = _scan(scene, prefix, full=True)
+    c["scans"] = 0
+    missed = sorted(changed)
+    if missed:
+        _state().obs_missed.append({"time": time.time(), "ids": missed[:50], "n": len(missed)})
+        del _state().obs_missed[:-20]
+    return missed
+
+
+# --- 自测：哪些改动 depsgraph 不通知（P4：测出来，不手写） -----------------------------
+def _watch_pending(objs, datas):
+    """场景里有、还没测过的类型，现在测。"""
+    st = _state()
+    need = {}
+    if objs and "Object" not in st.watch:
+        need["Object"] = list(objs.values())
+    for d, _ in datas.values():
+        k = type(d).__name__
+        if k not in st.watch:
+            need.setdefault(k, []).append(d)
+    for k, cands in sorted(need.items()):
+        st.watch[k] = _watch_test(k, cands, list(objs.values()))
+
+
+def _watch_test(tkey, cands, users):
+    """测一种数据块（对象，或者某一类数据块）哪些改动 depsgraph 不通知（design_v0.5.md 第 16 节）。
+    在临时场景里放一份副本，把每个可写的值原样写回一次（值不变，但 Blender 照常走"改了属性"的那条路：
+    有更新回调的会通知 depsgraph）。指纹里算进去的值（_TRACE 记下算指纹时读了哪些）写了却没通知的，就是"静默"的地方，
+    以后每次扫描都把它取一遍（_sig）。自定义属性、改名、放进别的集合实际改一下副本（这几样不会改坏东西）。
+    不改成别的值：通用地改值可能把 Blender 改崩（例如给灯光副本打开节点），自测不能冒这个险。
+    写不了的面（空的、没有可写的值）整个面每次都取；只读、派生的（法线）跳过。
+    数据块放不进 depsgraph（找不到用它的对象）：这一类每次都重算。副本、临时场景最后都删掉。"""
+    st = _state()
+    t0 = time.perf_counter()
+    spec = {"paths": [], "silent": [], "untested": [], "derived": [], "volatile": False}
+    is_obj = tkey == "Object"
+    faces_fn = object_faces if is_obj else data_faces
+    _take_pending(st)                                # 真实的更新先分给缓存，后面自测产生的更新不算数
+    sc = bpy.data.scenes.new(PROBE_NAME + "_watch_" + uuid.uuid4().hex[:6])
+    try:
+        proto = cands[0]
+        facets = list(faces_fn(proto, {}))
+        if "[props]" not in facets and not is_obj:
+            facets.append("[props]")
+        upaths = {}
+        groups = {}                                  # 候选（按指针）→ (候选, 用它的对象和路径, [(面, [路径])])
+        for f in facets:
+            cand = _pick(cands, f)
+            up = None
+            if not is_obj:
+                for x in (cand, proto):
+                    k = x.as_pointer()
+                    if k not in upaths:
+                        upaths[k] = _user_path(x, users)
+                    if upaths[k] is not None:
+                        cand, up = x, upaths[k]
+                        break
+                if up is None:
+                    spec["volatile"] = True          # 找不到用它的对象：放不进 depsgraph，这一类每次都重算
+                    return spec
+            groups.setdefault(cand.as_pointer(), (cand, up, []))[2].append((f, _pert_paths(cand, f)))
+        ref = max(cands[:500], key=_size)                 # 量取值快慢用最大的那个（只读）
+        for cand, up, items in groups.values():
+            res = _try_writes(is_obj, cand, up, [p for _, ps in items for p in ps], sc, faces_fn)
+            for f, paths in items:
+                tested = False
+                for path in paths:
+                    r = res.get(path)
+                    if r is None:
+                        continue
+                    tested = True
+                    if r == "silent":
+                        q = ("#colls",) if path[-1] == "#link" else path
+                        q = _cheaper_column(is_obj, cand, up, q, sc, ref) or q
+                        spec["silent"].append(list(path) + (["→"] + list(q) if q != path else []))
+                        if q not in spec["paths"]:
+                            spec["paths"].append(q)
+                if not tested:
+                    if not _writable(cand, f):
+                        spec["derived"].append(f)          # 只读、派生的（例如法线）：只会跟着别的地方变
+                        continue
+                    spec["untested"].append(f)             # 写不了（空的、没有可以写的值）：整个面每次都取
+                    if (f,) not in spec["paths"]:
+                        spec["paths"].append((f,))
+    except Exception:
+        traceback.print_exc()
+        spec["volatile"] = True
+    finally:
+        _clear_trash([], sc)
+        _take_pending(st)
+    spec["seconds"] = round(time.perf_counter() - t0, 3)
+    return spec
+
+
+def _try_writes(is_obj, cand, up, paths, sc, faces_fn):
+    """在一份副本上逐个写：{路径: None（写不了）| "irrelevant"（不算进指纹）| "notified" | "silent"}。
+    先把值原样写回（不改值）；最后才做会改内容的三样（自定义属性、改名、放进别的集合）。"""
+    global _DEPS, _TRACE
+    st = _state()
+    trash = []
+    out = {}
+    try:
+        x2 = _place(is_obj, cand, up, sc, trash)
+        vl = sc.view_layers[0]
+        vl.update()
+        _DEPS, _TRACE = {}, set()
+        try:
+            faces_fn(x2, {})
+        finally:
+            deps, incl = _DEPS, _TRACE
+            _DEPS, _TRACE = None, None
+        watched = {x2.session_uid} | {u for u, (k, v, _) in deps.items() if k == "content"}
+        late = ("[props]", "#name", "#link")
+        for path in sorted(paths, key=lambda q: q[-1] in late):
+            try:
+                owner = x2
+                for step in path[:-1]:
+                    owner = owner[0] if step == "*" else getattr(owner, step)
+                    if owner is None:
+                        break
+                if owner is None:
+                    continue
+                leaf = path[-1]
+                if len(path) > 1 and leaf not in ("#name", "#link"):
+                    key = "#walked" if leaf == "[props]" else leaf
+                    if (type(owner).__name__, key) not in incl:
+                        out[path] = "irrelevant"     # 算指纹时没有读它：改了也不影响指纹
+                        continue
+                st.obs_pending.clear()
+                if leaf == "[props]":
+                    owner[_PROBE_PROP] = 1.5
+                elif leaf == "#name":
+                    owner.name = owner.name + "_rw"
+                elif leaf == "#link":
+                    coll = bpy.data.collections.new(PROBE_NAME + "_coll")
+                    trash.append(coll)
+                    sc.collection.children.link(coll)
+                    coll.objects.link(owner)
+                else:
+                    p = owner.bl_rna.properties.get(leaf)
+                    if p is None or p.is_readonly:
+                        continue
+                    setattr(owner, leaf, getattr(owner, leaf))      # 原样写回
+                vl.update()
+            except Exception:
+                continue
+            out[path] = "notified" if st.obs_pending & watched else "silent"
+        return out
+    finally:
+        _clear_trash(trash, None)
+
+
+def _cheaper_column(is_obj, cand, up, path, sc, ref):
+    """静默的是大集合里一个数组属性的一列（例如网格每条边的两个顶点）：看看有没有别的列存的就是同一份数据、
+    取起来更便宜（例如网格的属性层，一次整块拷出来）。在一份副本上把第一项的数组倒过来（只是换个顺序，
+    数据仍然合法，不是改成别的值），哪一列跟着变了就是存着它的那一列；在最大的实例上量快慢，挑最快的。
+    返回更便宜的那一列的路径，没有就返回 None。"""
+    if len(path) != 3 or path[1] != "*":
+        return None
+    trash = []
+    try:
+        x2 = _place(is_obj, cand, up, sc, trash)
+        coll = getattr(x2, path[0])
+        if len(coll) <= BULK:
+            return None
+        p = coll[0].bl_rna.properties.get(path[2])
+        if (p is None or p.is_readonly or p.type not in ("INT", "FLOAT")
+                or (getattr(p, "array_length", 0) or 0) < 2):
+            return None
+        cands = [w for w in _witness_paths(x2) if w != path]
+        before = [_try_sig(x2, w) for w in cands]
+        v = list(getattr(coll[0], path[2]))
+        if v == v[::-1]:
+            return None
+        setattr(coll[0], path[2], v[::-1])
+        moved = [w for w, b in zip(cands, before) if _try_sig(x2, w) != b]
+        if not moved:
+            return None
+        best = min(moved, key=lambda w: _cost(ref, w))
+        return best if _cost(ref, best) < _cost(ref, path) else None
+    except Exception:
+        return None
+    finally:
+        _clear_trash(trash, None)
+
+
+def _witness_paths(x):
+    """可以代替的列：小集合（例如网格的属性层）里按名字取的每一项下面，大集合的每个数值属性。"""
+    out = []
+    for p in _content_props(x):
+        if p.type != "COLLECTION":
+            continue
+        try:
+            v = getattr(x, p.identifier)
+        except Exception:
+            continue
+        if not len(v) or len(v) > BULK or isinstance(v[0], bpy.types.ID):
+            continue
+        for item in v:
+            name = getattr(item, "name", None)
+            if not isinstance(name, str) or v.get(name) is None:
+                continue
+            for sp in item.bl_rna.properties:
+                if sp.type != "COLLECTION":
+                    continue
+                try:
+                    sv = getattr(item, sp.identifier)
+                except Exception:
+                    continue
+                if len(sv) > BULK and not isinstance(sv[0], bpy.types.ID):
+                    for ssp in sv[0].bl_rna.properties:
+                        if ssp.type in ("FLOAT", "INT", "BOOLEAN") and ssp.identifier != "rna_type":
+                            out.append((p.identifier, "@" + name, sp.identifier, "*", ssp.identifier))
+    return out
+
+
+def _try_sig(x, path):
+    try:
+        return _sig_path(x, path, 0)
+    except Exception as e:
+        return "!" + type(e).__name__
+
+
+def _cost(x, path):
+    best = None
+    for _ in range(3):
+        t = time.perf_counter()
+        _try_sig(x, path)
+        d = time.perf_counter() - t
+        best = d if best is None or d < best else best
+    return best
+
+
+def _clear_trash(trash, sc):
+    for x in reversed(trash):
+        try:
+            if isinstance(x, bpy.types.Object):
+                bpy.data.objects.remove(x, do_unlink=True)
+            elif isinstance(x, bpy.types.Collection):
+                bpy.data.collections.remove(x)
+            else:
+                getattr(bpy.data, _id_collection(x)).remove(x)
+        except Exception:
+            pass
+    if sc is not None:
+        try:
+            bpy.data.scenes.remove(sc)
+        except Exception:
+            pass
+
+
+def _size(x):
+    me = x.data if isinstance(x, bpy.types.Object) else x
+    try:
+        return len(getattr(me, "vertices", None) or ())
+    except Exception:
+        return 0
+
+
+def _pick(cands, f):
+    """挑一个这个面不是空的、尽量小的（网格顶点少的）。"""
+    best, bk = cands[0], None
+    for x in cands[:500]:
+        try:
+            v = getattr(x, f) if f in x.bl_rna.properties else None
+        except Exception:
+            continue
+        trivial = v is None or (isinstance(v, bpy.types.bpy_prop_collection) and len(v) == 0)
+        k = (trivial, _size(x))
+        if bk is None or k < bk:
+            best, bk = x, k
+    return best
+
+
+def _user_path(x, users):
+    """找一个用 x 的对象，和从对象到 x 的路径，例如 ("data",)、("material_slots", 0, "material")。"""
+    ptr = x.as_pointer()
+    try:
+        direct = bpy.data.user_map(subset=[x]).get(x, set())
+    except Exception:
+        direct = set()
+    first = [o for o in users if o in direct]
+    rest = [m for m in direct if not isinstance(m, bpy.types.Object)]
+    second = []
+    if rest:
+        try:
+            um = bpy.data.user_map(subset=rest)
+            near = set().union(*um.values()) if um else set()
+            second = [o for o in users if o in near]
+        except Exception:
+            pass
+    for o in first + second:
+        for p in _content_props(o):
+            pid = p.identifier
+            try:
+                v = getattr(o, pid)
+            except Exception:
+                continue
+            if p.type == "POINTER":
+                if v is None:
+                    continue
+                if isinstance(v, bpy.types.ID):
+                    if v.as_pointer() == ptr and not p.is_readonly:
+                        return o, (pid,)
+                    continue
+                for sp in v.bl_rna.properties:
+                    if sp.type == "POINTER" and not sp.is_readonly:
+                        try:
+                            sv = getattr(v, sp.identifier)
+                        except Exception:
+                            continue
+                        if isinstance(sv, bpy.types.ID) and sv.as_pointer() == ptr:
+                            return o, (pid, sp.identifier)
+            elif p.type == "COLLECTION":
+                for i, item in enumerate(v):
+                    if i > 16 or isinstance(item, bpy.types.ID):
+                        break
+                    for sp in item.bl_rna.properties:
+                        if sp.type == "POINTER" and not sp.is_readonly:
+                            try:
+                                sv = getattr(item, sp.identifier)
+                            except Exception:
+                                continue
+                            if isinstance(sv, bpy.types.ID) and sv.as_pointer() == ptr:
+                                return o, (pid, i, sp.identifier)
+    return None
+
+
+def _place(is_obj, cand, up, sc, trash):
+    """把 cand 的一份新副本放进临时场景（在 depsgraph 里）。副本去掉编号，不算追踪的东西；
+    对象副本的数据块也复制一份（写它不会写到原来的网格上），临时盖一个章（和场景里一样单独成单元）。"""
+    if is_obj:
+        x2 = cand.copy()
+        trash.append(x2)
+        _unstamp(x2)
+        if cand.data is not None:
+            try:
+                x2.data = cand.data.copy()
+                trash.append(x2.data)
+                _unstamp(x2.data)
+                if cand.data.get(ID_KEY):
+                    _stamp(x2.data, "probe-" + uuid.uuid4().hex[:8])
+            except Exception:
+                pass
+        sc.collection.objects.link(x2)
+        return x2
+    user, steps = up
+    x2 = cand.copy()
+    trash.append(x2)
+    _unstamp(x2)
+    u2 = user.copy()
+    trash.append(u2)
+    _unstamp(u2)
+    if steps[0] != "data" and user.data is not None:
+        u2.data = user.data.copy()
+        trash.append(u2.data)
+        _unstamp(u2.data)
+    owner = u2
+    for s_ in steps[:-1]:
+        owner = owner[s_] if isinstance(s_, int) else getattr(owner, s_)
+    setattr(owner, steps[-1], x2)
+    sc.collection.objects.link(u2)
+    return x2
+
+
+def _pert_paths(x, f):
+    """面 f 上可以试着写的地方。'*' 表示集合的项（自测写第一项；每次扫描时取所有项）。"""
+    if f == "users_collection":
+        return [("#link",)]
+    if f == "name":
+        return [("#name",)]
+    if f == "[props]":
+        return [("[props]",)]
+    p = x.bl_rna.properties.get(f)
+    if p is None:
+        return []
+    try:
+        v = getattr(x, f)
+    except Exception:
+        return []
+    if p.type == "POINTER":
+        if v is None:
+            return []
+        if isinstance(v, bpy.types.ID):
+            out = [] if p.is_readonly else [(f,)]
+            if getattr(v, "is_embedded_data", False):
+                out += _sub_paths(v, (f,), 1)
+            return out
+        return _sub_paths(v, (f,), 1)
+    if p.type == "COLLECTION":
+        if len(v) == 0 or isinstance(v[0], bpy.types.ID):
+            return []
+        return _sub_paths(v[0], (f, "*"), 1)
+    return [] if p.is_readonly else [(f,)]
+
+
+def _sub_paths(s, prefix, depth):
+    """结构 s 里可以试着写的地方：每个可写的值、自定义属性；指针、集合按算指纹的规则往下走。"""
+    out = []
+    try:
+        s.keys()
+        out.append(prefix + ("[props]",))
+    except Exception:
+        pass
+    is_id = isinstance(s, bpy.types.ID)
+    content = {p.identifier for p in _content_props(s)}
+    for sp in s.bl_rna.properties:
+        pid = sp.identifier
+        if pid == "rna_type" or (is_id and (pid in ("name", "name_full") or pid in _id_bookkeeping())):
+            continue
+        if sp.type in ("POINTER", "COLLECTION") and pid not in content:
+            continue
+        if sp.type == "POINTER":
+            try:
+                sv = getattr(s, pid)
+            except Exception:
+                continue
+            if sv is None:
+                continue
+            if isinstance(sv, bpy.types.ID):
+                if getattr(sv, "is_embedded_data", False):
+                    if depth < WATCH_DEPTH:
+                        out += _sub_paths(sv, prefix + (pid,), depth + 1)
+                elif not sp.is_readonly:
+                    out.append(prefix + (pid,))
+            elif depth < WATCH_DEPTH:
+                out += _sub_paths(sv, prefix + (pid,), depth + 1)
+        elif sp.type == "COLLECTION":
+            if depth >= WATCH_DEPTH:
+                continue
+            try:
+                sv = getattr(s, pid)
+            except Exception:
+                continue
+            if len(sv) and not isinstance(sv[0], bpy.types.ID):
+                out += _sub_paths(sv[0], prefix + (pid, "*"), depth + 1)
+        elif not sp.is_readonly:
+            out.append(prefix + (pid,))
+    return out
+
+
+def _writable(x, f):
+    """面 f 下面有没有可以写的值（看 RNA 的定义，不看现在有没有内容）。没有的就是只读、派生的。"""
+    if f in ("users_collection", "name", "[props]"):
+        return True
+    p = x.bl_rna.properties.get(f)
+    return p is not None and _rna_writable(p, 0)
+
+
+def _rna_writable(p, depth):
+    if p.type not in ("POINTER", "COLLECTION"):
+        return not p.is_readonly
+    if p.type == "POINTER" and not p.is_readonly:
+        return True
+    t = getattr(p, "fixed_type", None)
+    props = getattr(t, "properties", None) if t is not None else None
+    if props is None or depth >= WATCH_DEPTH:
+        return False
+    for sp in props:
+        if sp.identifier in ("rna_type", "id_data"):
+            continue
+        if sp.type in ("POINTER", "COLLECTION"):
+            if _rna_writable(sp, depth + 1):
+                return True
+        elif not sp.is_readonly:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -950,9 +2151,21 @@ def _put_candidate(scene, new, cid, name):
 # ---------------------------------------------------------------------------
 def poll(args):
     """args.known = {编号: {面: 指纹}}：只带回和它不一样的面的值；没有 known 时带回全部值。
-    args.data_units：方式一里数据块单独作为单元。"""
+    args.data_units：方式一里数据块单独作为单元。
+    args.delta（只传变化，design_v0.5.md 第 16 节）：增量扫描，只带回 args.since 这个代号之后变了的记录；
+    since 对不上（或者没给）就整份给（full）。verify=True 或者扫描次数到了：再做一次全量核对，漏掉的报在 missed 里。"""
     _set_data_units(args)
     scene = _scene(args)
+    if args.get("delta") and _DATA_UNITS:
+        prefix = args.get("prefix", "h-")
+        c, xs, _ = _scan(scene, prefix, test=True)
+        every = args.get("verify_every", VERIFY_EVERY)
+        missed = _verify(scene, c, prefix) if args.get("verify") or (every and c["scans"] >= every) else []
+        out = _delta_out(c, args.get("since"), xs)
+        if missed:
+            out["missed"] = missed
+        out.update(time=time.time(), boot=_state().boot, requests=_take_requests())
+        return out
     ensure_ids(scene, prefix=args.get("prefix", "h-"))
     known = args.get("known")
     return {"records": records(scene, values=known if known is not None else "all"),
@@ -1029,9 +2242,20 @@ def probe(args):
     # journal 2：执行前先记"开始了"、记得收到过的每张许可单（design_v0.5.md 14.8），"查不到任何记录"才说明没执行
     out = {"names": names, "identity": True, "transfer_ids": True, "notify": True, "atomic": True, "measured": True,
            "journal": 2, "requests": True, "unmatch": True, "boot": _state().boot,
+           "delta": 1,     # 只传变化（design_v0.5.md 第 16 节）：增量扫描，按代号对齐；自测在第一次增量扫描时做（_watch_test）
            # 文档：哪个文件的哪个场景。账本落盘时按它对上（design_v0.5.md 14.3）；没存过盘的文件只在这次打开期间有效
            "document": (bpy.data.filepath or ("unsaved:" + _state().boot)) + "|" + _scene(args).name}
     out.update(_self_test(base))
+    if args.get("delta") and args.get("data_units"):
+        # 只传变化：测出这个场景里各类数据块哪些改动 depsgraph 不通知（_watch_test），顺便建好缓存
+        _set_data_units(args)
+        try:
+            _scan(_scene(args), args.get("prefix", "h-"), test=True)
+        except Exception:
+            traceback.print_exc()
+        out["watch"] = {k: {"paths": len(v["paths"]), "silent": len(v["silent"]), "untested": len(v["untested"]),
+                            "volatile": v["volatile"], "seconds": v.get("seconds")}
+                        for k, v in sorted(_state().watch.items())}
     return out
 
 
@@ -1322,8 +2546,18 @@ def _actual(st, error, stdout, finish_error):
                     pool.remove(x)
         except Exception:
             pass
-    ai_created = ensure_ids(scene, prefix="a-")
-    final = records(scene, values={cid: r["aspects"] for cid, r in before.items()})
+    if st.get("delta"):
+        # 不知道收尾做到了哪一步：全部重算（不靠增量），和执行前比
+        c, xs, _ = _scan(scene, "a-", full=True)
+        ai_created = list(c["new"])
+        final_out = _delta_vs(before, c, set(before) | set(c["recs"]), xs)
+        states = {"delta": True, "gen": [c["epoch"], c["n"]], "raw": p.get("raw_out") or final_out,
+                  "final": final_out, "sel": sorted(c["sel"]), "labels": c["labels"],
+                  **({"pre": st["pre"]} if st.get("pre") else {})}
+    else:
+        ai_created = ensure_ids(scene, prefix="a-")
+        final = records(scene, values={cid: r["aspects"] for cid, r in before.items()})
+        states = {"before": before, "after_raw": p.get("raw") or final, "after": final, "labels": face_labels()}
     snap_path = st.get("snap_path")
     if snap_path and not p.get("undo"):
         try:
@@ -1331,15 +2565,18 @@ def _actual(st, error, stdout, finish_error):
         except OSError:
             pass
     return {
-        "status": "ok", "before": before, "after_raw": p.get("raw") or final, "after": final,
+        "status": "ok", **states,
         "protected": {k: sorted(v) for k, v in st["protected"].items()}, "selected": st["selected"],
         "restored": list(p.get("restored") or []), "merged": dict(p.get("merged") or {}), "fallback": [],
         "inexact": [], "renamed": [], "dangling": [], "candidates": [], "outside": {},
         "identity": p.get("identity") or {}, "recreated": list(p.get("recreated") or []),
         "ai_created": sorted(set(p.get("ai_created") or []) | set(ai_created)), "error": error,
         "finish_error": finish_error, "stdout": stdout[-4000:], "undo_pushed": False,
-        "seconds": round(time.perf_counter() - st["t0"], 4), "labels": face_labels(),
+        "seconds": round(time.perf_counter() - st["t0"], 4),
     }
+
+
+_STATE = None
 
 
 def _state():
@@ -1351,17 +2588,29 @@ def _state():
       seen      这次启动以来收到过的许可单编号（结果被挤出日志之后，也知道收到过、不能说没执行）；
       boot      这个 Blender 进程的启动编号：变了说明 Blender 重新打开过，记的结果都没了；
       requests  人在 RightOfWay 提醒里点的按钮（交还、不是同一个，14.4、14.5），随下一次结果交回；
-      undo      认回的撤销材料（14.5）：许可单编号 → {旧编号: 快照文件、AI 版本的副本……}。"""
+      undo      认回的撤销材料（14.5）：许可单编号 → {旧编号: 快照文件、AI 版本的副本……}；
+      obs       增量观察的缓存（design_v0.5.md 第 16 节）：(场景, 数据块是否成单元) → 记录、代号、用到的别的数据块……；
+      obs_pending  depsgraph 回调记下的、还没分给缓存的"脏"数据块（session_uid）；obs_reset 变了说明缓存作废（撤销、重做）；
+      obs_handlers 注册的回调（只在运行期间，不进文件）；watch  自测测出的每种数据块 depsgraph 不通知的地方；
+      obs_missed  全量核对发现增量漏掉的（最近 20 次）。"""
+    global _STATE
     import sys
-    import types
     mod = sys.modules.get("_rightofway_state")
+    if mod is not None and mod is _STATE:
+        return mod                                     # 已经初始化过（每次扫描对每个对象都要用到，要快）
+    import types
     if mod is None:
         mod = sys.modules["_rightofway_state"] = types.ModuleType("_rightofway_state")
-    for key, make in (("pending", dict), ("journal", dict), ("seen", dict), ("requests", list), ("undo", dict)):
+    for key, make in (("pending", dict), ("journal", dict), ("seen", dict), ("requests", list), ("undo", dict),
+                      ("obs", dict), ("obs_pending", set), ("watch", dict), ("obs_missed", list)):
         if not hasattr(mod, key):
             setattr(mod, key, make())
+    for key, val in (("obs_reset", 0), ("obs_handlers", None), ("obs_atexit", False)):
+        if not hasattr(mod, key):
+            setattr(mod, key, val)
     if not hasattr(mod, "boot"):
         mod.boot = uuid.uuid4().hex[:12]
+    _STATE = mod
     return mod
 
 
@@ -1467,15 +2716,39 @@ def _begin(args):
     t0 = time.perf_counter()
     _set_data_units(args)
     scene = _scene(args)
-    ensure_ids(scene, prefix=args.get("prefix", "h-"))
-    known = args.get("known", {})
-    before = records(scene, values={cid: k["aspects"] for cid, k in known.items()})
+    delta = bool(args.get("delta")) and _DATA_UNITS
+    if delta:
+        # 只传变化（design_v0.5.md 第 16 节）：增量扫描；许可单要保持的部分不管怎样都重算（I2 不靠增量）
+        force = set(args.get("protected") or {}) | set(args.get("keep_alive") or [])
+        c, xs, _ = _scan(scene, args.get("prefix", "h-"), force=force)
+        before = dict(c["recs"])                     # 执行前的记录（不带值、选中状态）：恢复、认回都按它
+        gen0 = c["n"]
+        selected = sorted(c["sel"])
+    else:
+        ensure_ids(scene, prefix=args.get("prefix", "h-"))
+        known = args.get("known", {})
+        before = records(scene, values={cid: k["aspects"] for cid, k in known.items()})
     editing = sorted(cid for cid, r in before.items() if r["editing"])
     if editing and args.get("defer_if_editing", True):
-        return {"status": "deferred", "reason": "edit_mode", "editing": editing, "before": before}
-    selected = sorted(cid for cid, r in before.items() if r["selected"])
+        return {"status": "deferred", "reason": "edit_mode", "editing": editing,
+                "before": {k: before[k] for k in editing} if delta else before}
+    if not delta:
+        selected = sorted(cid for cid, r in before.items() if r["selected"])
     expected = args.get("expected")
-    if expected is not None:
+    pre = None
+    if delta:
+        # 运行时以为的执行前状态就是它对齐到的代号（since）：这之后有变化（人刚改过），不执行，把变化交回去
+        moved = _changed_since(c, args.get("since"))
+        sel = args.get("expected_selection")
+        if not args.get("check", True):              # 对照组：不核对，这些变化随结果一起交回（pre）
+            if moved is None or moved[0] or moved[1]:
+                pre = _delta_out(c, args.get("since"), xs)
+        elif (moved is None or moved[0] or moved[1] or (sel is not None and sorted(sel) != selected)
+                or _state().requests):
+            out = _delta_out(c, args.get("since"), xs)
+            out.update(status="replan", selected=selected)
+            return out
+    elif expected is not None:
         changed = sorted((set(before) ^ set(expected))
                          | {cid for cid in before if cid in expected and before[cid]["fp"] != expected[cid]})
         sel = args.get("expected_selection")
@@ -1501,7 +2774,8 @@ def _begin(args):
 
     return {"t0": t0, "args": args, "before": before, "selected": selected, "protected": protected,
             "keep_alive": keep_alive, "do_protect": do_protect, "snap_path": snap_path,
-            "outside_before": outside_before, "sel_state": sel_state}
+            "outside_before": outside_before, "sel_state": sel_state, "delta": delta,
+            "gen0": gen0 if delta else None, "pre": pre}
 
 
 def _finish(st, error, stdout, undo_message):
@@ -1513,7 +2787,14 @@ def _finish(st, error, stdout, undo_message):
     scene = _scene(args)
     vl = _view_layer(scene)
     p = st["progress"] = {}                          # 做到哪一步了：收尾出错时 _actual 用（14.8）
-    ai_created = p["ai_created"] = ensure_ids(scene, prefix="a-")
+    delta = st.get("delta")
+    force = set(protected) | set(keep_alive)
+    if delta:
+        # 只重算 AI 改脏的（加上要保持的）；新建的照常盖章（a-）
+        c, xs, touched = _scan(scene, "a-", force=force)
+        ai_created = p["ai_created"] = list(c["new"])
+    else:
+        ai_created = p["ai_created"] = ensure_ids(scene, prefix="a-")
     identity, tombs = ({}, [])
     if args.get("reidentify") and do_protect:
         identity, tombs = _identity(scene, before, ai_created, args)
@@ -1538,8 +2819,15 @@ def _finish(st, error, stdout, undo_message):
             for m in undo.values():
                 m["ai_path"] = ai_path
             p["undo"] = True                         # 快照文件拆开时还要用，出错了也不删
-    before_faces = {cid: r["aspects"] for cid, r in before.items()}
-    after = p["raw"] = records(scene, values=before_faces)
+    before_faces = {cid: r["aspects"] for cid, r in before.items()} if not delta else None
+    if delta:
+        # 认回只改了编号（盖章、去掉旧的、改指向）：编号变了的、删掉的扫描自己看得出来，不用再把静默的地方取一遍
+        c, xs, t2 = _scan(scene, "a-", force=set(identity.get("pairs") or ()), sweep=False)
+        touched |= t2
+        after = p["raw"] = dict(c["recs"])
+        raw_out = p["raw_out"] = _delta_vs(before, c, touched, xs)
+    else:
+        after = p["raw"] = records(scene, values=before_faces)
 
     # 哪些要整个换回，哪些只把冲突的面换回（数据块和对象分开处理，数据块先恢复）
     full, partial, data_full, data_partial = [], {}, [], {}
@@ -1614,7 +2902,13 @@ def _finish(st, error, stdout, undo_message):
 
     if do_protect and args.get("restore_selection", True):
         _restore_selection(scene, vl, sel_state)     # 选中状态是人的界面状态，AI 的脚本改了就还原
-    final = records(scene, values=before_faces)
+    if delta:
+        # 恢复之后：只重算恢复了的（加上编号变了的、删掉的、引用了被换掉的东西的、不在 depsgraph 里的）
+        c, xs, t3 = _scan(scene, "a-", force=set(restored) | set(merged) | set(recreated), sweep=False)
+        touched |= t3
+        final = c["recs"]
+    else:
+        final = records(scene, values=before_faces)
     if undo:
         for old, m in undo.items():
             m["final_fp"] = (final.get(old) or {}).get("fp")
@@ -1629,15 +2923,25 @@ def _finish(st, error, stdout, undo_message):
                    "modified": sorted(n for n in set(outside_before) & set(outside_after)
                                       if outside_before[n] != outside_after[n])}
     undo_pushed = _try_undo_push(undo_message) if args.get("undo_push", True) else False
+    if delta:
+        # 只传变化：执行前就是运行时对齐到的那一版（执行前已经核对过），之后两份只带和执行前不一样的记录
+        states = {"delta": True, "gen": [c["epoch"], c["n"]], "raw": raw_out,
+                  "final": _delta_vs(before, c, touched, xs), "sel": sorted(c["sel"])}
+        if c["labels_n"] > st["gen0"]:
+            states["labels"] = c["labels"]
+        if st.get("pre"):
+            states["pre"] = st["pre"]
+    else:
+        states = {"before": before, "after_raw": after, "after": final, "labels": face_labels()}
     return {
-        "status": "ok", "before": before, "after_raw": after, "after": final,
+        "status": "ok", **states,
         "protected": {k: sorted(v) for k, v in protected.items()},
         "selected": selected,
         "restored": restored, "merged": merged, "fallback": fallback,
         "inexact": inexact, "renamed": renamed, "dangling": report.get("dangling", []),
         "candidates": candidates, "outside": outside, "identity": identity, "recreated": recreated,
         "ai_created": ai_created, "error": error, "stdout": stdout[-4000:],
-        "undo_pushed": undo_pushed, "seconds": round(time.perf_counter() - t0, 4), "labels": face_labels(),
+        "undo_pushed": undo_pushed, "seconds": round(time.perf_counter() - t0, 4),
     }
 
 
@@ -1678,10 +2982,16 @@ def unmatch(args):
     if (item is None or not entry.get("snap") or not os.path.exists(entry["snap"])
             or not os.path.exists(item.get("ai_path") or "")):
         return {"status": "unavailable"}
-    cur = records(scene, values="all")
+    delta = bool(args.get("delta")) and _DATA_UNITS
+    if delta:                                        # 只传变化：先交回运行时还没看到的变化（pre），再交回这次拆开改了的
+        c, xs, _ = _scan(scene, args.get("prefix", "h-"))
+        pre = _delta_out(c, args.get("since"), xs)
+        cur = dict(c["recs"])
+    else:
+        cur = records(scene, values="all")
     x = _find(scene, old)
     if old not in cur or x is None or cur[old]["fp"] != item.get("final_fp"):
-        return {"status": "changed"}
+        return {"status": "changed", **({"pre": pre} if delta else {})}
     own = [d for d in _data_refs([x]) if d.users == 1]          # 只给这个对象用的数据块
     own_ids = {d.get(ID_KEY) for d in own if d.get(ID_KEY)}
     # 1. 原来的对象：从快照放回，替换现在这个（引用转过去）；它私有的数据块用快照里的那份
@@ -1709,10 +3019,19 @@ def unmatch(args):
     new_id = "a-" + uuid.uuid4().hex[:10]
     _stamp(ai, new_id)
     ai.name = item["ai_name"]
-    ensure_ids(scene, prefix="a-")
+    if delta:
+        c, xs, touched = _scan(scene, "a-", force={old, new_id}, sweep=False)
+        touched |= {old, new_id}
+    else:
+        ensure_ids(scene, prefix="a-")
     del entry["items"][old]
     if not entry["items"]:
         _undo_drop(_state().undo.pop(pid))
+    if delta:
+        return {"status": "ok", "delta": True, "pre": pre, "new": new_id, "gen": [c["epoch"], c["n"]],
+                "sel": sorted(c["sel"]), "before": {k: cur[k] for k in touched if k in cur},
+                "after": {k: _emit(c, k, None, xs) for k in touched if k in c["recs"]},
+                "deleted": sorted(k for k in touched if k in cur and k not in c["recs"])}
     return {"status": "ok", "before": cur, "after": records(scene, values="all"), "new": new_id}
 
 def cleanup_scenes(args):

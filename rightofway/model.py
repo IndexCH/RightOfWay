@@ -78,6 +78,11 @@ class ObjectState:
     mergeable: bool = False            # 对象类型是否支持三方合并（例如纯文本）
     retracted: bool = False            # 是否已被撤掉（撤回或集合缩小）
     candidates: list[VersionRecord] = field(default_factory=list)  # R6 "留作候选"策略下保存的 AI 结果
+    # 稀疏账本（Runtime.set_baseline）：没人改过的单元不建记录，是"基线"（版本 0）。第一次被改时才建记录，
+    # 版本 0 的内容和作者记在这里；版本 1 起照常记在 versions 里。None 表示这个单元不是从基线来的（新建的）。
+    baseline: Any = None
+    baseline_author: Optional[str] = None
+    baseline_kind: Optional[ActorKind] = None
 
     @property
     def version(self) -> int:
@@ -85,12 +90,15 @@ class ObjectState:
 
     @property
     def content(self) -> Any:
-        return self.versions[-1].content if self.versions else None
+        return self.versions[-1].content if self.versions else self.baseline
 
     def get_version(self, v: int) -> VersionRecord:
         for rec in self.versions:
             if rec.version == v:
                 return rec
+        if v == 0 and self.baseline is not None:
+            return VersionRecord(0, self.baseline, self.baseline_author or "baseline",
+                                 self.baseline_kind or ActorKind.AGENT)
         raise KeyError(f"{self.object_id} 没有版本 {v}")
 
 

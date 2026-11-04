@@ -51,15 +51,14 @@ def _where(uid: str, name: str, labels: Optional[dict]) -> str:
 # I1
 # ---------------------------------------------------------------------------
 def check_ledger(rt: Runtime, scene: Records, granularity: str, labels: Optional[dict] = None) -> list[Violation]:
-    """账本里每个单元的最新版本，和场景里实际的单元比较。"""
+    """账本里每个单元的最新版本，和场景里实际的单元比较。
+    稀疏账本（design_v0.5.md 第 16 节）：没建记录的单元按基线（上次整份落盘时的样子）比，一样要和场景一致，
+    所以接入层看到了变化、却没记进运行时，照样查得出来（不放宽）。"""
     out: list[Violation] = []
     su = units(scene, granularity)
     tracked = set()
-    for uid, obj in sorted(rt.objects.items()):
-        if obj.retracted or not obj.versions:
-            continue
-        tracked.add(uid)
-        led = obj.content
+
+    def check(uid: str, led, author: str) -> None:
         got = su.get(uid)
         name = (display(led) if isinstance(led, dict) else None) or display(got, uid)
         where = _where(uid, name, labels)
@@ -67,9 +66,24 @@ def check_ledger(rt: Runtime, scene: Records, granularity: str, labels: Optional
             if got is not None:
                 out.append(Violation(I1, uid, where, "账本记为已删除，场景里还在"))
         elif got is None:
-            out.append(Violation(I1, uid, where, f"账本里还在（最后由 {obj.versions[-1].author_id} 写入），场景里没有"))
+            out.append(Violation(I1, uid, where, f"账本里还在（最后由 {author} 写入），场景里没有"))
         elif _fp(got) != _fp(led):
-            out.append(Violation(I1, uid, where, f"内容不一致（账本最后由 {obj.versions[-1].author_id} 写入）"))
+            out.append(Violation(I1, uid, where, f"内容不一致（账本最后由 {author} 写入）"))
+
+    for uid, obj in sorted(rt.objects.items()):
+        if obj.retracted or (not obj.versions and obj.baseline is None):
+            continue
+        tracked.add(uid)
+        check(uid, obj.content, obj.versions[-1].author_id if obj.versions else f"基线（{obj.baseline_author}）")
+    if rt.sparse:
+        for uid in rt._base_units():
+            if uid in tracked or dict.__contains__(rt.objects, uid):
+                continue
+            led = rt._baseline_content(uid)
+            if led is None:
+                continue
+            tracked.add(uid)
+            check(uid, led, "基线")
     for uid, u in sorted(su.items()):
         if uid not in tracked:
             out.append(Violation(I1, uid, _where(uid, display(u, uid), labels), "场景里有，账本里没有"))
@@ -141,8 +155,8 @@ def check_run(rt: Runtime, report: Any, granularity: str, scene: Optional[Record
         if _fp(got) != _fp(was):
             out.append(Violation(I3, uid, where(uid), f"说没有生效、保留了原来的（{s.get('reason')}），但场景里"
                                  + ("没有了" if got is None else "已经变了")))
-        obj = rt.objects.get(uid)
-        if obj is not None and not is_deleted(obj.content) and _fp(obj.content) != _fp(was):
+        led = rt.content_of(uid)                    # 不建记录（基线单元按基线）
+        if led is not None and not is_deleted(led) and _fp(led) != _fp(was):
             out.append(Violation(I3, uid, where(uid), "说保留了原来的，但账本里不是原来的"))
 
     if ledger:

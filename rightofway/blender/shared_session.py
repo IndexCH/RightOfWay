@@ -51,16 +51,30 @@ R_OTHER = KEEP_OTHER
 R_REVERTED = "reverted"         # 不在许可单里、但应用把它改回去了（接入代码多恢复了）
 # 来源说不准的变化（design_v0.5.md 14.2、14.3），记在 external:<来源> 名下，和人的修改一样保护
 SOURCES = {"external:unattributed": "结果没收到的那次执行前后", "external:offline": "RightOfWay 没运行期间",
-           "external:reopened": "应用重新打开时"}
+           "external:reopened": "应用重新打开时",
+           "external:missed": "增量观察漏掉、全量核对时才发现的"}      # design_v0.5.md 第 16 节
 
 
 @dataclass
 class AgentView:
-    """某个 AI 上次看到的场景（用来告诉它错过了什么）。看到的版本以运行时的 Runtime.seen 为准。"""
-    recs: Records
-    values: Values
-    versions: dict[str, int]
-    time: float
+    """某个 AI 上次看到的场景（用来告诉它错过了什么）。看到的版本以运行时的 Runtime.seen 为准。
+    不复制整个场景（以前每看一次复制一份，design_v0.5.md 第 16 节）：只在之后某个对象变了的时候，
+    记下它看的那一刻这个对象的样子（old，None 表示那时还没有）和值（old_values）。没记的就和现在一样。"""
+    old: dict[str, Optional[dict]] = field(default_factory=dict)
+    old_values: dict[str, dict] = field(default_factory=dict)
+    time: float = 0.0
+
+    def remember(self, cid: str, rec: Optional[dict]) -> bool:
+        if cid in self.old:
+            return False
+        self.old[cid] = rec
+        return True
+
+    def remember_values(self, cid: str, values: Optional[dict]) -> bool:
+        if cid in self.old_values:
+            return False
+        self.old_values[cid] = dict(values or {})
+        return True
 
 
 @dataclass
@@ -141,18 +155,47 @@ class _Prepared:
     blocked: Optional[list[dict]] = None                 # 整个调用执行前就被拒（不透明的工具调用没法只执行一部分）
 
 
+def _rows(recs: Records) -> dict[str, dict]:
+    """全部应用对象的身份行（运行时核对认回、判断哪些对象在用）。"""
+    return {cid: {k: r.get(k) for k in ("name", "type", "parent", "kind", "users")} for cid, r in recs.items()}
+
+
+def _overlay(base: Records, delta: dict) -> Records:
+    out = dict(base)
+    out.update(delta.get("changed") or {})
+    for cid in delta.get("deleted") or ():
+        out.pop(cid, None)
+    return out
+
+
+def _changed_groups(base: Records, *others: Records) -> set[str]:
+    """和 base 比，记录（指纹或身份行）不一样的对象，以及多出来、少了的。"""
+    out: set[str] = set()
+    keys = ("fp", "name", "type", "parent", "kind", "users")
+    for other in others:
+        for cid in set(base) | set(other):
+            a, b = base.get(cid), other.get(cid)
+            if a is None or b is None or any(a.get(k) != b.get(k) for k in keys):
+                out.add(cid)
+    return out
+
+
 class SharedSession:
     def __init__(self, runtime: Runtime, bridge, human: str = "yuan", agent: str = "agent",
                  scene: Optional[str] = None, initial_owner: str = "open", granularity: str = ASPECT,
                  occupy_selection: bool = False, reserve_seconds: float = 30.0, prefix: str = "h-",
-                 data_units: bool = True) -> None:
+                 data_units: bool = True, sparse: bool = True, incremental: bool = True) -> None:
         """initial_owner：开始时场景里已有的对象算谁的。
         'open'（默认）表示 AI 可以改；'human' 表示全部视为人碰过，AI 不能改，直到人交还。
         data_units：对象引用的数据块（材质、网格……）各自是一个单元（默认）。人改一次共用材质只记一次，
-        恢复时写回同一个数据块。接入代码不支持时忽略这个参数。"""
+        恢复时写回同一个数据块。接入代码不支持时忽略这个参数。
+        sparse：稀疏账本（默认，design_v0.5.md 第 16 节）：没人改过的单元不建记录，是基线；第一次被改时才建。
+        incremental：接入代码支持时（probe 报 delta），只传变化：接入代码在应用里缓存指纹、只重算变了的对象，
+        双方按观察的代号（gen）对齐。实时同步（live_sync）两个都关掉，和以前一样。"""
         assert granularity in (ASPECT, OBJECT)
         self.rt, self.bridge = runtime, bridge
         self.data_units = data_units
+        self.sparse, self.incremental = sparse, incremental
         self.human, self.agent, self.scene = human, agent, scene
         self.initial_owner, self.granularity = initial_owner, granularity
         self.occupy_selection, self.reserve_seconds, self.prefix = occupy_selection, reserve_seconds, prefix
@@ -165,8 +208,14 @@ class SharedSession:
         if CAPABILITY not in runtime.capabilities:
             # 执行脚本属于可回退的修改（等级 1）；Blender 里的脚本执行不能中途取消
             runtime.register_capability(CapabilityMeta(CAPABILITY, effect_level=1, cancellable=False))
-        self.view: Records = {}                    # 运行时上次看到的场景
-        self.values: Values = {}                   # 每个面现在的值（文字），增量更新
+        self._view: Records = {}                   # 运行时上次看到的场景（只经过 view 的 setter 和 _set_records 改）
+        self.values: Values = {}                   # 每个面现在的值（文字），增量更新（只经过 _learn 改）
+        self.baseline: Records = {}                # 稀疏账本的基线：上次整份落盘（开始、压缩）时的场景；没人改过的单元按它算
+        self.obs_gen: Optional[int] = None         # 接入代码的观察代号（只传变化时用）：双方对齐到同一个代号
+        self._dirty_view: set[str] = set()         # 上次落盘之后 view 里变了的对象
+        self._dirty_values: set[str] = set()
+        self._av_dirty: dict[str, dict] = {}       # 上次落盘之后每个 AI 的视图记下了什么
+        self._ledger_meta: dict = {}               # 账本文件：压缩之后追加了多少
         self.selected: set[str] = set()            # 人现在选中的对象
         self.agent_views: dict[str, AgentView] = {}
         self.agent_names: dict[str, str] = {}
@@ -198,6 +247,11 @@ class SharedSession:
             self._see(agent)
 
     @property
+    def _incr(self) -> bool:
+        """接入代码支持只传变化（probe 报 delta），并且这个会话没关掉（incremental）、数据块单独成单元。"""
+        return bool(self.incremental and self.data_units and self.capabilities.get("delta"))
+
+    @property
     def reservations(self) -> dict[str, tuple[str, float]]:
         """R23 的预留，由运行时管理：单元 → (预留给哪个 AI, 到期时间)。"""
         self.rt._expire_reservations()
@@ -213,6 +267,14 @@ class SharedSession:
             kw["aliases"] = dict(self.aliases)
         return kw
 
+    def _dargs(self, **kw) -> dict:
+        """调接入代码观察或执行：只传变化时带上 delta 和这一边对齐到的代号（since，design_v0.5.md 第 16 节）。"""
+        kw = self._args(**kw)
+        if self._incr:
+            kw["delta"] = True
+            kw.setdefault("since", self.obs_gen)
+        return kw
+
     def _units(self, recs: Records) -> dict[str, dict]:
         return units(recs, self.granularity)
 
@@ -220,42 +282,217 @@ class SharedSession:
     def _known(recs: Records) -> dict[str, dict]:
         return {cid: r["aspects"] for cid, r in recs.items()}
 
+    # ------------------------------------------------------------------
+    # 运行时看到的场景（view）、值（values）、每个 AI 看到的（agent_views）：只经过这几个函数改
+    # ------------------------------------------------------------------
+    @property
+    def view(self) -> Records:
+        return self._view
+
+    @view.setter
+    def view(self, recs: Records) -> None:
+        """整份换掉（和现在比，只记变了的对象）。"""
+        old = self._view
+        changed = {c: r for c, r in recs.items() if old.get(c) is not r and old.get(c) != r}
+        self._set_records(changed, [c for c in old if c not in recs])
+
+    def _set_records(self, changed: Records, deleted=()) -> None:
+        """场景里这些对象变了（changed：新的记录）、没了（deleted）。每个 AI 的视图、每次结果没收到的执行，
+        记下它们那一刻这个对象的样子（只记第一次），所以不用每次复制整个场景。"""
+        for cid, rec in changed.items():
+            if "values" in rec:
+                rec = {k: v for k, v in rec.items() if k != "values"}
+            self._remember(cid)
+            self._view[cid] = rec
+            self._dirty_view.add(cid)
+        for cid in deleted:
+            if cid in self._view:
+                self._remember(cid)
+                del self._view[cid]
+                self._dirty_view.add(cid)
+
+    def _remember(self, cid: str) -> None:
+        old = self._view.get(cid)
+        for a, av in self.agent_views.items():
+            if av.remember(cid, old):
+                self._av_dirty.setdefault(a, {"old": set(), "old_values": set()})["old"].add(cid)
+        for d in self._doubts.values():
+            d.setdefault("old", {}).setdefault(cid, old)
+
     def _learn(self, recs: Records) -> None:
+        """记录里带的值（变了的面才带）记进 self.values。"""
         for cid, r in recs.items():
-            if r.get("values"):
-                self.values.setdefault(cid, {}).update(r["values"])
+            new = r.get("values")
+            if not new:
+                continue
+            cur = self.values.get(cid)
+            changed = {f: v for f, v in new.items() if cur is None or cur.get(f) != v}
+            if not changed:
+                continue
+            for a, av in self.agent_views.items():
+                if av.remember_values(cid, cur):
+                    self._av_dirty.setdefault(a, {"old": set(), "old_values": set()})["old_values"].add(cid)
+            self.values.setdefault(cid, {}).update(changed)
+            self._dirty_values.add(cid)
 
     def _see(self, agent: str) -> None:
-        """这个 AI 看到了现在的场景：运行时记下它看到的版本（R3），这里记下样子和值（用来告诉它错过了什么）。"""
+        """这个 AI 看到了现在的场景：运行时记下它看到的版本（R3），这里从头记它之后错过了什么。"""
         self.rt.mark_seen(agent)
-        self.agent_views[agent] = AgentView(
-            recs=dict(self.view), values={cid: dict(v) for cid, v in self.values.items() if cid in self.view},
-            versions=dict(self.rt.seen[agent]), time=time.time())
+        self.agent_views[agent] = AgentView(time=time.time())
+        self._av_dirty[agent] = {"reset": True, "old": set(), "old_values": set()}
+
+    def _since_look(self, agent: str, now: Optional[Records] = None) -> tuple[Records, Records, Values, Values]:
+        """这个 AI 上次看之后变了的对象：(那时的记录, 现在的记录, 那时的值, 现在的值)，只含变了的。
+        describe_changes、diff_records 对没变的对象什么也不做，所以只给变了的，结果和给整个场景一样。"""
+        av, now = self.agent_views[agent], self._view if now is None else now
+        old = {c: r for c, r in av.old.items() if r is not None}
+        new = {c: now[c] for c in av.old if c in now}
+        old_values = {c: av.old_values.get(c, self.values.get(c, {})) for c in old}
+        new_values = {c: self.values.get(c, {}) for c in new}
+        return old, new, old_values, new_values
+
+    def agent_scene(self, agent: str) -> tuple[Records, Values]:
+        """这个 AI 上次看到的整个场景和值（实验、显示用）。"""
+        av = self.agent_views[agent]
+        values = {c: dict(v) for c, v in self.values.items()}
+        for c, v in av.old_values.items():
+            values[c] = dict(v)
+        return self._agent_recs(agent), values
+
+    def _agent_recs(self, agent: str) -> Records:
+        """这个 AI 上次看到的整个场景（只在接入代码要整份 known 时用：不支持只传变化的接入代码）。"""
+        av = self.agent_views[agent]
+        out = dict(self._view)
+        for c, r in av.old.items():
+            if r is None:
+                out.pop(c, None)
+            else:
+                out[c] = r
+        return out
+
+    # ------------------------------------------------------------------
+    # 稀疏账本的基线（design_v0.5.md 第 16 节）：交给运行时，按需取
+    # ------------------------------------------------------------------
+    def _base_unit(self, uid: str) -> Optional[dict]:
+        cid, face = split_unit(uid)
+        r = self.baseline.get(cid)
+        if r is None:
+            return None
+        if self.granularity == OBJECT:
+            return r if face is None else None
+        fp = r["aspects"].get(face) if face is not None else None
+        if fp is None:
+            return None
+        meta = {k: r[k] for k in ("type", "parent", "kind", "display", "users") if r.get(k) is not None}
+        return {"id": cid, "aspect": face, "name": r["name"], "fp": fp, "cfp": fp, **meta}
+
+    def _base_units_of(self, cid: str) -> list[str]:
+        r = self.baseline.get(cid)
+        if r is None:
+            return []
+        return [cid] if self.granularity == OBJECT else [f"{cid}#{a}" for a in r["aspects"]]
+
+    def _base_units(self):
+        for cid in list(self.baseline):
+            yield from self._base_units_of(cid)
+
+    def _base_row(self, cid: str) -> Optional[dict]:
+        r = self._view.get(cid)
+        return None if r is None else {k: r.get(k) for k in ("name", "type", "parent", "kind", "users")}
+
+    def _use_baseline(self, recs: Records) -> None:
+        """这些记录就是基线：没人改过的单元不在运行时里建记录。"""
+        self.baseline = dict(recs)
+        if self.sparse:
+            owner = None if self.initial_owner == "open" else self.human
+            self.rt.set_baseline(self._base_unit, self._base_units, self._base_units_of, row=self._base_row,
+                                 owner=owner, actor=BASELINE_ACTOR, type_=OBJECT_TYPE)
 
     def _set_selected(self, selected) -> None:
         self.selected = set(selected)
         self.rt.set_selection(self.human, self.selected)
+
+    def _observed(self, res: dict, source: Optional[str] = None) -> Diff:
+        """接入代码交回的一次观察（只传变化时）：记下这之间的变化（source 为 None 是人做的，否则来源说不准），
+        更新 view、值、选中状态、代号。交回的是整份（full：代号对不上）就和以前一样整份比。
+        全量核对发现增量漏掉的（missed）：说不准是谁、什么时候改的，记为来源不明（external:missed），和人的修改一样保护。"""
+        if res.get("labels"):
+            self.labels = res["labels"]
+        if res.get("full"):
+            recs = res["records"]
+            self._learn(recs)
+            d = self._absorb_human(self.view, recs, source=source)
+            self.view = recs
+        else:
+            ch, dl = res.get("changed") or {}, res.get("deleted") or []
+            missed = set(res.get("missed") or ())
+            old = {c: self._view[c] for c in set(ch) | set(dl) if c in self._view}
+            self._learn(ch)
+            d = Diff()
+            for group, src in ((missed, "missed"), (None, source)):
+                o = {c: r for c, r in old.items() if (c in missed) == (group is not None)}
+                n = {c: r for c, r in ch.items() if (c in missed) == (group is not None)}
+                part = self._absorb_human(o, n, source=src)
+                d.created.update(part.created)
+                d.deleted.update(part.deleted)
+                d.modified.update(part.modified)
+            if missed:                                  # 照实告诉每个 AI：这些地方说不准是谁改的，按人的修改保护
+                names = "、".join(sorted(display(ch.get(c) or old.get(c), c) for c in missed)[:12])
+                for a in self.agent_names:
+                    self._notes.setdefault(a, []).append(
+                        f"核对时发现 {names} 和之前记下的不一样（增量观察漏掉了，说不准是谁、什么时候改的），"
+                        "已按人的修改保护：人交还之后才能改。")
+            self._set_records(ch, dl)
+        if res.get("gen") is not None:
+            self.obs_gen = res["gen"]
+        if res.get("sel") is not None:
+            self._sync_selected(res["sel"])
+        return d
+
+    def _sync_selected(self, sel) -> None:
+        """选中状态（只传变化时单独交回）：view 里对象记录的 selected 跟着改，和整份交回时一样。"""
+        sel = set(sel)
+        fix = {c: {**r, "selected": c in sel} for c, r in self._view.items()
+               if r.get("kind") != "data" and bool(r.get("selected")) != (c in sel)}
+        if fix:
+            self._set_records(fix)
+        self._set_selected(sel)
+
+    def _list_all(self) -> Records:
+        """整份列一次（结果没收到、查清时用）。只传变化时也整份要（since=None），并对齐到交回的代号。"""
+        if not self._incr:
+            return self.bridge.call("poll", self._args())["records"]
+        res = self.bridge.call("poll", self._dargs(since=None))
+        self.obs_gen = res.get("gen")
+        if res.get("labels"):
+            self.labels = res["labels"]
+        return res["records"]
 
     def start(self, ledger=None) -> Records:
         """连接。ledger：账本落盘的文件（design_v0.5.md 14.3），或者"文档 → 文件"的函数（按连接时测出的文档决定）。
         文件在、并且是同一个文档的，接着上次的账本，先和场景对一遍：上次之后的变化来源说不准（代理没运行），
         按人的修改保护；结果没查清的执行先查清。"""
         # 连接时的自测（design_v0.5.md 第 4 节）：重名后缀、接入代码会不会认回、编号能不能转交、记不记执行结果
-        self.capabilities = self.rt.learn_app(self.bridge.call("probe", self._args()))
+        self.capabilities = self.rt.learn_app(self.bridge.call(
+            "probe", self._args(**({"delta": True} if self.incremental and self.data_units else {}))))
         self.app_boot = self.capabilities.get("boot")
         if callable(ledger):
             ledger = ledger(self.capabilities.get("document"))
         self.ledger_path = ledger
         if ledger and os.path.exists(ledger) and self._load(ledger):
             return self._reconcile()
-        res = self.bridge.call("poll", self._args())
+        res = self.bridge.call("poll", self._dargs(since=None))
         self.labels = res.get("labels", {})
-        owner = BASELINE_ACTOR if self.initial_owner == "open" else self.human
-        for uid, content in self._units(res["records"]).items():
-            if uid not in self.rt.objects:
-                self.rt.create_object(uid, OBJECT_TYPE, content, owner)
+        self.obs_gen = res.get("gen")
         self.view = res["records"]
-        self._learn(self.view)
+        self._learn(res["records"])
+        if self.sparse:
+            self._use_baseline(self._view)
+        else:
+            owner = BASELINE_ACTOR if self.initial_owner == "open" else self.human
+            for uid, content in self._units(res["records"]).items():
+                if uid not in self.rt.objects:
+                    self.rt.create_object(uid, OBJECT_TYPE, content, owner)
         self._set_selected(cid for cid, r in self.view.items() if r.get("selected"))
         self._started = True
         for a in self.agent_names:
@@ -274,15 +511,22 @@ class SharedSession:
             self._resolve_in_doubt()
             if self._doubts:
                 return Diff()
-        res = self.bridge.call("poll", self._args(known=self._known(self.view)))
-        recs = res["records"]
-        self._learn(recs)
-        reopened = bool(res.get("boot") and self.app_boot and res["boot"] != self.app_boot)
-        d = self._absorb_human(self.view, recs, source="reopened" if reopened else None)
-        if res.get("boot"):
-            self.app_boot = res["boot"]
-        self.view = recs
-        self._set_selected(cid for cid, r in recs.items() if r.get("selected"))
+        if self._incr:
+            res = self.bridge.call("poll", self._dargs())
+            reopened = bool(res.get("boot") and self.app_boot and res["boot"] != self.app_boot)
+            d = self._observed(res, source="reopened" if reopened else None)
+            if res.get("boot"):
+                self.app_boot = res["boot"]
+        else:
+            res = self.bridge.call("poll", self._args(known=self._known(self.view)))
+            recs = res["records"]
+            self._learn(recs)
+            reopened = bool(res.get("boot") and self.app_boot and res["boot"] != self.app_boot)
+            d = self._absorb_human(self.view, recs, source="reopened" if reopened else None)
+            if res.get("boot"):
+                self.app_boot = res["boot"]
+            self.view = recs
+            self._set_selected(cid for cid, r in recs.items() if r.get("selected"))
         applied = self._apply_requests(res)
         if d or reopened or applied:                  # 人只点了"交还"、场景没变，也要落盘（重启后交还还在）
             self._save()
@@ -295,9 +539,9 @@ class SharedSession:
         if self._doubts:
             return ObserveResult([], Diff(), "之前有一次执行的结果还没收到，查清之前不能告诉你最新的变化"
                                               "（说不准哪些是谁做的）。稍后再看。")
-        av = self.agent_views[agent]
-        lines = describe_changes(av.recs, self.view, av.values, self.values, self.labels, who=self._who_for(agent))
-        diff = diff_records(av.recs, self.view)
+        old, new, old_values, new_values = self._since_look(agent)
+        lines = describe_changes(old, new, old_values, new_values, self.labels, who=self._who_for(agent))
+        diff = diff_records(old, new)
         self._see(agent)
         text = ("你上次看场景之后，发生了这些变化：\n" + "\n".join("- " + x for x in lines)) if lines else "你上次看场景之后没有变化。"
         return ObserveResult(lines, diff, text)
@@ -309,7 +553,9 @@ class SharedSession:
         if not d:
             return d
         self.detections.append({"time": time.time(), "changes": d.describe(), **({"source": source} if source else {})})
-        ud = diff_records(self._units(old), self._units(new))
+        ids = d.ids                                  # 只展开变了的对象（以前整个场景的每个面都展开一遍）
+        ud = diff_records(self._units({c: old[c] for c in ids if c in old}),
+                          self._units({c: new[c] for c in ids if c in new}))
 
         def record(uid: str, content: dict) -> None:
             if source is not None:
@@ -348,12 +594,14 @@ class SharedSession:
 
     def _last_author(self, cid: str, face: Optional[str]) -> Optional[str]:
         if face is not None and self.granularity == ASPECT:
-            obj = self.rt.objects.get(f"{cid}#{face}")
+            obj = self.rt.objects.peek(f"{cid}#{face}")
         else:
-            obj = self.rt.objects.get(cid)
+            obj = self.rt.objects.peek(cid)
             if obj is None:
                 obj = next((o for u, o in self.rt.objects.items() if split_unit(u)[0] == cid), None)
-        return obj.versions[-1].author_id if obj is not None and obj.versions else None
+        if obj is not None and obj.versions:
+            return obj.versions[-1].author_id
+        return obj.baseline_author if obj is not None and obj.baseline_author != BASELINE_ACTOR else None
 
     def _who_for(self, recipient: Optional[str]):
         def who(cid: str, face: Optional[str]) -> str:
@@ -464,7 +712,7 @@ class SharedSession:
             res = self.bridge.call("finish_agent", self._args(token=b["token"], error=error))
             self._tokens.pop(args.get("permit_id"), None)
             return res
-        before = self.bridge.call("poll", args)["records"]
+        before = self.bridge.call("poll", {k: v for k, v in args.items() if k not in ("delta", "since")})["records"]
         expected = args.get("expected")
         if expected is not None:
             changed = sorted((set(before) ^ set(expected))
@@ -543,9 +791,10 @@ class SharedSession:
                 self._see(agent)
         if self._doubts:
             self._resolve_in_doubt()                  # 先查清上一次没收到结果的执行
-        av = self.agent_views[agent]
         keep_cand = self.rt.human_touched_policy == POLICY_CANDIDATE
-        known = {cid: {"fp": r["fp"], "aspects": r["aspects"]} for cid, r in av.recs.items()}
+        known = None
+        if not self._incr:                           # 不支持只传变化的接入代码：带上这个 AI 看到的整个场景（决定带回哪些值）
+            known = {cid: {"fp": r["fp"], "aspects": r["aspects"]} for cid, r in self._agent_recs(agent).items()}
         replans = 0
         while True:
             permit = self.rt.admit(agent)
@@ -557,7 +806,9 @@ class SharedSession:
                 self.rt.close_permit(permit, [])
                 return self._with_notes(self._blocked_report(agent, prep.blocked))
             args = dict(code=prep.code, protected=plan, protect=protect, keep_candidates=keep_cand,
-                        granularity=self.granularity, known=known, permit_id=permit.permit_id)
+                        granularity=self.granularity, permit_id=permit.permit_id)
+            if known is not None:
+                args["known"] = known
             if permit.keep_alive and protect:
                 args["keep_alive"] = sorted(permit.keep_alive)       # 祖先：不许删，面可以改（12.6）
             if permit.reidentify and protect:
@@ -572,14 +823,17 @@ class SharedSession:
                 if permit.no_recreate:
                     args["no_recreate"] = permit.no_recreate
             if protect:
-                args["expected"] = {cid: r["fp"] for cid, r in self.view.items()}
+                if not self._incr:                   # 只传变化时，执行前的状态就是对齐到的代号（since）
+                    args["expected"] = {cid: r["fp"] for cid, r in self.view.items()}
                 if self.rt.selection_occupies:
                     args["expected_selection"] = sorted(self.selected)
+            elif self._incr:
+                args["check"] = False                 # 对照组：不核对，执行前没看到的变化随结果交回（pre）
             self.rt.dispatched(permit)
             self._doubts[permit.permit_id] = self._doubt_record(permit, prep, label, protect, agent, plan)
             self._save()                              # 发出之前落盘：代理在执行期间退出，重启后也知道这次结果未知
             try:
-                res = (executor or (lambda a: self.bridge.call("run_agent", a)))(self._args(**args))
+                res = (executor or (lambda a: self.bridge.call("run_agent", a)))(self._dargs(**args))
             except Exception as e:                    # noqa: BLE001  发出去了，结果没收到
                 return self._lost(permit, e)
             if res["status"] not in ("replan", "deferred"):
@@ -593,11 +847,15 @@ class SharedSession:
                 return self._with_notes(AgentReport(status="deferred", agent=agent, text=(
                     "这次没有执行：人正在编辑模式里修改 " + "、".join(names) + "。等人退出编辑模式后再试。")))
             # 人在上次轮询之后刚改过（或者刚换了选中）：先记下来，再重开许可单
-            self.labels = res.get("labels", self.labels)
-            self._learn(res["before"])
-            self._absorb_human(self.view, res["before"])
-            self.view = res["before"]
-            self._set_selected(res.get("selected", [cid for cid, r in self.view.items() if r.get("selected")]))
+            if res.get("delta"):
+                self._observed(res)
+                self._set_selected(res.get("selected", sorted(self.selected)))
+            else:
+                self.labels = res.get("labels", self.labels)
+                self._learn(res["before"])
+                self._absorb_human(self.view, res["before"])
+                self.view = res["before"]
+                self._set_selected(res.get("selected", [cid for cid, r in self.view.items() if r.get("selected")]))
             replans += 1
             if replans > max_replan:
                 self._save()
@@ -611,9 +869,10 @@ class SharedSession:
     def _doubt_record(self, permit, prep, label: str, protect: bool, agent: str, plan: dict) -> dict:
         """结果没收到时，查清之后结算要用的东西。可以落盘（只有基本类型），代理重启后也能接着查。"""
         cmds = prep.commands
+        # 发出前运行时以为的场景：不复制整个场景，之后哪个对象变了再记下它那一刻的样子（old，见 _remember）
         return {"permit": permit.permit_id, "agent": agent, "label": label, "protect": protect, "plan": plan,
                 "keep_alive": sorted(permit.keep_alive) if protect else [],
-                "view": dict(self.view), "since": time.time(), "boot": self.app_boot,
+                "old": {}, "gen": self.obs_gen, "since": time.time(), "boot": self.app_boot,
                 "prep": {"code": "", "refused": sorted(prep.refused), "refused_deletes": sorted(prep.refused_deletes),
                          "commands": cmds, "executed": [cmds.index(e) for e in prep.executed] if cmds else []}}
 
@@ -624,28 +883,48 @@ class SharedSession:
         return _Prepared("", set(p.get("refused") or ()), set(p.get("refused_deletes") or ()), cmds,
                          [cmds[i] for i in p.get("executed") or ()] if cmds else [])
 
+    def _result_states(self, res: dict) -> tuple[Records, Records, Records, set[str]]:
+        """应用交回的执行前、执行后（恢复前）、最终的场景（整份，没变的对象和 view 里是同一个记录），
+        以及变了的对象。只传变化的接入代码（delta）：执行前就是 view（执行前已经核对过代号），之后两份只带变了的。"""
+        if res.get("delta"):
+            before = dict(self._view)
+            raw, after = _overlay(before, res["raw"]), _overlay(before, res["final"])
+            touched = {c for d in (res["raw"], res["final"]) for c in list(d.get("changed") or ()) + list(d.get("deleted") or ())}
+            return before, raw, after, touched
+        before, raw, after = res["before"], res["after_raw"], res["after"]
+        return before, raw, after, _changed_groups(before, raw, after)
+
     def _complete(self, permit, prep, res: dict, label: str, protect: bool, agent: str, plan: dict) -> AgentReport:
         """应用交回了结果：认回、核对、记账、写说明（第 2 节 ③④）。结果没收到、之后查回来的也走这里。"""
-        av = self.agent_views[agent]
-        before, after, raw = res["before"], res["after"], res["after_raw"]
         self.aliases.update(res.get("aliases") or {})
-        self.labels = res.get("labels", self.labels)
-        self._learn(before)
-        before_values = {cid: dict(self.values.get(cid, {})) for cid in before}
-        # 1. 执行前已经核对过，这里正常为空；接入代码没有核对时（例如旧版本），按人的修改补记
-        human_since = self._absorb_human(self.view, before)
+        self.labels = res.get("labels") or self.labels
+        # 1. 执行前已经核对过，这里正常为空；接入代码没有核对时（对照组、旧版本），按人的修改补记
+        human_since = Diff()
+        if res.get("delta") and res.get("pre"):
+            human_since = self._observed(res["pre"])
+        before, raw, after, touched = self._result_states(res)
+        if not res.get("delta"):
+            self._learn(before)
+            human_since = self._absorb_human(self.view, before)
+            self.view = before
         if "selected" in res:
             self._set_selected(res["selected"])
         # 2. 这个 AI 上次看之后错过的变化（人做的、别的 AI 做的），带具体的值
-        missed = describe_changes(av.recs, before, av.values, before_values, self.labels, who=self._who_for(agent))
-        missed_diff = diff_records(av.recs, before)
-        raw_values = {cid: r.get("values", {}) for cid, r in raw.items()}
-        self._learn(after)
+        old, new, old_values, new_values = self._since_look(agent)
+        missed = describe_changes(old, new, old_values, new_values, self.labels, who=self._who_for(agent))
+        missed_diff = diff_records(old, new)
+        # 只看变了的对象（还有类型化命令执行前就拒掉的）：三份里都一样的单元，核对时什么也不做（design_v0.5.md 第 16 节）
+        rel = set(touched) | {split_unit(u)[0] for u in prep.refused} | set(prep.refused_deletes)
+        before_values = {cid: dict(self.values.get(cid, {})) for cid in rel}
+        raw_values = {cid: dict(raw[cid].get("values") or {}) for cid in rel if cid in raw}
+        self._learn({cid: after[cid] for cid in rel if cid in after})
 
         # 3. 按应用交回的实际状态核对、记账。由运行时决定（P9）；说明只从运行时的记录生成
         self._n_step += 1
         step_id = f"ai-{self._n_step}" + (f"-{label}" if label else "")
-        ub, ua, ur = self._units(before), self._units(after), self._units(raw)
+        sub = lambda recs: {c: recs[c] for c in rel if c in recs}         # noqa: E731
+        ub, ua, ur = self._units(sub(before)), self._units(sub(after)), self._units(sub(raw))
+        rows = (_rows(before), _rows(raw), _rows(after))
         self.rt.add_step(step_id, inputs=[], outputs=sorted(diff_records(ub, ua).ids))
         rep = AgentReport(status="ok", agent=agent, step_id=step_id, missed=missed, missed_diff=missed_diff,
                           human_since=human_since, outside=res.get("outside", {}),
@@ -657,7 +936,7 @@ class SharedSession:
         if protect:
             st = self.rt.settle(permit, ub, ur, ua, step_id=step_id, produce_type=OBJECT_TYPE,
                                 refused=prep.refused, refused_deletes=prep.refused_deletes,
-                                identity=res.get("identity") if permit.reidentify else None)
+                                identity=res.get("identity") if permit.reidentify else None, rows=rows)
             self._report_from(rep, st, before, raw, after)
         else:
             self._control_accounting(rep, permit, step_id, ub, ua, ur, before, raw)
@@ -681,11 +960,15 @@ class SharedSession:
                     rep.partial[display(after.get(cid) or before.get(cid), cid)] = {
                         "kept": sorted(kept), "restored": sorted(skipped)}
         self.view = after
+        if res.get("delta"):
+            self.obs_gen = res.get("gen", self.obs_gen)
+            if res.get("sel") is not None:
+                self._sync_selected(res["sel"])
         self._see(agent)
         rep.conflicts = self._conflicts(rep, before, raw, after, before_values, raw_values)
         rep.facts = self._facts(rep)
         if protect:
-            rep.derived = self._derived(before, after)
+            rep.derived = self._derived(before, after, rel)
         rep.text = self._describe(rep, before, after, before_values, raw_values)
         if rep.commands:
             cl = self._command_lines(rep)
@@ -758,7 +1041,7 @@ class SharedSession:
         agent = d["agent"]
         head = "你之前有一次执行的结果没收到（" + str(d.get("reason") or "") + "），现在查清了："
         if not self.capabilities.get("journal"):
-            recs = self.bridge.call("poll", self._args())["records"]
+            recs = self._list_all()
             return self._unattributed(pid, d, permit, recs, "接入代码不记执行结果")
         q = self.bridge.call("result", self._args(permit_id=pid))
         entry, boot = q.get("entry"), q.get("boot")
@@ -776,7 +1059,7 @@ class SharedSession:
                 # 收尾在应用里出错，接入代码会记 failed；还是 begun 说明请求没到应用（传输的问题）：继续等
                 e2 = self.bridge.call("result", self._args(permit_id=pid)).get("entry") or {}
                 if e2.get("status") == "failed":
-                    recs = self.bridge.call("poll", self._args())["records"]
+                    recs = self._list_all()
                     return self._unattributed(pid, d, permit, recs, "工具调用之后的收尾出错，结果交不回来", boot,
                                               executed=True)
                 if e2.get("status") != "done":
@@ -791,7 +1074,7 @@ class SharedSession:
             self.rt.close_permit(permit, [])           # 应用没执行（没收到，或者执行前场景变了）
             self._apply_requests((entry or {}).get("result") or {})
             return AgentReport(status="not_executed", agent=agent, text=head + "那次没有执行，场景没有被它改动。需要的话请重新执行。")
-        recs = self.bridge.call("poll", self._args())["records"]
+        recs = self._list_all()
         if status in ("started", "failed", "begun") or (same_boot and q.get("seen")):
             why = {"started": "执行开始了，但没有交回结果", "failed": "执行了，但收尾出错，结果交不回来",
                    "begun": "工具调用开始了，收尾的状态没了"}.get(status, "收到过这张许可单，结果已经不在日志里")
@@ -802,11 +1085,11 @@ class SharedSession:
 
     def _unattributed(self, pid: str, d: dict, permit, recs: Records, why: str, boot: Optional[str] = None,
                       executed: bool = False) -> AgentReport:
-        """查不回来：发出前运行时以为的场景（d["view"]）和现在不一样的地方，说不准是这次执行改的还是人改的。
+        """查不回来：发出前运行时以为的场景（_doubt_view）和现在不一样的地方，说不准是这次执行改的还是人改的。
         如实记为来源不明，按人的修改保护（人交还之后 AI 才能改），提醒人。
         executed：确知 AI 的代码执行了（开始了、没交回结果，14.8）。这时许可单里要保持、现在又不一样的部分，
         可能是 AI 改了、没恢复成：和违规一样，单独告诉人，暂停这个 AI，等人看过再继续。"""
-        diff = self._absorb_human(d["view"], recs, source="unattributed")
+        diff = self._absorb_human(self._doubt_view(d), recs, source="unattributed")
         self._learn(recs)
         self.view = recs
         if boot is not None:
@@ -838,9 +1121,21 @@ class SharedSession:
                 + ("AI 已暂停，处理好之后让它继续（resume_agent）。" if rep.suspended else ""))) if x)
         return rep
 
+    def _doubt_view(self, d: dict) -> Records:
+        """发出前运行时以为的场景：现在的 view，加上之后变了的对象那一刻的样子（old）。旧账本（format 1）里是整份 view。"""
+        if "view" in d:
+            return d["view"]
+        out = dict(self._view)
+        for c, r in (d.get("old") or {}).items():
+            if r is None:
+                out.pop(c, None)
+            else:
+                out[c] = r
+        return out
+
     def _suspect(self, d: dict, recs: Records) -> list[str]:
         """许可单里要保持的部分（以及不许删的祖先），现在和发出前不一样的对象（14.8）。"""
-        view, out = d["view"], set()
+        view, out = self._doubt_view(d), set()
         for g, faces in (d.get("plan") or {}).items():
             b, a = view.get(g), recs.get(g)
             if b is None:
@@ -913,72 +1208,253 @@ class SharedSession:
     # ------------------------------------------------------------------
     # 账本落盘（design_v0.5.md 14.3）
     # ------------------------------------------------------------------
-    def _state(self) -> dict:
-        return {"format": 1, "document": self.capabilities.get("document"), "boot": self.app_boot,
-                "scene": self.scene, "granularity": self.granularity, "human": self.human,
-                "runtime": self.rt.to_state(), "view": self.view, "values": self.values,
-                "selected": sorted(self.selected),
-                "agent_views": {a: {"recs": v.recs, "values": v.values, "versions": v.versions, "time": v.time}
-                                for a, v in self.agent_views.items()},
+    # 账本是追加写的日志（design_v0.5.md 第 16 节）：第一行是整份记录（运行时 + 会话的小字段），场景的观察缓存
+    # （view、values、每个 AI 的视图）单独存一个文件；之后每次只追加这一步的变化。日志长了再整份重写（压缩），
+    # 照旧先写临时文件再改名，存到一半退出也不会留下坏文件。
+    COMPACT_LINES = 2000
+    COMPACT_BYTES = 4 << 20
+
+    def _small_state(self) -> dict:
+        return {"document": self.capabilities.get("document"), "boot": self.app_boot, "scene": self.scene,
+                "granularity": self.granularity, "human": self.human, "selected": sorted(self.selected),
                 "agent_names": self.agent_names, "human_deleted": self.human_deleted, "aliases": self.aliases,
                 "labels": self.labels, "n_op": self._n_op, "n_step": self._n_step, "doubts": self._doubts,
-                "tokens": self._tokens, "notes": self._notes, "alerted": sorted(list(x) for x in self._alerted)}
+                "tokens": self._tokens, "notes": self._notes, "alerted": sorted(list(x) for x in self._alerted),
+                "obs_gen": self.obs_gen, "av_time": {a: v.time for a, v in self.agent_views.items()}}
+
+    def _apply_small(self, st: dict) -> None:
+        if "selected" in st:
+            self.selected = set(st["selected"])
+        if "agent_names" in st:
+            self.agent_names.update(st["agent_names"])
+        for k, attr in (("human_deleted", "human_deleted"), ("aliases", "aliases"), ("labels", "labels"),
+                        ("n_op", "_n_op"), ("n_step", "_n_step"), ("doubts", "_doubts"), ("tokens", "_tokens"),
+                        ("notes", "_notes"), ("obs_gen", "obs_gen"), ("boot", "_saved_boot")):
+            if k in st:
+                setattr(self, attr, st[k])
+        if "alerted" in st:
+            self._alerted = {tuple(x) for x in st["alerted"]}
+        for a, t in (st.get("av_time") or {}).items():
+            self.agent_views.setdefault(a, AgentView()).time = t
+
+    @staticmethod
+    def _dumps(v) -> str:
+        return json.dumps(v, ensure_ascii=False, sort_keys=True, default=str)
 
     def _save(self) -> None:
-        """每次执行、发现变化之后存一次（先写临时文件再改名，存到一半退出也不会留下坏文件）。"""
+        """每次执行、发现变化之后存一次：追加这一步的变化；还没有整份记录、或者日志太长了，就整份重写。"""
         if not self.ledger_path:
             return
-        tmp = self.ledger_path + ".tmp"
-        os.makedirs(os.path.dirname(os.path.abspath(self.ledger_path)), exist_ok=True)
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(self._state(), fh, ensure_ascii=False)
-        os.replace(tmp, self.ledger_path)
+        m = self._ledger_meta
+        if (m.get("path") != self.ledger_path or m.get("lines", 0) >= self.COMPACT_LINES
+                or m.get("bytes", 0) >= max(self.COMPACT_BYTES, m.get("obs_bytes", 0))):
+            self._write_snapshot()
+            return
+        line = self._dumps(self._delta()) + "\n"
+        with open(self.ledger_path, "a", encoding="utf-8") as fh:
+            fh.write(line)
+        m["lines"] = m.get("lines", 0) + 1
+        m["bytes"] = m.get("bytes", 0) + len(line.encode("utf-8"))
+
+    def _delta(self) -> dict:
+        d: dict = {"t": "d"}
+        saved = self._ledger_meta.setdefault("small", {})
+        ss = {}
+        for k, v in self._small_state().items():
+            js = self._dumps(v)
+            if saved.get(k) != js:
+                ss[k] = v
+                saved[k] = js
+        if ss:
+            d["ss"] = ss
+        rt = self.rt.take_delta()
+        if rt:
+            d["rt"] = rt
+        if self._dirty_view:
+            d["view"] = {c: self._view.get(c) for c in sorted(self._dirty_view)}
+        if self._dirty_values:
+            d["values"] = {c: self.values.get(c) for c in sorted(self._dirty_values)}
+        av = {}
+        for a, x in self._av_dirty.items():
+            v = self.agent_views.get(a)
+            if v is None:
+                continue
+            av[a] = {"reset": bool(x.get("reset")), "old": {c: v.old[c] for c in x.get("old", ()) if c in v.old},
+                     "old_values": {c: v.old_values[c] for c in x.get("old_values", ()) if c in v.old_values}}
+        if av:
+            d["av"] = av
+        self._dirty_view, self._dirty_values, self._av_dirty = set(), set(), {}
+        return d
+
+    def _write_snapshot(self) -> None:
+        """整份重写：观察缓存先写进一个新文件，再写账本（第一行引用它），最后删掉旧的观察缓存。
+        基线换成现在的场景：没建记录的单元从开始到现在都没变过，它的基线就是现在的样子（建了记录的自己带着版本 0）。"""
+        path = self.ledger_path
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        snap = time.strftime("%Y%m%d%H%M%S") + "-" + os.urandom(3).hex()
+        obs_path = f"{path}.obs.{snap}"
+        obs = {"format": 2, "snap": snap, "view": self._view, "values": self.values,
+               "agent_views": {a: {"old": v.old, "old_values": v.old_values, "time": v.time}
+                               for a, v in self.agent_views.items()}}
+        with open(obs_path + ".tmp", "w", encoding="utf-8") as fh:
+            json.dump(obs, fh, ensure_ascii=False)
+        os.replace(obs_path + ".tmp", obs_path)
+        if self.sparse:
+            self.baseline = dict(self._view)
+        small = self._small_state()
+        head = self._dumps({"t": "snap", "format": 2, "obs": os.path.basename(obs_path), "ss": small,
+                            "rt": self.rt.snapshot()}) + "\n"
+        with open(path + ".tmp", "w", encoding="utf-8") as fh:
+            fh.write(head)
+        os.replace(path + ".tmp", path)
+        self._drop_old_obs(os.path.basename(obs_path))
+        self._dirty_view, self._dirty_values, self._av_dirty = set(), set(), {}
+        self._ledger_meta = {"path": path, "lines": 0, "bytes": len(head.encode("utf-8")),
+                             "obs_bytes": os.path.getsize(obs_path),
+                             "small": {k: self._dumps(v) for k, v in small.items()}}
+
+    def _drop_old_obs(self, keep: str) -> None:
+        folder = os.path.dirname(os.path.abspath(self.ledger_path))
+        prefix = os.path.basename(self.ledger_path) + ".obs."
+        for name in os.listdir(folder):
+            if name.startswith(prefix) and name != keep:
+                try:
+                    os.remove(os.path.join(folder, name))
+                except OSError:
+                    pass
 
     def _load(self, path: str) -> bool:
-        """接着存下的账本用。必须是同一个文档（接入代码报的 document）、同样的粒度，否则不用（返回 False）。"""
+        """接着存下的账本用。必须是同一个文档（接入代码报的 document）、同样的粒度，否则不用（返回 False）。
+        认两种：追加写的日志（format 2）；整份重写的旧账本（format 1，读进来之后下一次落盘整份重写成 format 2）。"""
         try:
             with open(path, encoding="utf-8") as fh:
-                st = json.load(fh)
+                first = fh.readline()
+                head = json.loads(first)
+                rest = fh.read() if head.get("t") == "snap" else None
         except (OSError, ValueError):
-            return False
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    head = json.load(fh)
+                rest = None
+            except (OSError, ValueError):
+                return False
+        if head.get("format") == 1:
+            return self._load_v1(head)
+        ss = head.get("ss") or {}
         doc = self.capabilities.get("document")
-        if (st.get("format") != 1 or doc is None or st.get("document") != doc
-                or st.get("granularity") != self.granularity or st.get("scene") != self.scene):
+        if (head.get("format") != 2 or doc is None or ss.get("document") != doc
+                or ss.get("granularity") != self.granularity or ss.get("scene") != self.scene):
+            return False
+        try:
+            with open(os.path.join(os.path.dirname(os.path.abspath(path)), head["obs"]), encoding="utf-8") as fh:
+                obs = json.load(fh)
+        except (OSError, ValueError, KeyError):
             return False
         app = dict(self.rt.app)                      # 这次连接测出来的能力为准
+        self.rt.load_state(head["rt"])
+        self._view, self.values = dict(obs["view"]), {c: dict(v) for c, v in obs["values"].items()}
+        self.agent_views = {a: AgentView(dict(v["old"]), {c: dict(x) for c, x in v["old_values"].items()}, v["time"])
+                            for a, v in obs["agent_views"].items()}
+        self._apply_small(ss)
+        if self.sparse:
+            self._use_baseline(self._view)
+        n, nbytes = 0, len(first.encode("utf-8"))
+        for line in (rest or "").splitlines():
+            try:
+                d = json.loads(line)
+            except ValueError:
+                break                                # 最后一行没写完（存到一半退出）：到这里为止
+            self._replay(d)
+            n += 1
+            nbytes += len(line.encode("utf-8")) + 1
+        self.rt.app = app
+        self.rt._mark_saved()
+        self._finish_load()
+        self._dirty_view, self._dirty_values, self._av_dirty = set(), set(), {}
+        self._ledger_meta = {"path": path, "lines": n, "bytes": nbytes,
+                             "obs_bytes": os.path.getsize(os.path.join(os.path.dirname(os.path.abspath(path)), head["obs"])),
+                             "small": {k: self._dumps(v) for k, v in self._small_state().items()}}
+        return True
+
+    def _replay(self, d: dict) -> None:
+        if d.get("rt"):
+            self.rt.apply_delta(d["rt"])
+        for c, r in (d.get("view") or {}).items():
+            if r is None:
+                self._view.pop(c, None)
+            else:
+                self._view[c] = r
+        for c, v in (d.get("values") or {}).items():
+            if v is None:
+                self.values.pop(c, None)
+            else:
+                self.values[c] = dict(v)
+        for a, x in (d.get("av") or {}).items():
+            av = self.agent_views.setdefault(a, AgentView())
+            if x.get("reset"):
+                av.old, av.old_values = {}, {}
+            av.old.update(x.get("old") or {})
+            av.old_values.update({c: dict(v) for c, v in (x.get("old_values") or {}).items()})
+        if d.get("ss"):
+            self._apply_small(d["ss"])
+
+    def _load_v1(self, st: dict) -> bool:
+        """旧账本（format 1，整份重写）：照旧读进来，没人改过的单元也都建了记录（下一次落盘整份重写成 format 2）。"""
+        doc = self.capabilities.get("document")
+        if (doc is None or st.get("document") != doc
+                or st.get("granularity") != self.granularity or st.get("scene") != self.scene):
+            return False
+        app = dict(self.rt.app)
         self.rt.load_state(st["runtime"])
         self.rt.app = app
-        for actor, kind in ((self.human, ActorKind.HUMAN), (BASELINE_ACTOR, ActorKind.AGENT)):
-            if actor not in self.rt.actors:
-                self.rt.register_actor(actor, kind)
-        self.view, self.values = st["view"], st["values"]
+        self._view, self.values = dict(st["view"]), {c: dict(v) for c, v in st["values"].items()}
         self.selected = set(st["selected"])
-        self.agent_views = {a: AgentView(v["recs"], v["values"], v["versions"], v["time"])
-                            for a, v in st["agent_views"].items()}
+        self.agent_views = {}
+        for a, v in st["agent_views"].items():           # 那时存的是整份：只留和现在不一样的
+            av = self.agent_views[a] = AgentView(time=v["time"])
+            recs, vals = v["recs"], v["values"]
+            for c in set(recs) | set(self._view):
+                if recs.get(c) != self._view.get(c):
+                    av.old[c] = recs.get(c)
+                    av.old_values[c] = dict(vals.get(c) or {})
         self.agent_names.update(st["agent_names"])
-        for a in self.agent_names:
-            if a not in self.rt.actors:
-                self.rt.register_actor(a, ActorKind.AGENT)
         self.human_deleted, self.aliases = st["human_deleted"], st["aliases"]
         self.labels, self._n_op, self._n_step = st["labels"], st["n_op"], st["n_step"]
         self._doubts, self._tokens, self._notes = st["doubts"], st["tokens"], st["notes"]
         self._alerted = {tuple(x) for x in st["alerted"]}
+        if self.sparse:
+            self._use_baseline(self._view)
+        self._finish_load()
+        self._ledger_meta = {}                           # 下一次落盘整份重写
+        return True
+
+    def _finish_load(self) -> None:
+        for actor, kind in ((self.human, ActorKind.HUMAN), (BASELINE_ACTOR, ActorKind.AGENT)):
+            if actor not in self.rt.actors:
+                self.rt.register_actor(actor, kind)
+        for a in self.agent_names:
+            if a not in self.rt.actors:
+                self.rt.register_actor(a, ActorKind.AGENT)
         self._started = True
         for a in self.agent_names:
-            if a not in self.agent_views:
+            if a not in self.agent_views or a not in self.rt.seen:
                 self._see(a)
-        return True
 
     def _reconcile(self) -> Records:
         """接着存下的账本，和现在的场景对一遍：先查清结果没收到的执行；剩下的差异是代理没运行期间发生的，
         说不准是谁做的（人，或者绕过代理的工具），记为来源不明，按人的修改保护（14.3）。"""
         self._resolve_in_doubt()
-        res = self.bridge.call("poll", self._args(known=self._known(self.view)))
-        recs = res["records"]
-        self._learn(recs)
+        if self._incr:                               # 同一个 Blender 进程还在：只收上次落盘之后的变化
+            res = self.bridge.call("poll", self._dargs())
+        else:
+            res = self.bridge.call("poll", self._args(known=self._known(self.view)))
+            self._learn(res["records"])
         if not self._doubts:
-            d = self._absorb_human(self.view, recs, source="offline")
-            self.view = recs
+            if self._incr:
+                d = self._observed(res, source="offline")
+            else:
+                d = self._absorb_human(self.view, res["records"], source="offline")
+                self.view = res["records"]
             if d:
                 names = sorted(r["name"] for r in list(d.created.values()) + list(d.deleted.values()))
                 names += sorted(new["name"] for _, new in d.modified.values())
@@ -987,7 +1463,8 @@ class SharedSession:
                                     + "。如果是 AI 改的、你同意它继续改，请交还给它。")
         if res.get("boot"):
             self.app_boot = res["boot"]
-        self._set_selected(cid for cid, r in self.view.items() if r.get("selected"))
+        if not self._incr:
+            self._set_selected(cid for cid, r in self.view.items() if r.get("selected"))
         self._apply_requests(res)
         self._save()
         return self.view
@@ -1026,7 +1503,9 @@ class SharedSession:
         if not entries:
             return "找不到这次认回（或者已经拆开过）"
         e = entries[-1]
-        res = self.bridge.call("unmatch", self._args(permit_id=e["permitId"], old=old))
+        res = self.bridge.call("unmatch", self._dargs(permit_id=e["permitId"], old=old))
+        if res.get("pre"):                             # 只传变化：拆开之前运行时还没看到的变化，先照常记（人的修改）
+            self._observed(res["pre"])
         if res.get("status") != "ok":
             return {"changed": "之后又改过，不能自动拆开", "unavailable": "拆开用的材料已经没有了"}.get(
                 res.get("status"), str(res.get("status")))
@@ -1048,7 +1527,13 @@ class SharedSession:
                 self.rt.human_edit(self.human, uid, {**DELETED, **{k: content[k] for k in ("name", "type", "parent", "kind")
                                                                    if content.get(k) is not None}}, occupy=False)
         self._learn(after)
-        self.view = after
+        if res.get("delta"):
+            self._set_records(after, res.get("deleted") or ())
+            self.obs_gen = res.get("gen", self.obs_gen)
+            if res.get("sel") is not None:
+                self._sync_selected(res["sel"])
+        else:
+            self.view = after
         self.rt.mark_unmatched(self.human, e["permitId"], old, new)
         name, new_name = display(after.get(old), old), display(after.get(new), new)
         self._notes.setdefault(e["agent"], []).append(
@@ -1115,7 +1600,7 @@ class SharedSession:
             facts.append({"object": n, "fact": "deleted", "owner": "human"})
         return facts
 
-    def _derived(self, before: Records, after: Records) -> list[dict]:
+    def _derived(self, before: Records, after: Records, changed=None) -> list[dict]:
         """派生改动，只告知（prior_art_solutions.md 问题三）：
         - copy：AI 新建的数据块是已有数据块的副本（去掉探测出的重名后缀后同名同类型，例如材质 X → X.001）。
           用副本的对象之后不再跟着原来的变，人改原来的也不会跟着变（Unity 的 Renderer.material 就会这样克隆）；
@@ -1123,23 +1608,31 @@ class SharedSession:
           人在它上面的修改在这些对象上看不到了。"""
         suffix = self.capabilities.get("suffix")
         out: list[dict] = []
+        changed = set(before) | set(after) if changed is None else set(changed)
         if suffix:
             names = {(r.get("type"), r["name"]): cid for cid, r in before.items() if r.get("kind") == "data"}
-            for cid, r in sorted(after.items()):
+            for cid in sorted(c for c in changed if c in after):
+                r = after[cid]
                 if r.get("kind") != "data" or cid in before:
                     continue
                 base = strip_suffix(r["name"], suffix)
                 if base != r["name"] and (r.get("type"), base) in names:
                     out.append({"kind": "copy", "object": display(r, cid),
                                 "of": display(before[names[(r.get("type"), base)]], base)})
-        touched = {split_unit(u)[0] for u, o in self.rt.objects.items() if o.human_touched is not None}
-        for cid, r in sorted(before.items()):
-            a = after.get(cid)
-            if (r.get("kind") == "data" and a is not None and cid in touched
+        for cid in sorted(c for c in changed if c in before):
+            r, a = before[cid], after.get(cid)
+            if (r.get("kind") == "data" and a is not None and self._group_touched(cid, r)
                     and (a.get("users") or 0) < (r.get("users") or 0)):
                 out.append({"kind": "fewer_users", "object": display(r, cid), "before": r.get("users"),
                             "after": a.get("users")})
         return out
+
+    def _group_touched(self, cid: str, rec: Optional[dict] = None) -> bool:
+        """这个应用对象有没有人碰过（或来源不明）、还没交还的部分。"""
+        rec = rec or self._view.get(cid)
+        uids = {cid} if self.granularity == OBJECT else {f"{cid}#{a}" for a in (rec or {}).get("aspects", {})}
+        uids |= {u for u in self.rt.objects if split_unit(u)[0] == cid}      # 建了记录的（只在少见的情况下用到）
+        return any(self.rt.touched_by_human(u) for u in uids)
 
     def _fact_text(self, f: dict) -> str:
         who = "人" if f["owner"] == "human" else (self._display(f["owner"].removeprefix("agent:"), None).strip() or "别的 AI")
@@ -1497,7 +1990,10 @@ class SharedSession:
     # ------------------------------------------------------------------
     def hand_back(self, cid: str) -> None:
         """人把整个对象交还给 AI：同时结束占用。人的决定，马上落盘（只有交还、场景没变时也一样）。"""
-        for uid in [u for u in self.rt.objects if split_unit(u)[0] == cid]:
+        uids = {u for u in self.rt.objects if split_unit(u)[0] == cid}
+        if self.rt.baseline_owner is not None:        # 基线算人的：这个对象没建记录的基线单元也一起交还（建上记录）
+            uids |= set(self._base_units_of(cid))
+        for uid in sorted(uids):
             obj = self.rt.objects.get(uid)
             if obj is None:
                 continue

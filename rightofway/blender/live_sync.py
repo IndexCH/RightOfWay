@@ -60,10 +60,11 @@ class LiveSyncSession:
                  occupy_selection: bool = False, inline: bool = False) -> None:
         """inline=True：两个 Blender 不在同一台机器上时，对象通过 base64 传，而不是临时文件路径。"""
         self.rt, self.ai, self.ai_scene, self.g, self.inline = runtime, ai_bridge, ai_scene, granularity, inline
-        # 实时同步按对象搬运（export_objects / apply_sync），数据块还没有单独作为单元（design_v0.5.md 第 11 节第 5 步）
+        # 实时同步按对象搬运（export_objects / apply_sync），数据块还没有单独作为单元（design_v0.5.md 第 11 节第 5 步）。
+        # 这次的性能修复（第 16 节：稀疏账本、只传变化）不用在实时同步上：照旧每个单元建记录、整份观察
         self.hs = SharedSession(runtime, human_bridge, human=human, agent=agent, scene=human_scene,
                                 granularity=granularity, occupy_selection=occupy_selection, prefix="h-",
-                                data_units=False)
+                                data_units=False, sparse=False, incremental=False)
         self.base: Records = {}                # 上次同步后两边共同的状态（也就是 AI 窗口里当时的样子）
         self.base_versions: dict[str, int] = {}
         self.ai_values: Values = {}

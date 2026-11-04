@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import json
 import time
 import uuid
 from dataclasses import asdict
@@ -64,6 +65,104 @@ class ObservationError(ProtocolError):
     """R18：适配器报告的变化找不到可归属的对象，不能静默丢弃。"""
 
 
+_MISSING = object()
+
+
+class _Ledger(dict):
+    """账本里的单元 {编号: ObjectState}。
+
+    稀疏账本（Runtime.set_baseline，design_v0.5.md 第 16 节）：没人改过的单元不建记录，是"基线"（版本 0，没有作者，
+    内容由接入层提供）。第一次用到（被改、被交还……）时才建记录（_materialize）。所以：
+      ledger[uid]、ledger.get(uid)   基线单元也取得到（顺便建记录）；
+      uid in ledger                 基线单元也算在；
+      迭代、len、items()             只包括建了记录的；
+      ledger.peek(uid)              只看建了记录的，不建。
+    没有设基线时和普通的 dict 一样。"""
+
+    def __init__(self, rt: "Runtime") -> None:
+        super().__init__()
+        self._rt = rt
+
+    def __missing__(self, key: str) -> ObjectState:
+        obj = self._rt._materialize(key)
+        if obj is None:
+            raise KeyError(key)
+        return obj
+
+    def __contains__(self, key: object) -> bool:
+        return dict.__contains__(self, key) or (isinstance(key, str) and self._rt._baseline_content(key) is not None)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if dict.__contains__(self, key):
+            return dict.__getitem__(self, key)
+        obj = self._rt._materialize(key)
+        return default if obj is None else obj
+
+    def peek(self, key: str) -> Optional[ObjectState]:
+        return dict.get(self, key)
+
+
+class SeenMap:
+    """一个 Agent 上次看到的版本（R3）。看的那一刻只记下事件序号（mark_seen），某个单元当时是第几版，用到时再从它的历史里算：
+    那一刻之前的最后一个版本；从基线来、那时还没人改过的是 0；那时还不存在的返回 default。
+    explicit：直接给出的版本（mark_seen(versions=...)、旧的逐项提交里 Agent 刚写进去的版本），优先。
+    用起来和 {编号: 版本} 的 dict 一样（get、[]、in），但看一次不用复制全部单元的版本（以前每次 O(单元数)）。"""
+    __slots__ = ("rt", "seq", "explicit")
+
+    def __init__(self, rt: "Runtime", seq: Optional[int] = None, explicit: Optional[dict[str, int]] = None) -> None:
+        self.rt, self.seq, self.explicit = rt, seq, dict(explicit or {})
+
+    def get(self, uid: str, default: Any = None) -> Any:
+        if uid in self.explicit:
+            return self.explicit[uid]
+        if self.seq is None:
+            return default
+        obj = self.rt.objects.peek(uid)
+        if obj is not None:
+            for v in reversed(obj.versions):
+                if v.seq <= self.seq:
+                    return v.version
+            return 0 if obj.baseline is not None else default
+        return 0 if self.rt._baseline_content(uid) is not None else default
+
+    def __getitem__(self, uid: str) -> int:
+        v = self.get(uid, _MISSING)
+        if v is _MISSING:
+            raise KeyError(uid)
+        return v
+
+    def __contains__(self, uid: object) -> bool:
+        return isinstance(uid, str) and self.get(uid, _MISSING) is not _MISSING
+
+    def update(self, versions: dict[str, int]) -> None:
+        self.explicit.update(versions)
+
+    def copy(self) -> "SeenMap":
+        return SeenMap(self.rt, self.seq, self.explicit)
+
+    def items(self):
+        """建了记录的单元里，这个 Agent 看到过的 (编号, 版本)（显示、兼容用）。"""
+        for uid in list(self.rt.objects) + [u for u in self.explicit if not dict.__contains__(self.rt.objects, u)]:
+            v = self.get(uid, _MISSING)
+            if v is not _MISSING:
+                yield uid, v
+
+    def keys(self):
+        return [u for u, _ in self.items()]
+
+    def __iter__(self):
+        return iter(self.keys())
+
+    def to_json(self) -> dict:
+        return {"seq": self.seq, "explicit": dict(self.explicit)}
+
+    @classmethod
+    def from_json(cls, rt: "Runtime", d: Any) -> "SeenMap":
+        if isinstance(d, dict) and set(d) <= {"seq", "explicit"} and "explicit" in d:
+            return cls(rt, d.get("seq"), d.get("explicit"))
+        return cls(rt, None, dict(d or {}))            # 旧账本（format 1）：直接存的 {编号: 版本}
+
+
 class Runtime:
     def __init__(self, human_touched_policy: str = POLICY_DISCARD, selection_occupies: bool = False,
                  reserve_seconds: float = 30.0, pause_on_breach: bool = True, reidentify: bool = True,
@@ -86,7 +185,7 @@ class Runtime:
         self.human_touched_policy = human_touched_policy
         self.selection_occupies = selection_occupies          # R8 选项："选中即占用"
         self.reserve_seconds = reserve_seconds                # R23：被别的 Agent 抢先后，预留多少秒
-        self.seen: dict[str, dict[str, int]] = {}             # R3：每个 Agent 上次看到的每个对象的版本
+        self.seen: dict[str, SeenMap] = {}                    # R3：每个 Agent 上次看到的每个对象的版本
         self.selection: dict[str, set[str]] = {}              # 人 → 选中的应用对象（group_of 的结果）
         self.reservations: dict[str, tuple[str, float]] = {}  # 对象 → (预留给哪个 Agent, 到期时间)
         self.permits: dict[str, Permit] = {}
@@ -97,7 +196,7 @@ class Runtime:
         self.pause_on_breach = pause_on_breach                # 违规后暂停这个 Agent，等人处理（第 6 节）
         self.suspended: dict[str, dict] = {}                  # 被暂停的 Agent → 原因
         self.actors: dict[str, Actor] = {}
-        self.objects: dict[str, ObjectState] = {}
+        self.objects: _Ledger = _Ledger(self)
         self.capabilities: dict[str, CapabilityMeta] = {}
         self.steps: dict[str, Step] = {}
         self.ops: dict[str, Operation] = {}
@@ -105,6 +204,20 @@ class Runtime:
         self.paused = False
         self._seq = 0
         self._subscribers: list[Callable[[Event], None]] = []
+        # 稀疏账本（set_baseline）：没人改过的单元是基线，内容由接入层提供，不建记录
+        self._base_content: Optional[Callable[[str], Any]] = None
+        self._base_units: Optional[Callable[[], Iterable[str]]] = None
+        self._base_units_of: Optional[Callable[[str], Iterable[str]]] = None
+        self._base_row: Optional[Callable[[str], Optional[dict]]] = None
+        self.baseline_owner: Optional[str] = None       # 基线算谁改的：None 表示没人改过；人 → 全部按人改过保护
+        self.baseline_actor = "baseline"
+        self.baseline_type = "blob"
+        # 落盘只追加这一步的变化（take_delta）：上次落盘之后改过的单元、步骤，以及小字段上次落盘时的样子
+        self._dirty_objects: set[str] = set()
+        self._dirty_steps: set[str] = set()
+        self._saved_small: dict[str, str] = {}
+        self._saved_log = 0
+        self._readers_index: dict[str, list[str]] = {}       # 对象 → 读它的步骤（R12；以前每次都扫一遍全部步骤）
 
     # ------------------------------------------------------------------
     # 注册与基础设施
@@ -139,7 +252,65 @@ class Runtime:
                  assignee: str = "agent") -> Step:
         step = Step(step_id, list(inputs), list(outputs), assignee=assignee)
         self.steps[step_id] = step
+        self._index_step(step)
+        self._dirty_steps.add(step_id)
         return step
+
+    def _index_step(self, step: Step) -> None:
+        for oid in step.inputs:
+            ids = self._readers_index.setdefault(oid, [])
+            if step.step_id not in ids:
+                ids.append(step.step_id)
+
+    # ------------------------------------------------------------------
+    # 稀疏账本（design_v0.5.md 第 16 节）
+    # ------------------------------------------------------------------
+    def set_baseline(self, content: Callable[[str], Any], units: Callable[[], Iterable[str]],
+                     units_of: Callable[[str], Iterable[str]], row: Optional[Callable[[str], Optional[dict]]] = None,
+                     owner: Optional[str] = None, actor: str = "baseline", type_: str = "blob") -> None:
+        """没人改过的单元不建记录：它是基线（版本 0），内容由接入层按需提供（content(编号) → 内容，不在时 None）。
+        units()：全部基线单元的编号；units_of(应用对象)：它的基线单元；row(应用对象)：{"name", "type", "parent", ...}。
+        owner：基线算谁的。None（默认）表示没人改过，Agent 可以改；人的编号表示全部按人改过保护（initial_owner="human"），
+        用规则表示（admit 时展开），不逐个单元建记录。"""
+        self._base_content, self._base_units, self._base_units_of = content, units, units_of
+        self._base_row = row
+        self.baseline_owner, self.baseline_actor, self.baseline_type = owner, actor, type_
+
+    @property
+    def sparse(self) -> bool:
+        return self._base_content is not None
+
+    def _baseline_content(self, uid: str) -> Any:
+        return None if self._base_content is None else self._base_content(uid)
+
+    def _materialize(self, uid: str) -> Optional[ObjectState]:
+        """给一个基线单元建记录（版本 0 = 基线的内容）。不是基线单元返回 None。"""
+        content = self._baseline_content(uid)
+        if content is None:
+            return None
+        owner = self.baseline_owner
+        actor = self.actors.get(owner or self.baseline_actor)
+        obj = ObjectState(uid, self.baseline_type, baseline=content, baseline_author=owner or self.baseline_actor,
+                          baseline_kind=actor.kind if actor is not None else ActorKind.AGENT,
+                          human_touched=HumanTouched(by=owner, since_version=0) if owner else None)
+        dict.__setitem__(self.objects, uid, obj)
+        self._dirty_objects.add(uid)
+        return obj
+
+    def content_of(self, uid: str) -> Any:
+        """账本里这个单元现在的内容（基线单元也算），不建记录。不在账本里返回 None。"""
+        obj = self.objects.peek(uid)
+        return obj.content if obj is not None else self._baseline_content(uid)
+
+    def touched_by_human(self, uid: str) -> bool:
+        """人碰过（或来源不明）、还没交还的单元（基线单元按 owner 算），不建记录。"""
+        obj = self.objects.peek(uid)
+        if obj is not None:
+            return obj.human_touched is not None
+        return self.baseline_owner is not None and self._baseline_content(uid) is not None
+
+    def _touch(self, uid: str) -> None:
+        self._dirty_objects.add(uid)
 
     def subscribe(self, callback: Callable[[Event], None]) -> None:
         self._subscribers.append(callback)
@@ -190,13 +361,16 @@ class Runtime:
                         op_id: Optional[str] = None, step_id: Optional[str] = None,
                         restored_from: Optional[int] = None) -> VersionRecord:
         self._seq += 1
+        # 父版本：前一个版本；第一个版本没有父版本，除非它是从基线（版本 0）改出来的
+        parent = obj.version if obj.versions else (0 if obj.baseline is not None else None)
         rec = VersionRecord(
             version=obj.version + 1, content=content, author_id=author.actor_id,
             author_kind=author.kind, op_id=op_id, step_id=step_id,
-            parent_version=obj.version or None, seq=self._seq, restored_from=restored_from,
+            parent_version=parent, seq=self._seq, restored_from=restored_from,
         )
         obj.versions.append(rec)
         obj.retracted = False
+        self._dirty_objects.add(obj.object_id)
         # "人碰过"标记：人或外部修改时设置，AI 修改时清除（AI 只能改没被人碰过的对象）
         if author.kind in (ActorKind.HUMAN, ActorKind.EXTERNAL):
             obj.human_touched = HumanTouched(by=author.actor_id, since_version=rec.version)
@@ -484,6 +658,7 @@ class Runtime:
                 version=-1, content=writes.get(t.object_id), author_id=op.actor_id,
                 author_kind=ActorKind.AGENT, op_id=op.op_id, step_id=op.step_id,
                 parent_version=obj.version, seq=self._seq))
+            self._touch(t.object_id)
         op.status = OpStatus.CANDIDATE
         self._emit("result/candidate", opId=op.op_id, objects=[t.object_id for t in op.targets])
         self._maybe_finish_step(op)
@@ -534,8 +709,8 @@ class Runtime:
         """R3：记下这个 Agent 看到了哪些版本（它读了场景，或者它的一次执行完成了）。
         之后它按旧印象做的修改，以这些版本为基准判断是否过时（R4）。"""
         self._actor(agent_id)
-        self.seen[agent_id] = dict(versions) if versions is not None else {
-            oid: o.version for oid, o in self.objects.items()}
+        # 只记下看的那一刻（事件序号），某个单元当时是第几版用到时再算（SeenMap），不复制全部单元的版本
+        self.seen[agent_id] = SeenMap(self, explicit=versions) if versions is not None else SeenMap(self, self._seq)
 
     def set_selection(self, actor_id: str, groups: Iterable[str]) -> None:
         """R8 选项：人现在选中的应用对象。只有 selection_occupies 打开时才影响许可。"""
@@ -593,17 +768,23 @@ class Runtime:
             self.permits[permit.permit_id] = permit
             self._emit("permit/refused", permitId=permit.permit_id, agent=agent_id, reason=refusal["reason"])
             return permit
-        seen = self.seen.get(agent_id, {})
+        seen = self.seen.get(agent_id) or SeenMap(self)
         keep: dict[str, dict] = {}
+
+        def claimed(oid: str) -> bool:
+            hit = self._claim_conflict(agent_id, oid)
+            if hit is None:
+                return False
+            status, info = hit
+            keep[oid] = ({"reason": KEEP_RESERVED, "by": info["holder"]} if status == OpStatus.REJECTED_RESERVED
+                         else {"reason": KEEP_SELECTED})
+            return True
+
         for oid, obj in self.objects.items():
             if obj.retracted or _is_deleted(obj.content):
                 continue
             base = seen.get(oid, -1)
-            hit = self._claim_conflict(agent_id, oid)
-            if hit is not None:
-                status, info = hit
-                keep[oid] = ({"reason": KEEP_RESERVED, "by": info["holder"]} if status == OpStatus.REJECTED_RESERVED
-                             else {"reason": KEEP_SELECTED})
+            if claimed(oid):
                 continue
             if obj.occupancy is not None:
                 keep[oid] = {"reason": KEEP_HUMAN}
@@ -613,9 +794,26 @@ class Runtime:
                 continue
             if self._target_conflict(obj, base) is not None:
                 keep[oid] = self.reason_for(agent_id, oid)
+        if self.sparse:
+            # 没建记录的基线单元（没人改过，版本 0，这个 Agent 看到的也是 0）：只有被选中、被预留，
+            # 或者基线算人的（initial_owner="human"，按规则展开）时才要保持
+            extra = {u for u in self.reservations if not dict.__contains__(self.objects, u)}
+            if self.selection_occupies:
+                for groups in self.selection.values():
+                    for g in groups:
+                        extra.update(self._base_units_of(g))
+            if self.baseline_owner is not None:
+                extra.update(self._base_units())
+            for oid in sorted(extra):
+                if oid in keep or dict.__contains__(self.objects, oid) or self._baseline_content(oid) is None:
+                    continue
+                if claimed(oid) or self.baseline_owner is None:
+                    continue
+                keep[oid] = ({"reason": KEEP_HUMAN, "candidate": True} if self.human_touched_policy == POLICY_CANDIDATE
+                             else {"reason": KEEP_HUMAN})
         self._n_permit += 1
-        permit = Permit(f"permit-{self._n_permit}-{self.nonce}", agent_id, keep,
-                        {oid: seen.get(oid, -1) for oid in self.objects}, reidentify=self.identity_rule())
+        permit = Permit(f"permit-{self._n_permit}-{self.nonce}", agent_id, keep, seen.copy(),
+                        reidentify=self.identity_rule())
         permit.keep_alive = self._ancestors(keep)
         if permit.reidentify is not None:
             protected = permit.no_delete
@@ -634,21 +832,30 @@ class Runtime:
         """要保持的对象的祖先（design_v0.5.md 12.6）：不许删，面照样可以改。
         删掉父对象，子对象的父对象就断了（Blender），或者被连带删掉（Unity），人改过的子对象跟着坏掉。
         父对象来自账本里每个单元记的 "parent"，对所有应用都一样（P4）。"""
-        parents: dict[str, Optional[str]] = {}
-        for oid, obj in self.objects.items():
-            c = obj.content
-            if obj.retracted or _is_deleted(c) or not isinstance(c, dict):
-                continue
-            parents.setdefault(group_of(oid), c.get("parent"))
+        if self._base_row is not None:
+            # 稀疏账本：没建记录的对象不在账本里，父对象取接入层最近看到的（I1：账本和场景一致）
+            def parent_of(g: str) -> Optional[str]:
+                return (self._base_row(g) or {}).get("parent")
+
+            def known(g: str) -> bool:
+                return self._base_row(g) is not None
+        else:
+            parents: dict[str, Optional[str]] = {}
+            for oid, obj in self.objects.items():
+                c = obj.content
+                if obj.retracted or _is_deleted(c) or not isinstance(c, dict):
+                    continue
+                parents.setdefault(group_of(oid), c.get("parent"))
+            parent_of, known = parents.get, parents.__contains__
         kept = {group_of(uid) for uid in keep}
         out: dict[str, dict] = {}
         for g in sorted(kept):
-            p, seen = parents.get(g), {g}
-            while p and p not in seen and p in parents:
+            p, seen = parent_of(g), {g}
+            while p and p not in seen and known(p):
                 seen.add(p)
                 if p not in kept:
                     out.setdefault(p, {"reason": KEEP_HUMAN, "ancestor": True, "of": g})
-                p = parents.get(p)
+                p = parent_of(p)
         return out
 
     def _tombstones(self, agent_id: str, seen: dict[str, int]) -> dict[str, dict]:
@@ -668,7 +875,9 @@ class Runtime:
             if content.get("kind") == "data" and not (content.get("users") or 0):
                 continue                          # 没人用了之后才消失：清理
             base = seen.get(oid, -1)
-            if not any(not _is_deleted(v.content) for v in obj.versions if v.version <= base):
+            existed = any(not _is_deleted(v.content) for v in obj.versions if v.version <= base) or (
+                base >= 0 and obj.baseline is not None and not _is_deleted(obj.baseline))     # 基线（版本 0）就在
+            if not existed:
                 continue                          # 这个 Agent 从没见过它还在
             g = group_of(oid)
             out.setdefault(g, {"name": content.get("name"), "type": content.get("type"),
@@ -737,7 +946,8 @@ class Runtime:
     def settle(self, permit: Permit, before: dict[str, Any], raw: dict[str, Any], final: dict[str, Any],
                step_id: Optional[str] = None, produce_type: str = "blob",
                refused: Iterable[str] = (), refused_deletes: Iterable[str] = (),
-               identity: Optional[dict] = None) -> Settlement:
+               identity: Optional[dict] = None,
+               rows: Optional[tuple[dict[str, dict], dict[str, dict], dict[str, dict]]] = None) -> Settlement:
         """一次执行结束：按应用交回的实际状态核对，再记账（design_v0.5.md 2.3–2.5、第 6 节）。
 
         before / raw / final：执行前、执行后（恢复前）、最终的单元 {编号: 内容}，内容是带 "fp" 的 dict。
@@ -751,6 +961,9 @@ class Runtime:
           配上的旧编号在 raw / final 里已经是新对象的内容，所以照常按面核对：人改过的面要么还是人的，要么是违规。
           补回人删掉的对象（墓碑）被接入代码删掉了：记为保持（kept，"recreate"）；按规则是补回、最后却还在的
           （例如接入代码收尾出错，design_v0.5.md 14.8）：记为违规。
+        rows：(执行前, 执行后, 最终) 全部应用对象的身份行 {对象编号: {"name", "type", "parent", "kind", "users"}}。
+          给了 rows，before / raw / final 可以只含变了的单元（以及类型化命令执行前拒掉的、删除被拒的对象的单元）：
+          三份里都一样的单元在下面的循环里什么也不做，哪些对象在、认回要的身份行从 rows 里取（design_v0.5.md 第 16 节）。
         账本只记实际看到的（P1）：结束后账本里每个单元都和 final 一样。"""
         if permit.state not in self.OPEN_STATES:
             raise ProtocolError(f"{permit.permit_id} 已经结束（{permit.state}），不能再结算")
@@ -762,11 +975,11 @@ class Runtime:
         if step is not None and step.state != StepState.RUNNING:
             step.state, step.committed_ops = StepState.RUNNING, []
             self._emit("step/state", stepId=step.step_id, state=step.state.value)
-        before_groups = {group_of(u) for u in before}
-        raw_groups = {group_of(u) for u in raw}
+        rows_b, rows_r, rows_f = rows if rows is not None else (_group_rows(before), _group_rows(raw), _group_rows(final))
+        before_groups, raw_groups = set(rows_b), set(rows_r)
         tomb_hits: set[str] = set()
         if permit.reidentify is not None:
-            expected = self._settle_identity(st, permit, before, raw, identity, pre_deleted)
+            expected = self._settle_identity(st, permit, rows_b, rows_r, identity, pre_deleted)
             # 按运行时自己的规则，补回了墓碑（人删掉、还没交还）的对象：接过旧编号的、或者还是新编号的（14.8）
             for old, (new, _level) in expected.items():
                 if old in permit.no_recreate and old not in before_groups:
@@ -838,7 +1051,7 @@ class Runtime:
             self._emit("step/state", stepId=step.step_id, state=step.state.value)
         st.holds = sorted({group_of(u) for u, k in st.kept.items() if k.get("recreate")})
         if permit.reidentify is not None:
-            self._track_wanted_gone(permit, st, before, raw, final, pre_deleted)
+            self._track_wanted_gone(permit, st, before, raw, rows_b, set(rows_r), set(rows_f), pre_deleted)
         self._detect_loops(st)
         self.mark_seen(agent)
         if st.breach:
@@ -874,7 +1087,7 @@ class Runtime:
             self._emit("alert/human", kind="loop", agent=agent, permitId=st.permit_id, objects=new,
                        times={u: st.loops[u] for u in new}, window=self.loop_window)
 
-    def _settle_identity(self, st: Settlement, permit: Permit, before: dict[str, Any], raw: dict[str, Any],
+    def _settle_identity(self, st: Settlement, permit: Permit, rows_b: dict[str, dict], rows_r: dict[str, dict],
                          identity: Optional[dict], pre_deleted: set[str]) -> dict:
         """核对接入代码认回的结果（design_v0.5.md 12.4）：只用执行前、执行后（恢复前）的记录，按许可单里的同一条规则
         自己重算一遍（rightofway/identity.py 的 verify）。一致的记进 st.reidentified 和认回记录（带置信等级）；
@@ -884,7 +1097,6 @@ class Runtime:
         pairs = {o: list(v) for o, v in (identity.get("pairs") or {}).items()}
         kinds = identity.get("kinds") or {}
         wanted = set(permit.rebind) | set(pre_deleted)
-        rows_b, rows_r = _group_rows(before), _group_rows(raw)
         expected, errors = verify_identity(rows_b, rows_r, pairs, identity.get("fresh") or {}, wanted,
                                            permit.no_recreate, (permit.reidentify or {}).get("suffix"))
         if not identity and expected:
@@ -921,13 +1133,11 @@ class Runtime:
         self._emit("identity/unmatched", permitId=permit_id, objectId=old, new=new, by=actor_id)
 
     def _track_wanted_gone(self, permit: Permit, st: Settlement, before: dict[str, Any], raw: dict[str, Any],
-                           final: dict[str, Any], pre_deleted: set[str]) -> None:
+                           rows_b: dict[str, dict], raw_groups: set[str], final_groups: set[str],
+                           pre_deleted: set[str]) -> None:
         """记下 Agent 想删、因为人改过而保留下来的对象：之后它新建同名同类型的对象，就认成这一个（清空和重建分两次执行）。
         认上了、被删掉了、或者 Agent 又去改它（说明它知道这个对象还在）时，不再记。"""
         wanted = self.wanted_gone.setdefault(permit.agent, {})
-        rows_b = _group_rows(before)
-        final_groups = {group_of(u) for u in final}
-        raw_groups = {group_of(u) for u in raw}
         for g in list(wanted):
             if g in st.reidentified or g not in final_groups:
                 del wanted[g]
@@ -984,6 +1194,7 @@ class Runtime:
         obj.candidates.append(VersionRecord(version=-1, content=r, author_id=agent, author_kind=ActorKind.AGENT,
                                             op_id=op_id, step_id=step_id, parent_version=obj.version,
                                             seq=self._seq))
+        self._touch(uid)
         self._emit("result/candidate", opId=op_id, objects=[uid])
 
     def _settle_breach(self, op_id: str, agent: str, actor: Actor, uid: str, f: Any, b: Any,
@@ -1014,6 +1225,8 @@ class Runtime:
         out = {oid for oid, o in self.objects.items()
                if (o.human_touched is not None or o.occupancy is not None)
                and not o.retracted and not _is_deleted(o.content)}
+        if self.sparse and self.baseline_owner is not None:      # 基线算人的：没建记录的基线单元也是
+            out |= {u for u in self._base_units() if not dict.__contains__(self.objects, u)}
         if for_agent is not None:
             self._expire_reservations()
             out |= {oid for oid, (h, _) in self.reservations.items() if h != for_agent}
@@ -1032,6 +1245,7 @@ class Runtime:
         self._invalidate_from(object_id)                              # R12
         if occupy and obj.occupancy is None:                          # R8：第一次修改即占用
             obj.occupancy = Occupancy(holder=actor_id, since_seq=self._seq)
+            self._touch(object_id)
             self._emit("occupancy/acquired", objectId=object_id, holder=actor_id)
             self._block_readers(object_id)                            # R9
         return rec
@@ -1052,6 +1266,7 @@ class Runtime:
         if obj.occupancy is None or obj.occupancy.holder != actor_id:
             raise ProtocolError(f"{actor_id} 没有占用 {object_id}，不能释放")
         obj.occupancy = None
+        self._touch(object_id)
         self._emit("occupancy/released", objectId=object_id, holder=actor_id)
         for step in self.steps.values():
             if step.state == StepState.BLOCKED and not self._inputs_occupied(step):
@@ -1062,6 +1277,7 @@ class Runtime:
         self._require_human(actor_id)
         obj = self.objects[object_id]
         obj.human_touched = None
+        self._touch(object_id)
         self._emit("object/handback", objectId=object_id, actor=actor_id)
 
     def external_change(self, object_id: str, content: Any, source: str = "file_watch") -> VersionRecord:
@@ -1150,7 +1366,7 @@ class Runtime:
     # 失效传播与阻塞（R9、R12）
     # ------------------------------------------------------------------
     def _readers(self, object_id: str) -> list[Step]:
-        return [s for s in self.steps.values() if object_id in s.inputs]
+        return [self.steps[sid] for sid in self._readers_index.get(object_id, ()) if sid in self.steps]
 
     def _inputs_occupied(self, step: Step) -> bool:
         return any(self.objects.get(i) is not None and self.objects[i].occupancy is not None
@@ -1208,6 +1424,7 @@ class Runtime:
                 skipped.append({"objectId": obj.object_id, "reason": "changed_after"})
                 continue
             first = mine[0]
+            self._touch(obj.object_id)
             if first.parent_version is None:                          # 这一步新建的对象：撤掉
                 obj.retracted = True
                 retracted.append(obj.object_id)
@@ -1262,56 +1479,137 @@ class Runtime:
     # ------------------------------------------------------------------
     def to_state(self) -> dict:
         """运行时的全部记录，只含基本类型（可以存成 JSON）。重启后用 load_state 接着用。
-        事件日志不存（它只是记录，序号接着往下数）；规则选项不存（由创建运行时的人决定）；还开着的许可单要存。"""
-        def ver(v: VersionRecord) -> dict:
-            d = asdict(v)
-            d["author_kind"] = v.author_kind.value
-            return d
-        objects = {}
-        for oid, o in self.objects.items():
-            objects[oid] = {"type": o.type, "versions": [ver(v) for v in o.versions],
-                            "authority": {"kind": o.authority.kind.value, "adapter_id": o.authority.adapter_id},
-                            "provenance": o.provenance, "mergeable": o.mergeable, "retracted": o.retracted,
-                            "human_touched": asdict(o.human_touched) if o.human_touched else None,
-                            "occupancy": asdict(o.occupancy) if o.occupancy else None,
-                            "candidates": [ver(v) for v in o.candidates]}
-        caps = {n: {**asdict(m), "channel": m.channel.value} for n, m in self.capabilities.items()}
-        steps = {sid: {**asdict(st), "state": st.state.value} for sid, st in self.steps.items()}
-        open_permits = {pid: asdict(pm) for pid, pm in self.permits.items() if pm.state in self.OPEN_STATES}
-        return {"format": 1, "seq": self._seq, "n_permit": self._n_permit, "nonce": self.nonce,
-                "actors": {a: x.kind.value for a, x in self.actors.items()}, "capabilities": caps,
-                "objects": objects, "steps": steps, "seen": self.seen,
+        事件日志不存（它只是记录，序号接着往下数）；规则选项不存（由创建运行时的人决定）；还开着的许可单要存。
+        稀疏账本里只有建了记录的单元；基线由接入层自己存（design_v0.5.md 第 16 节）。"""
+        objects = {oid: _obj_json(o) for oid, o in self.objects.items()}
+        steps = {sid: _step_json(st) for sid, st in self.steps.items()}
+        return {"format": 2, **self._small_state(), "objects": objects, "steps": steps,
+                "identity_log": list(self.identity_log)}
+
+    def snapshot(self) -> dict:
+        """整份记录（to_state），并把它当作盘上的样子：之后 take_delta 只交出从这里开始的变化。"""
+        out = self.to_state()
+        self._mark_saved()
+        return out
+
+    def _small_state(self) -> dict:
+        return {"seq": self._seq, "n_permit": self._n_permit, "nonce": self.nonce, "paused": self.paused,
+                "actors": {a: x.kind.value for a, x in self.actors.items()},
+                "capabilities": {n: {**asdict(m), "channel": m.channel.value} for n, m in self.capabilities.items()},
+                "seen": {a: sm.to_json() for a, sm in self.seen.items()},
                 "selection": {h: sorted(g) for h, g in self.selection.items()},
-                "suspended": self.suspended, "paused": self.paused, "app": self.app,
-                "wanted_gone": self.wanted_gone, "identity_log": self.identity_log,
+                "suspended": self.suspended, "app": self.app, "wanted_gone": self.wanted_gone,
                 "kept_history": {a: [sorted(x) for x in h] for a, h in self.kept_history.items()},
                 "looping": {a: sorted(v) for a, v in self.looping.items()},
-                "permits": open_permits, "in_doubt": self.in_doubt}
+                "permits": {pid: _permit_json(pm) for pid, pm in self.permits.items() if pm.state in self.OPEN_STATES},
+                "in_doubt": self.in_doubt}
+
+    @staticmethod
+    def _step_sig(st: Step) -> tuple:
+        return (st.state.value, len(st.committed_ops), st.committed_ops[-1] if st.committed_ops else None,
+                st.done_seq, st.claimed_by, st.assignee)
+
+    def _mark_saved(self) -> None:
+        """现在的样子就是盘上的样子：之后 take_delta 只交出从这里开始的变化。"""
+        self._dirty_objects.clear()
+        self._saved_steps = {sid: self._step_sig(st) for sid, st in self.steps.items()}
+        self._dirty_steps.clear()
+        self._saved_small = {k: json.dumps(v, sort_keys=True, ensure_ascii=False, default=str)
+                             for k, v in self._small_state().items()}
+        self._saved_log = len(self.identity_log)
+
+    def take_delta(self) -> dict:
+        """上次落盘（to_state / take_delta / load_state）之后的变化，追加进账本用（design_v0.5.md 第 16 节）：
+        改过的单元、步骤整条重写；小字段变了才写；认回记录只追加新的。和场景大小无关，只和这一步的改动有关。"""
+        d: dict = {}
+        for k, v in self._small_state().items():
+            js = json.dumps(v, sort_keys=True, ensure_ascii=False, default=str)
+            if self._saved_small.get(k) != js:
+                d[k] = v
+                self._saved_small[k] = js
+        objs = {}
+        for oid in sorted(self._dirty_objects):
+            o = self.objects.peek(oid)
+            if o is not None:
+                objs[oid] = _obj_json(o)
+        self._dirty_objects.clear()
+        if objs:
+            d["objects"] = objs
+        saved = getattr(self, "_saved_steps", {})
+        steps = {}
+        for sid, st in self.steps.items():
+            sig = self._step_sig(st)
+            if saved.get(sid) != sig or sid in self._dirty_steps:
+                steps[sid] = _step_json(st)
+                saved[sid] = sig
+        self._saved_steps = saved
+        self._dirty_steps.clear()
+        if steps:
+            d["steps"] = steps
+        if len(self.identity_log) > self._saved_log:
+            d["identity_log_add"] = self.identity_log[self._saved_log:]
+            self._saved_log = len(self.identity_log)
+        return d
+
+    def apply_delta(self, d: dict) -> None:
+        """把 take_delta 交出的一段变化接到 load_state 读进来的记录上（重启时按顺序重放账本）。"""
+        if "seq" in d:
+            self._seq = d["seq"]
+        if "n_permit" in d:
+            self._n_permit = d["n_permit"]
+        if d.get("nonce"):
+            self.nonce = d["nonce"]
+        if "paused" in d:
+            self.paused = bool(d["paused"])
+        if "actors" in d:
+            self.actors = {a: Actor(a, ActorKind(k)) for a, k in d["actors"].items()}
+        if "capabilities" in d:
+            self.capabilities = {n: CapabilityMeta(**{**m, "channel": Channel(m["channel"])})
+                                 for n, m in d["capabilities"].items()}
+        if "seen" in d:
+            self.seen = {a: SeenMap.from_json(self, v) for a, v in d["seen"].items()}
+        if "selection" in d:
+            self.selection = {h: set(g) for h, g in d["selection"].items()}
+        if "suspended" in d:
+            self.suspended = dict(d["suspended"])
+        if "app" in d:
+            self.app = dict(d["app"])
+        if "wanted_gone" in d:
+            self.wanted_gone = {a: dict(v) for a, v in d["wanted_gone"].items()}
+        if "kept_history" in d:
+            self.kept_history = {a: [set(x) for x in h] for a, h in d["kept_history"].items()}
+        if "looping" in d:
+            self.looping = {a: set(v) for a, v in d["looping"].items()}
+        if "permits" in d:
+            self.permits = {pid: _permit_from(self, x) for pid, x in d["permits"].items()}
+        if "in_doubt" in d:
+            self.in_doubt = dict(d["in_doubt"])
+        for oid, x in (d.get("objects") or {}).items():
+            dict.__setitem__(self.objects, oid, _obj_from(oid, x))
+        for sid, x in (d.get("steps") or {}).items():
+            st = _step_from(x)
+            self.steps[sid] = st
+            self._index_step(st)
+        self.identity_log.extend(d.get("identity_log_add") or ())
 
     def load_state(self, state: dict) -> None:
-        """接着 to_state 存下的记录用。预留（R23）是短时间的，不恢复。"""
-        if state.get("format") != 1:
+        """接着 to_state 存下的记录用。预留（R23）是短时间的，不恢复。format 1（v0.5 第 14 节，整份重写的账本）也认。"""
+        if state.get("format") not in (1, 2):
             raise ProtocolError(f"不认识的账本格式：{state.get('format')}")
-
-        def ver(d: dict) -> VersionRecord:
-            return VersionRecord(**{**d, "author_kind": ActorKind(d["author_kind"])})
         self._seq = state["seq"]
         self._n_permit = state.get("n_permit", 0)
         self.nonce = state.get("nonce") or self.nonce
         self.actors = {a: Actor(a, ActorKind(k)) for a, k in state["actors"].items()}
         self.capabilities = {n: CapabilityMeta(**{**m, "channel": Channel(m["channel"])})
                              for n, m in state["capabilities"].items()}
-        self.objects = {}
+        self.objects = _Ledger(self)
         for oid, d in state["objects"].items():
-            self.objects[oid] = ObjectState(
-                oid, d["type"], versions=[ver(v) for v in d["versions"]],
-                authority=Authority(AuthorityKind(d["authority"]["kind"]), d["authority"]["adapter_id"]),
-                provenance=d["provenance"], mergeable=d["mergeable"], retracted=d["retracted"],
-                human_touched=HumanTouched(**d["human_touched"]) if d["human_touched"] else None,
-                occupancy=Occupancy(**d["occupancy"]) if d["occupancy"] else None,
-                candidates=[ver(v) for v in d["candidates"]])
-        self.steps = {sid: Step(**{**d, "state": StepState(d["state"])}) for sid, d in state["steps"].items()}
-        self.seen = {a: dict(v) for a, v in state["seen"].items()}
+            dict.__setitem__(self.objects, oid, _obj_from(oid, d))
+        self.steps = {sid: _step_from(d) for sid, d in state["steps"].items()}
+        self._readers_index = {}
+        for st in self.steps.values():
+            self._index_step(st)
+        self.seen = {a: SeenMap.from_json(self, v) for a, v in state["seen"].items()}
         self.selection = {h: set(g) for h, g in state["selection"].items()}
         self.suspended = dict(state["suspended"])
         self.paused = bool(state["paused"])
@@ -1320,10 +1618,11 @@ class Runtime:
         self.identity_log = list(state["identity_log"])
         self.kept_history = {a: [set(x) for x in h] for a, h in state["kept_history"].items()}
         self.looping = {a: set(v) for a, v in state["looping"].items()}
-        self.permits = {pid: Permit(**d) for pid, d in state["permits"].items()}
+        self.permits = {pid: _permit_from(self, d) for pid, d in state["permits"].items()}
         self.in_doubt = dict(state["in_doubt"])
         self.reservations = {}
         self.ops = {}
+        self._mark_saved()
         self._emit("ledger/loaded", objects=len(self.objects), openPermits=sorted(self.permits))
 
     # ------------------------------------------------------------------
@@ -1335,6 +1634,7 @@ class Runtime:
     def retract_object(self, object_id: str, reason: str) -> None:
         obj = self.objects[object_id]
         obj.retracted = True
+        self._touch(object_id)
         self._emit("object/retracted", objectId=object_id, reason=reason)
 
     # ------------------------------------------------------------------
@@ -1377,3 +1677,58 @@ def _fp(content: Any) -> Any:
     if isinstance(content, dict) and "fp" in content:
         return content["fp"]
     return content
+
+
+def _ver_json(v: VersionRecord) -> dict:
+    d = asdict(v)
+    d["author_kind"] = v.author_kind.value
+    return d
+
+
+def _ver_from(d: dict) -> VersionRecord:
+    return VersionRecord(**{**d, "author_kind": ActorKind(d["author_kind"])})
+
+
+def _obj_json(o: ObjectState) -> dict:
+    return {"type": o.type, "versions": [_ver_json(v) for v in o.versions],
+            "authority": {"kind": o.authority.kind.value, "adapter_id": o.authority.adapter_id},
+            "provenance": o.provenance, "mergeable": o.mergeable, "retracted": o.retracted,
+            "human_touched": asdict(o.human_touched) if o.human_touched else None,
+            "occupancy": asdict(o.occupancy) if o.occupancy else None,
+            "candidates": [_ver_json(v) for v in o.candidates],
+            **({"baseline": o.baseline, "baseline_author": o.baseline_author,
+                "baseline_kind": o.baseline_kind.value if o.baseline_kind else None}
+               if o.baseline is not None else {})}
+
+
+def _obj_from(oid: str, d: dict) -> ObjectState:
+    return ObjectState(
+        oid, d["type"], versions=[_ver_from(v) for v in d["versions"]],
+        authority=Authority(AuthorityKind(d["authority"]["kind"]), d["authority"]["adapter_id"]),
+        provenance=d["provenance"], mergeable=d["mergeable"], retracted=d["retracted"],
+        human_touched=HumanTouched(**d["human_touched"]) if d["human_touched"] else None,
+        occupancy=Occupancy(**d["occupancy"]) if d["occupancy"] else None,
+        candidates=[_ver_from(v) for v in d["candidates"]],
+        baseline=d.get("baseline"), baseline_author=d.get("baseline_author"),
+        baseline_kind=ActorKind(d["baseline_kind"]) if d.get("baseline_kind") else None)
+
+
+def _step_json(st: Step) -> dict:
+    return {**asdict(st), "state": st.state.value}
+
+
+def _step_from(d: dict) -> Step:
+    return Step(**{**d, "state": StepState(d["state"])})
+
+
+def _permit_json(pm: Permit) -> dict:
+    base = pm.base
+    out = {f: getattr(pm, f) for f in pm.__dataclass_fields__ if f != "base"}
+    out["base"] = base.to_json() if isinstance(base, SeenMap) else dict(base or {})
+    return json.loads(json.dumps(out, ensure_ascii=False, default=str))
+
+
+def _permit_from(rt: Runtime, d: dict) -> Permit:
+    pm = Permit(**{**d, "base": {}})
+    pm.base = SeenMap.from_json(rt, d.get("base"))
+    return pm

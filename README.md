@@ -189,9 +189,11 @@ When you delete an object and the agent's step would put it back (3 of 11 deleti
 - **The MCP proxy's handling of the app's own typed tools is not atomic.** It checks before and after the call, so anything you change in the app in between is attributed to the agent. Code-execution tools and the proxy's own small tools (`rightofway_set_property` etc.) are atomic.
 - **Derived changes and intent conflicts are reported, not fixed.** If a leaf is restored to the height you set, a bird the agent placed above it may float in mid-air: the agent is told to treat the leaf's current height as the target and recheck, but the runtime doesn't move the bird.
 - **It guards against agents' habits and mistakes, not deliberate circumvention.** The agent's code runs in the same Blender process as the integration code, so in principle it can change anything (for example, register a timer that acts after the check). Guarding against deliberate circumvention needs the agent's code to run in another process (shadow execution).
-- **The ledger is rewritten whole.** After long use the file grows and each save gets slower; it will become an append-only log.
+- **Blender: a one-object step still grows slowly with scene size.** Before and after every step the integration re-reads, on every object and data block, the few properties whose changes Blender's depsgraph doesn't report (measured by the connection self-test): about 40 ms at 500 objects, a step takes 0.12 s at 500 objects and 0.5–0.7 s at 2000. Right after an object is created or deleted, the depsgraph reports every object as updated, so that one scan recomputes all object records (0.26 s at 500). With `initial_owner="human"` every object is protected and recomputed before and after each step. Details in [design §16](spec/design_v0.5.md).
 - **Code: only saved edits count, and commands aren't atomic.** Unsaved edits in your editor aren't seen (your editor won't silently lose them either: it warns when you save over a changed file). Your saves during a quick command (up to 3 seconds) count as the command's. A command can end up half-applied across files. Partial reads count as reading the whole file.
 - **Multi-object operations aren't undone as a whole.** If the agent merges A into B and then deletes A, and A is yours, A is put back but B keeps the merged result (A's content appears twice). Each property is right on its own, but the operation as a whole isn't; the agent is told. How to group changes that must land or be undone together is still being decided.
+
+Fixed on 2026-11-03 (performance, nothing else changed): the ledger only keeps records for properties someone changed and is an append-only log with periodic compaction (at 500 objects: 10 KB after connecting instead of 56 MB, saves under 1 ms instead of 5.9 s); Blender observation is incremental (depsgraph update callbacks, plus a connection self-test that finds the changes the depsgraph doesn't report, plus a periodic full check whose findings are recorded as unattributed) and only changes are sent, so an agent changing one object takes 0.12 s at 500 objects instead of 15.2 s; the socket bridge parses a reply once instead of once per 64 KB.
 
 Fixed on 2026-10-15: a wrap-up error after an execution was reported as "not executed", and the agent's change was later counted as yours; clicking "Allow rebuild" without any scene change wasn't saved, so a restarted proxy blocked the rebuild again.
 
@@ -210,7 +212,7 @@ git clone https://github.com/IndexCH/RightOfWay.git
 cd RightOfWay
 python -m venv .venv
 .venv/bin/pip install -e ".[dev,proxy]"    # Windows: .venv\Scripts\pip install -e ".[dev,proxy]"
-.venv/bin/python -m pytest                  # 284 tests; the bpy and mcp ones skip when those aren't installed
+.venv/bin/python -m pytest                  # 292 tests; the bpy and mcp ones skip when those aren't installed
 python examples/demo_game_assets.py         # narrated walkthrough of the runtime, no Blender needed
 ```
 
@@ -267,10 +269,10 @@ rightofway/              runtime (Python package)
 └── unity/               Unity integration through Unity's own MCP (Unity_RunCommand)
 experiments/             experiments A, B, C (Unity), D (two agents), E (agent deletes an object you edited),
                          H (realistic agent habits), K (code with Claude Code), P (through the MCP proxy),
-                         S (shadow execution trial) and run_all.py
-tests/                   284 tests, including the invariant checks
+                         S (shadow execution trial), Q (performance, exp_perf.py) and run_all.py
+tests/                   292 tests, including the invariant checks and the incremental-vs-full differential tests
 spec/spec_v0.4.md        protocol spec (Chinese, draft); section 0 lists the design principles
-spec/design_v0.5.md      v0.5 architecture redesign (Chinese; steps 1–3 implemented; section 13: hardening from the survey; section 14: execution lifecycle, identity and intent)
+spec/design_v0.5.md      v0.5 architecture redesign (Chinese; steps 1–3 implemented; section 13: hardening from the survey; section 14: execution lifecycle, identity and intent; section 16: performance — sparse ledger, append-only log, incremental observation)
 spec/design_code.md      code integration design (Chinese): lines as the unit, Claude Code hooks
 spec/related_work.md     how this relates to existing papers, protocols and tools
 spec/prior_art_solutions.md  how other systems handle the same four problems (Chinese, 2026-10-08)

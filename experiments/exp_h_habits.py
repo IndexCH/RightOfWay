@@ -170,8 +170,7 @@ class Run:
         return reps
 
     def view(self, agent: str):
-        av = self.s.agent_views[agent]
-        return av.recs, av.values
+        return self.s.agent_scene(agent)
 
     def look(self, agent: str) -> list[str]:
         self.s.observe(agent)
