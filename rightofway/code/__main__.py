@@ -127,7 +127,7 @@ def status(project: str) -> str:
         rows = []
         for path, rs in regions.items():
             for g in rs:
-                spans = "、".join(_span(r) for r in g["lines"]) + (f"（{len(g['points'])} 处删除）" if g["points"] else "")
+                spans = "、".join(_span(r) for r in g["units"]) + (f"（{len(g['points'])} 处删除）" if g["points"] else "")
                 rows.append(f"  {path} {spans}：{who(led, g['mark'])}")
         agents = [f"  {v.get('name', a)}" for a, v in sorted(led.agents.items())]
     out = [f"项目：{led.root}", f"账本：{led.dir}"]
@@ -157,7 +157,7 @@ def release(project: str, specs: list[str]) -> str:
             what = "；".join(d["path"] for d in done)
             for agent in list(led.agents):
                 led.note(agent, f"人把这些交还给了 AI，现在可以改了：{what}。")
-    return ("已交还：" + "；".join(d["path"] + " " + "、".join(_span(r) for r in d["lines"]) for d in done)) if done \
+    return ("已交还：" + "；".join(d["path"] + " " + "、".join(_span(r) for r in d["units"]) for d in done)) if done \
         else "没有找到可以交还的（这些行没有受保护）。"
 
 
