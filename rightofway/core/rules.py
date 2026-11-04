@@ -101,7 +101,11 @@ def judge(last: Last, agent: str, seen: Optional[int]) -> Optional[dict]:
 
 
 def judge_tombstone(last: Last, agent: str, seen: Optional[int]) -> Optional[dict]:
-    """墓碑（删掉的单元、对象、文件）：AI 能不能把它补回来。和单元用同一张表，看的是删掉它的是谁。"""
+    """墓碑（删掉的单元、对象、文件）：AI 能不能把它补回来。和单元用同一张表，看的是删掉它的是谁（last.author）：
+    人或来源不明删的，人交还之前不能补回；它自己删的能；别的 AI、git 删的，先看过这次删除。
+    AI 违规删掉了人改过的东西时，这个单元仍然归人（hold），但删掉它的是这个 AI——墓碑按删的人算，不按 hold 算。"""
+    if category(last.author, last.kind) not in (HUMAN, EXTERNAL):
+        last = Last(last.author, last.kind, last.stamp, None)
     return judge(last, agent, seen)
 
 
