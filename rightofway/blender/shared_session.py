@@ -37,6 +37,7 @@ from ..model import (KEEP_HUMAN, KEEP_OTHER, KEEP_OTHER_AGENT, KEEP_RESERVED, KE
 from ..runtime import POLICY_CANDIDATE, Runtime
 from .changes import Values, describe_changes
 from ..core import explain as X
+from ..core.store import AppendLog
 from . import messages as MSG
 from .records import (ASPECT, DELETED, OBJECT, Diff, Records, diff_records, display, label, split_unit, units)
 
@@ -217,7 +218,8 @@ class SharedSession:
         self._dirty_view: set[str] = set()         # 上次落盘之后 view 里变了的对象
         self._dirty_values: set[str] = set()
         self._av_dirty: dict[str, dict] = {}       # 上次落盘之后每个 AI 的视图记下了什么
-        self._ledger_meta: dict = {}               # 账本文件：压缩之后追加了多少
+        self._log: Optional[AppendLog] = None       # 账本文件（core.store：追加写的日志）
+        self._saved_ss: dict[str, str] = {}         # 小字段上次落盘时的样子（只追加变了的）
         self.selected: set[str] = set()            # 人现在选中的对象
         self.agent_views: dict[str, AgentView] = {}
         self.agent_names: dict[str, str] = {}
@@ -1162,9 +1164,9 @@ class SharedSession:
     # ------------------------------------------------------------------
     # 账本落盘（design_v0.5.md 14.3）
     # ------------------------------------------------------------------
-    # 账本是追加写的日志（design_v0.5.md 第 16 节）：第一行是整份记录（运行时 + 会话的小字段），场景的观察缓存
-    # （view、values、每个 AI 的视图）单独存一个文件；之后每次只追加这一步的变化。日志长了再整份重写（压缩），
-    # 照旧先写临时文件再改名，存到一半退出也不会留下坏文件。
+    # 账本是追加写的日志（core.store，spec/core.md 第 7 节）：第一行是整份记录（运行时 + 会话的小字段），场景的观察缓存
+    # （view、values、每个 AI 的视图）是附属文件；之后每次只追加这一步的变化。日志长了再整份重写（压缩），
+    # 先写临时文件再改名，存到一半退出也不会留下坏文件。
     COMPACT_LINES = 2000
     COMPACT_BYTES = 4 << 20
 
@@ -1196,29 +1198,25 @@ class SharedSession:
         return json.dumps(v, ensure_ascii=False, sort_keys=True, default=str)
 
     def _save(self) -> None:
-        """每次执行、发现变化之后存一次：追加这一步的变化；还没有整份记录、或者日志太长了，就整份重写。"""
+        """每次执行、发现变化之后存一次（core.store.AppendLog）：追加这一步的变化；还没有整份记录、换了文件、
+        或者日志太长了，就整份重写。"""
         if not self.ledger_path:
             return
-        m = self._ledger_meta
-        if (m.get("path") != self.ledger_path or m.get("lines", 0) >= self.COMPACT_LINES
-                or m.get("bytes", 0) >= max(self.COMPACT_BYTES, m.get("obs_bytes", 0))):
+        if self._log is None or self._log.path != self.ledger_path:
+            self._log = AppendLog(self.ledger_path, self.COMPACT_LINES, self.COMPACT_BYTES)
+        if self._log.due():
             self._write_snapshot()
             return
-        line = self._dumps(self._delta()) + "\n"
-        with open(self.ledger_path, "a", encoding="utf-8") as fh:
-            fh.write(line)
-        m["lines"] = m.get("lines", 0) + 1
-        m["bytes"] = m.get("bytes", 0) + len(line.encode("utf-8"))
+        self._log.append(self._delta())
 
     def _delta(self) -> dict:
-        d: dict = {"t": "d"}
-        saved = self._ledger_meta.setdefault("small", {})
+        d: dict = {}
         ss = {}
         for k, v in self._small_state().items():
             js = self._dumps(v)
-            if saved.get(k) != js:
+            if self._saved_ss.get(k) != js:
                 ss[k] = v
-                saved[k] = js
+                self._saved_ss[k] = js
         if ss:
             d["ss"] = ss
         rt = self.rt.take_delta()
@@ -1241,67 +1239,36 @@ class SharedSession:
         return d
 
     def _write_snapshot(self) -> None:
-        """整份重写：观察缓存先写进一个新文件，再写账本（第一行引用它），最后删掉旧的观察缓存。
+        """整份重写：观察缓存是附属文件，先写它，再写账本（第一行引用它），最后删掉旧的（core.store）。
         基线换成现在的场景：没建记录的单元从开始到现在都没变过，它的基线就是现在的样子（建了记录的自己带着版本 0）。"""
-        path = self.ledger_path
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        snap = time.strftime("%Y%m%d%H%M%S") + "-" + os.urandom(3).hex()
-        obs_path = f"{path}.obs.{snap}"
-        obs = {"format": 2, "snap": snap, "view": self._view, "values": self.values,
+        obs = {"format": 2, "view": self._view, "values": self.values,
                "agent_views": {a: {"old": v.old, "old_values": v.old_values, "time": v.time}
                                for a, v in self.agent_views.items()}}
-        with open(obs_path + ".tmp", "w", encoding="utf-8") as fh:
-            json.dump(obs, fh, ensure_ascii=False)
-        os.replace(obs_path + ".tmp", obs_path)
         if self.sparse:
             self.baseline = dict(self._view)
         small = self._small_state()
-        head = self._dumps({"t": "snap", "format": 2, "obs": os.path.basename(obs_path), "ss": small,
-                            "rt": self.rt.snapshot()}) + "\n"
-        with open(path + ".tmp", "w", encoding="utf-8") as fh:
-            fh.write(head)
-        os.replace(path + ".tmp", path)
-        self._drop_old_obs(os.path.basename(obs_path))
+        self._log.write_snapshot({"format": 2, "ss": small, "rt": self.rt.snapshot()}, side=obs)
         self._dirty_view, self._dirty_values, self._av_dirty = set(), set(), {}
-        self._ledger_meta = {"path": path, "lines": 0, "bytes": len(head.encode("utf-8")),
-                             "obs_bytes": os.path.getsize(obs_path),
-                             "small": {k: self._dumps(v) for k, v in small.items()}}
+        self._saved_ss = {k: self._dumps(v) for k, v in small.items()}
 
-    def _drop_old_obs(self, keep: str) -> None:
-        folder = os.path.dirname(os.path.abspath(self.ledger_path))
-        prefix = os.path.basename(self.ledger_path) + ".obs."
-        for name in os.listdir(folder):
-            if name.startswith(prefix) and name != keep:
-                try:
-                    os.remove(os.path.join(folder, name))
-                except OSError:
-                    pass
 
     def _load(self, path: str) -> bool:
         """接着存下的账本用。必须是同一个文档（接入代码报的 document）、同样的粒度，否则不用（返回 False）。
-        认两种：追加写的日志（format 2）；整份重写的旧账本（format 1，读进来之后下一次落盘整份重写成 format 2）。"""
-        try:
-            with open(path, encoding="utf-8") as fh:
-                first = fh.readline()
-                head = json.loads(first)
-                rest = fh.read() if head.get("t") == "snap" else None
-        except (OSError, ValueError):
-            try:
-                with open(path, encoding="utf-8") as fh:
-                    head = json.load(fh)
-                rest = None
-            except (OSError, ValueError):
-                return False
-        if head.get("format") == 1:
-            return self._load_v1(head)
+        认两种：追加写的日志（format 2，core.store）；整份重写的旧账本（format 1，读进来之后下一次落盘整份重写成 format 2）。"""
+        log = AppendLog(path, self.COMPACT_LINES, self.COMPACT_BYTES)
+        got = log.read()
+        if got is None:
+            return False
+        kind, head, deltas = got
+        if kind == "whole":
+            return isinstance(head, dict) and head.get("format") == 1 and self._load_v1(head)
         ss = head.get("ss") or {}
         doc = self.capabilities.get("document")
         if (head.get("format") != 2 or doc is None or ss.get("document") != doc
                 or ss.get("granularity") != self.granularity or ss.get("scene") != self.scene):
             return False
         try:
-            with open(os.path.join(os.path.dirname(os.path.abspath(path)), head["obs"]), encoding="utf-8") as fh:
-                obs = json.load(fh)
+            obs = log.read_side(head["obs"])
         except (OSError, ValueError, KeyError):
             return False
         app = dict(self.rt.app)                      # 这次连接测出来的能力为准
@@ -1312,22 +1279,14 @@ class SharedSession:
         self._apply_small(ss)
         if self.sparse:
             self._use_baseline(self._view)
-        n, nbytes = 0, len(first.encode("utf-8"))
-        for line in (rest or "").splitlines():
-            try:
-                d = json.loads(line)
-            except ValueError:
-                break                                # 最后一行没写完（存到一半退出）：到这里为止
+        for d in deltas:
             self._replay(d)
-            n += 1
-            nbytes += len(line.encode("utf-8")) + 1
         self.rt.app = app
         self.rt._mark_saved()
         self._finish_load()
         self._dirty_view, self._dirty_values, self._av_dirty = set(), set(), {}
-        self._ledger_meta = {"path": path, "lines": n, "bytes": nbytes,
-                             "obs_bytes": os.path.getsize(os.path.join(os.path.dirname(os.path.abspath(path)), head["obs"])),
-                             "small": {k: self._dumps(v) for k, v in self._small_state().items()}}
+        self._log = log
+        self._saved_ss = {k: self._dumps(v) for k, v in self._small_state().items()}
         return True
 
     def _replay(self, d: dict) -> None:
@@ -1379,7 +1338,7 @@ class SharedSession:
         if self.sparse:
             self._use_baseline(self._view)
         self._finish_load()
-        self._ledger_meta = {}                           # 下一次落盘整份重写
+        self._log = None                                 # 下一次落盘整份重写
         return True
 
     def _finish_load(self) -> None:
