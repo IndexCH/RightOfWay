@@ -36,7 +36,7 @@ MAX_TRACK = 50_000_000                     # 超过这个大小的文件不管�
 MAX_PLAIN = 20_000                         # 不是 git 仓库时最多管这么多个文件
 LOCKED = (".claude/settings.json", ".claude/settings.local.json")    # hooks 的配置：只有人能改（Agent 改了就改回）
 # 命令（Bash）执行超过这么多秒，这期间不是 git 带来的变化说不准是命令改的还是人改的（spec/design_code.md 3.4）
-BASH_WINDOW = float(os.environ.get("RIGHTOFWAY_BASH_WINDOW", "3"))
+BASH_WINDOW = R.QUICK_WINDOW
 EDIT_EXPIRE = 300.0                        # 编辑开始之后这么久还没结算的，照实际结果结算
 FORMAT = 2                                 # 账本格式：2 = 追加写的日志（core.store）；1 = 整份的 state.json（照样读）
 

@@ -691,9 +691,19 @@ class SharedSession:
         return rep, None
 
     def end_tool(self, ticket: dict, error: Optional[str] = None) -> AgentReport:
-        """拆开的工具调用执行完了（或者失败了）：接入代码 finish_agent（认回、恢复、核对），按实际状态结算。"""
+        """拆开的工具调用执行完了（或者失败了）：接入代码 finish_agent（认回、恢复、核对），按实际状态结算。
+        执行得比较久的（rules.settle_window）：这期间的变化说不准是谁做的，不放回（可能抹掉人刚做的修改），
+        按人的修改保护、提醒人，和代码那边执行得比较久的命令一样。"""
         pid = ticket["permit"]
         permit = self.rt.permits[pid]
+        d = self._doubts.get(pid) or {}
+        if self._window(d).author != "agent":
+            self._tokens.pop(pid, None)
+            rep = self._unattributed(pid, d, permit, self._list_all(), self._window_why(d), self.app_boot,
+                                     executed=True)
+            self._doubts.pop(pid, None)
+            self._save()
+            return self._with_notes(rep)
         try:
             res = self.bridge.call("finish_agent", self._args(token=ticket["token"], error=error))
         except Exception as e:                       # noqa: BLE001  收尾的结果没收到：和别的执行一样查清
@@ -704,6 +714,17 @@ class SharedSession:
         self._doubts.pop(pid, None)
         self._save()
         return self._with_notes(rep)
+
+    @staticmethod
+    def _window(d: dict) -> "R.WindowDecision":
+        """发出之后到现在多久：很快 → 变化算 AI 的；比较久 → 说不准是谁的（核心的同一条规则）。"""
+        span = time.time() - d.get("since", time.time())
+        return R.settle_window(hits=False, quick=span <= R.QUICK_WINDOW, from_reference=False, deleted=False,
+                               lost=False)
+
+    @staticmethod
+    def _window_why(d: dict) -> str:
+        return f"工具调用开始 {time.time() - d.get('since', time.time()):.0f} 秒之后才结束，这期间的变化说不准是谁做的"
 
     def _begin_only(self, args: dict) -> dict:
         b = self.bridge.call("begin_agent", args)
@@ -1087,6 +1108,11 @@ class SharedSession:
             rep.text = head + "\n" + rep.text
             return rep
         if dec.action == "finish":
+            # 工具调用不是原子的：开始之后过了很久才查到，这期间的变化说不准是谁做的（rules.settle_window），
+            # 不补做收尾（放回可能抹掉人在这期间的修改），按人的修改保护
+            w = self._window(d)
+            if w.author != "agent":
+                return self._unattributed(pid, d, permit, self._list_all(), self._window_why(d), boot, executed=True)
             try:
                 res = self.bridge.call("finish_agent", self._args(token=token, error="结果没收到之后补做的收尾"))
             except Exception:                          # noqa: BLE001

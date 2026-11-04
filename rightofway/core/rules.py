@@ -20,6 +20,7 @@
 """
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 from typing import Callable, Iterable, Optional
@@ -180,6 +181,10 @@ def observed_author(human: str, source: Optional[str] = None, git: bool = False)
 # ---------------------------------------------------------------------------
 # 结算：不能原子执行、事后才知道改了什么的执行（例如一条命令）
 # ---------------------------------------------------------------------------
+# 不能原子执行的执行：这么多秒以内结束的，人插进来的可能很小，变化算 AI 的；更久的说不准是谁的
+QUICK_WINDOW = float(os.environ.get("RIGHTOFWAY_BASH_WINDOW", "3"))
+
+
 @dataclass(frozen=True)
 class WindowDecision:
     author: str                  # "agent"：算这个 AI 的；"unattributed"：说不准是谁的

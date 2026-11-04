@@ -22,6 +22,7 @@ class KeyedSession:
     def __init__(self, session: SharedSession) -> None:
         self.s = session
         self._tickets: dict[str, dict] = {}
+        self.last = None                               # 最近一次的报告（AgentReport），调试、测试用
 
     def capabilities(self) -> dict:
         return dict(self.s.capabilities)
@@ -97,6 +98,7 @@ class KeyedSession:
         except ValueError as e:                        # 应用侧拆不开工具调用：事后放不回，宁可不执行（P1、P5）
             return Decision(False, f"这次没有执行：{e}。RightOfWay 没法在工具调用之后把不能动的部分放回去。")
         if ticket is None:
+            self.last = rep
             return Decision(False, rep.text, rep.alert)
         self._tickets[intent.ticket or agent] = ticket
         return Decision()
@@ -106,6 +108,7 @@ class KeyedSession:
         if ticket is None:
             return Outcome()
         rep = self.s.end_tool(ticket, error="工具自己报错了" if failed else None)
+        self.last = rep
         return Outcome(texts=[rep.text] if rep.text else [], alerts=[rep.alert] if rep.alert else [], report=rep)
 
     def look(self, agent: str, name: str, target: Optional[str]) -> list[str]:
