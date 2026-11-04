@@ -56,9 +56,43 @@ Behind all of them: the rules are decided in one place, the runtime. The full li
 
 ## How it works
 
+**One core, plus an adapter on each side.** The rules exist exactly once, in `rightofway/core` ([spec/core.md](spec/core.md), Chinese). The core only knows *units*: something with an id, a fingerprint, and a value that can be written as text. Whether a unit is a property of a 3D object, a line of code or (later) a spreadsheet cell is up to the app side.
+
 ```mermaid
 flowchart LR
-    AI["AI client<br/>Claude Desktop etc."] -- MCP --> P["RightOfWay proxy<br/>session layer + runtime"]
+    subgraph AI side["AI side: where the AI is intercepted"]
+        CC["Claude Code hooks<br/>code/hooks.py"]
+        MP["MCP proxy<br/>proxy/"]
+    end
+    subgraph Core["core (rightofway/core)"]
+        J["judgment table · permits · settlement<br/>lifecycle · ledger · explanations · invariants"]
+    end
+    subgraph App side["app side: where the units live"]
+        TF["text files<br/>code/ledger.py"]
+        BL["Blender<br/>blender/"]
+        UN["Unity, fake app …"]
+    end
+    CC -- "intent / done" --> J
+    MP -- "intent / done" --> J
+    J -- "allow or refuse + what to say" --> CC
+    J -- "allow or refuse + what to say" --> MP
+    J -- "units to keep, rebuilt things to remove" --> TF
+    J -- " " --> BL
+    TF -- "units, fingerprints, names and values,<br/>identity, capabilities" --> J
+    BL --> J
+    UN --> J
+```
+
+- **The AI side** hands the core what the agent wants to do (an edit, a command, a tool call, a script) and "done", and gets back allow or refuse and what to tell the agent and you. It only talks to a `Session` (`core/interfaces.py`), so any AI side can drive any app side: a test drives the keyed fake app through the Claude Code hooks.
+- **The app side** hands the core the units and their fingerprints, names and values for the messages, identity tracking (re-identified objects, or how old and new lines correspond) and its capabilities, which are measured by a self-test, not declared. It gets back which units to keep and which rebuilt things to remove.
+- **The core** decides, in one place (P9): the judgment table (a unit nobody changed or that was handed back: yes; changed by this agent: yes; changed by you or by an unknown source: no, until you hand it back; changed by another agent or by git: only after this agent has seen that version), temporary blocks (you're editing it, it's reserved for another agent), the gate (paused, a result still unknown, this agent suspended), how each unit of an execution is settled, the permit lifecycle, the ledger and its append-only log, the facts the messages are built from, and the three invariants.
+- **Conformance tests** (`python -m rightofway.conformance`) run the same media-independent scenarios on every app side and grade each one: protected, not protected but truthfully reported, or lied (the only failing grade); each app side prints a capability report.
+
+The rest of this section follows one adapter pair, Blender through the MCP proxy:
+
+```mermaid
+flowchart LR
+    AI["AI client<br/>Claude Desktop etc."] -- MCP --> P["RightOfWay proxy<br/>session layer + core"]
     P -- MCP --> S["the app's existing MCP server<br/>e.g. BlenderMCP"]
     S --> A["the app's add-on<br/>runs the integration code sent in"]
     H["Human"] -- edits directly in the app --> A
@@ -66,8 +100,8 @@ flowchart LR
 
 RightOfWay's code runs in two places:
 
-- **In the proxy process.** The AI client connects only here. The session layer (`rightofway/proxy`, `blender/shared_session.py`) routes each tool call into the pipeline below and writes the feedback for the agent. The runtime (`runtime.py`) holds the ledger and the rules, and is the only place that decides.
-- **Inside the app.** The integration code (`blender/blender_side.py` plus `identity.py`) carries out the permit and reports the actual state. It isn't installed: it is sent in with every call through the app's existing code-execution tool, so neither the app nor its add-on changes.
+- **In the proxy process.** The AI client connects only here. The session layer (`rightofway/proxy`, `blender/shared_session.py`) routes each tool call into the pipeline below and writes the feedback for the agent. The core (`rightofway/core`) holds the ledger and the rules, and is the only place that decides.
+- **Inside the app.** The integration code (`blender/blender_side.py` plus `core/identity.py`) carries out the permit and reports the actual state. It isn't installed: it is sent in with every call through the app's existing code-execution tool, so neither the app nor its add-on changes.
 
 Here is one code-execution call, using the story from the experiments: the human moves Leaf_3 and deletes Rock_2, then the agent clears and rebuilds the scene without looking first.
 
@@ -76,7 +110,7 @@ sequenceDiagram
     autonumber
     participant AI as AI client
     participant P as Proxy (session layer)
-    participant R as Runtime
+    participant R as Core
     participant A as App (add-on + integration code)
     actor H as Human
     H->>A: moves Leaf_3, deletes Rock_2
@@ -127,7 +161,7 @@ Design details are in [spec/design_v0.5.md](spec/design_v0.5.md), and a plain-la
 
 ## Code: you and Claude Code in the same files
 
-The same rules, with lines as the unit. Nothing is language-specific: a file is a sequence of lines, compared without line endings; binary and very large files count as one line.
+The same core, with lines as the unit. Nothing is language-specific: a file is a sequence of lines, compared without line endings; binary and very large files count as one line.
 
 - **Who changed which lines.** Each line in the ledger carries the change that last wrote it, and follows its line through later edits; deleted lines leave a marker between the lines around them. Whenever a hook runs, anything that changed on disk outside the agent's own tool calls is yours. Only saved content counts: with auto save on (VS Code: `"files.autoSave": "afterDelay"`), all your edits are seen.
 - **What the agent can't change.** Lines you changed and haven't handed back or committed, including the places where you deleted lines; lines another agent (or a `git` checkout or pull you ran) changed after this agent last read the file, until it reads it again; and RightOfWay's own hook configuration. Inserting next to your lines, or editing other lines of the same file, is fine.
@@ -169,6 +203,17 @@ Same task in experiments A–D: the agent builds a small scene (tree, leaves, ro
 | Rename across files with a command (measurement) | 0; `shop.py` put back, `report.py` renamed: half-applied, and the agent is told | 0 |
 
 The v0.4 Unity integration was checked in a real Unity 6.4 editor through Unity's own MCP: the human's leaf height survived, the agent's autumn colour applied, a selected object was left alone, and nothing outside the experiment scene changed (57 tracked objects, about 0.07 s per agent step). The Unity integration code changed in v0.5 (executing the runtime's permit, the connection self-test) hasn't been run in Unity yet; only its C# syntax is checked.
+
+### Conformance (one set of scenarios, every app side)
+
+`python -m rightofway.conformance` runs seven media-independent scenarios on each app side, checking the three invariants after every step: the human edits a unit and the agent then changes it; the agent changes something else; the human deletes and the agent recreates; the agent deletes what the human edited; a lost result while the human edits elsewhere; after hand-back; two agents.
+
+| App side (with its AI side) | Result |
+|---|---|
+| fake app, Blender (bpy), text files through the Claude Code hooks, a test-only container whose units are characters, the Claude Code hooks driving the keyed fake app (cross-combination) | all 7 protected |
+| fake app that can't restore deletions (like today's Unity integration) | 6 protected; "agent deletes what the human edited": not protected but truthfully reported (breach recorded, you're alerted, the agent is paused) |
+
+A random differential test also replays random human edits, agent edits, looks and hand-backs on each app side and compares every outcome with an independent model of the judgment table.
 
 ### Realistic agent habits (experiment H)
 
@@ -212,7 +257,7 @@ git clone https://github.com/IndexCH/RightOfWay.git
 cd RightOfWay
 python -m venv .venv
 .venv/bin/pip install -e ".[dev,proxy]"    # Windows: .venv\Scripts\pip install -e ".[dev,proxy]"
-.venv/bin/python -m pytest                  # 292 tests; the bpy and mcp ones skip when those aren't installed
+.venv/bin/python -m pytest                  # 331 tests; the bpy and mcp ones skip when those aren't installed
 python examples/demo_game_assets.py         # narrated walkthrough of the runtime, no Blender needed
 ```
 
@@ -249,19 +294,33 @@ Each experiment needs its application ready (Blender with the [Blender MCP add-o
 ## Repository layout
 
 ```
-rightofway/              runtime (Python package)
-├── runtime.py           protocol rules R1–R21 and R23; issues the permit for every agent action, then verifies and records
-├── identity.py          re-identification rules (the same code runs in the runtime and in the integrations)
-├── invariants.py        checks that the scene, the runtime's record and the agent's feedback agree
+rightofway/              Python package
+├── core/                the rules, exactly once (spec/core.md)
+│   ├── rules.py         judgment table, temporary blocks, gate, who did a change, how executions are settled
+│   ├── keyed.py         keyed containers (3D faces): permits, settlement, lifecycle, re-identification checks, ledger
+│   ├── positional.py    positional containers (lines, characters): marks follow positions, tombstones between them
+│   ├── identity.py      re-identification rules (the same code runs in the core and in the integrations)
+│   ├── interfaces.py    the two sides: Intent / Session for AI sides, capabilities for app sides
+│   ├── explain.py       structured facts the messages are built from; loops.py: repeated refusals
+│   ├── invariants.py    the three invariants over units
+│   └── store.py         the append-only ledger file with compaction, file lock
+├── runtime.py           the earlier per-operation model (submit/complete, steps, candidates, merge) on top of the core
+├── invariants.py        the invariants in terms of 3D records
+├── conformance.py       conformance scenarios, three grades, capability reports, random differential test
 ├── fakeapp.py           an in-memory app speaking the same protocol (code or typed commands), for tests without Blender or Unity
-├── proxy/               MCP proxy: python -m rightofway.proxy -- <command that starts the app's MCP server>
-├── code/                code integration: python -m rightofway.code install (Claude Code hooks)
-│   ├── ledger.py        who changed which lines, and the rules (the only place that decides)
-│   ├── hooks.py         Claude Code's hook events: check before edits, settle after edits and commands, tell the agent
+├── proxy/               AI side: MCP proxy, python -m rightofway.proxy -- <command that starts the app's MCP server>
+├── code/                code: python -m rightofway.code install (Claude Code hooks)
+│   ├── hooks.py         AI side: turns Claude Code's hook events into intents
+│   ├── session.py       the text-file side behind the Session interface
+│   ├── ledger.py        app side: scanning files, git, putting files back
+│   ├── lines.py         lines as units: splitting, old/new correspondence
+│   ├── messages.py      what the agent and you are told
 │   └── fakeagent.py     a scripted agent whose tools behave like Claude Code's (tests, experiment K)
-├── blender/             Blender integration: no changes to Blender or its MCP add-on
+├── blender/             Blender: no changes to Blender or its MCP add-on
 │   ├── blender_side.py  integration code sent into Blender with each call: carries out the permit, re-identifies, restores, reports the actual state; also sync and merge
-│   ├── shared_session.py  session layer (mode 1): runs each call through the pipeline; per-agent views, "what you missed" (R22), multiple agents (R23)
+│   ├── shared_session.py  session layer (mode 1): observation and the pipeline; per-agent views, "what you missed" (R22), multiple agents (R23)
+│   ├── hook_session.py  the keyed side behind the Session interface, for hook-style AI sides
+│   ├── messages.py      what the agent and you are told
 │   ├── commands.py      typed commands compiled into Blender scripts (for the proxy's small tools)
 │   ├── live_sync.py     mode 2: separate windows, live sync
 │   ├── filemerge.py     file fallback: per-object three-way merge
@@ -270,10 +329,11 @@ rightofway/              runtime (Python package)
 experiments/             experiments A, B, C (Unity), D (two agents), E (agent deletes an object you edited),
                          H (realistic agent habits), K (code with Claude Code), P (through the MCP proxy),
                          S (shadow execution trial), Q (performance, exp_perf.py) and run_all.py
-tests/                   292 tests, including the invariant checks and the incremental-vs-full differential tests
+tests/                   331 tests, including the invariant checks, the conformance scenarios and the differential tests
+spec/core.md             the rules in one place, in unified terms (Chinese): judgment table, settlement, lifecycle, the two sides, conformance tests
 spec/spec_v0.4.md        protocol spec (Chinese, draft); section 0 lists the design principles
-spec/design_v0.5.md      v0.5 architecture redesign (Chinese; steps 1–3 implemented; section 13: hardening from the survey; section 14: execution lifecycle, identity and intent; section 16: performance — sparse ledger, append-only log, incremental observation)
-spec/design_code.md      code integration design (Chinese): lines as the unit, Claude Code hooks
+spec/design_v0.5.md      3D side (Chinese): faces, observation, restoring; history of the v0.5 redesign (section 16: performance; section 17: the unified core)
+spec/design_code.md      code side (Chinese): lines as the unit, Claude Code hooks
 spec/related_work.md     how this relates to existing papers, protocols and tools
 spec/prior_art_solutions.md  how other systems handle the same four problems (Chinese, 2026-10-08)
 docs/overview.md         plain-language walkthrough of the protocol (Chinese)
