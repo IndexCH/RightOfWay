@@ -158,6 +158,14 @@ class _Prepared:
     blocked: Optional[list[dict]] = None                 # 整个调用执行前就被拒（不透明的工具调用没法只执行一部分）
 
 
+class _Begun(BaseException):
+    """begin_tool 用：接入代码已经 begin，工具交给 AI 侧去调用（不是错误，所以不继承 Exception）。"""
+
+    def __init__(self, permit_id: str, token: str) -> None:
+        super().__init__(permit_id)
+        self.permit_id, self.token = permit_id, token
+
+
 def _rows(recs: Records) -> dict[str, dict]:
     """全部应用对象的身份行（运行时核对认回、判断哪些对象在用）。"""
     return {cid: {k: r.get(k) for k in ("name", "type", "parent", "kind", "users")} for cid, r in recs.items()}
@@ -665,6 +673,45 @@ class SharedSession:
         rep = self._execute(prepare, label or "tool", True, agent, max_replan,
                             executor=lambda args: self._around(args, call, holder))
         return rep, holder.get("result")
+
+    def begin_tool(self, label: str = "", agent: Optional[str] = None, targets=(), destructive: bool = True,
+                   max_replan: int = 3) -> tuple[Optional[AgentReport], Optional[dict]]:
+        """拆开的工具调用：AI 侧在执行前、执行后各通知一次（例如 Claude Code 的 hooks，spec/core.md 第 4 节），
+        工具由 AI 侧自己去调用。执行前：开许可单、按对象预检查、接入代码 begin_agent（核对、快照），结果未知的记录先落盘。
+        返回 (不执行时的报告, None) 或 (None, 票据)；票据交给 end_tool。
+        接入代码不能把工具调用包在快照和恢复之间（能力表里没有 around）时拆不开，抛 ValueError（由 AI 侧如实拒绝）。"""
+        if not self.capabilities.get("around"):
+            raise ValueError("这个接入不能把工具调用包在快照和恢复之间（没有 begin_agent / finish_agent）")
+        prepare = lambda permit: _Prepared("", blocked=self._tool_precheck(permit, targets, destructive) or None)  # noqa: E731
+        try:
+            rep = self._execute(prepare, label or "tool", True, agent, max_replan, executor=self._begin_only)
+        except _Begun as b:
+            return None, {"permit": b.permit_id, "token": b.token, "label": label or "tool",
+                          "agent": agent or self.agent}
+        return rep, None
+
+    def end_tool(self, ticket: dict, error: Optional[str] = None) -> AgentReport:
+        """拆开的工具调用执行完了（或者失败了）：接入代码 finish_agent（认回、恢复、核对），按实际状态结算。"""
+        pid = ticket["permit"]
+        permit = self.rt.permits[pid]
+        try:
+            res = self.bridge.call("finish_agent", self._args(token=ticket["token"], error=error))
+        except Exception as e:                       # noqa: BLE001  收尾的结果没收到：和别的执行一样查清
+            return self._lost(permit, e)
+        self._tokens.pop(pid, None)
+        rep = self._complete(permit, _Prepared(""), res, ticket["label"], True, ticket["agent"],
+                             permit.keep_by_group())
+        self._doubts.pop(pid, None)
+        self._save()
+        return self._with_notes(rep)
+
+    def _begin_only(self, args: dict) -> dict:
+        b = self.bridge.call("begin_agent", args)
+        if b.get("status") != "begun":
+            return b                                  # replan / deferred
+        self._tokens[args["permit_id"]] = b["token"]
+        self._save()
+        raise _Begun(args["permit_id"], b["token"])
 
     def _tool_precheck(self, permit, targets, destructive: bool) -> list[dict]:
         caps = self.capabilities

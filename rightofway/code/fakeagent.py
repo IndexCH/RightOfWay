@@ -23,8 +23,9 @@ class ToolResult:
 
 class FakeClaudeCode:
     def __init__(self, repo: str, home: Optional[str] = None, session: str = "sess-0001", protect: bool = True,
-                 env: Optional[dict] = None) -> None:
-        self.repo, self.home, self.session, self.protect = repo, home, session, protect
+                 env: Optional[dict] = None, app=None) -> None:
+        """app：对面的应用侧（core.interfaces.Session，例如 blender.hook_session.KeyedSession）；默认是 repo 里的文本文件。"""
+        self.repo, self.home, self.session, self.protect, self.app = repo, home, session, protect, app
         self.env = {**os.environ, **(env or {})}
         self.n = 0
         self.applied = self.refused = 0
@@ -32,7 +33,8 @@ class FakeClaudeCode:
             self._hook("SessionStart")
 
     def _hook(self, event: str, **kw):
-        return handle({"hook_event_name": event, "session_id": self.session, "cwd": self.repo, **kw}, home=self.home)
+        return handle({"hook_event_name": event, "session_id": self.session, "cwd": self.repo, **kw}, home=self.home,
+                      session=self.app)
 
     def _tid(self) -> str:
         self.n += 1
@@ -112,6 +114,10 @@ class FakeClaudeCode:
     def write(self, name: str, content: str) -> ToolResult:
         return self._call("Write", {"file_path": self.path(name), "content": content},
                           lambda: self._put(name, content))
+
+    def tool(self, name: str, args: dict, effect) -> ToolResult:
+        """调用任意一个工具（例如 MCP 的工具）：effect() 真正去做，出错时返回错误文字。"""
+        return self._call(name, args, effect)
 
     def bash(self, command: str) -> ToolResult:
         def effect():
