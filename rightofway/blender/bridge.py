@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 SOURCE_PATH = Path(__file__).with_name("blender_side.py")
-IDENTITY_PATH = Path(__file__).parent.parent / "identity.py"     # 认回同一个对象的规则：运行时和接入代码用同一份
+IDENTITY_PATH = Path(__file__).parent.parent / "core" / "identity.py"   # 认回同一个对象的规则（核心）：核心和接入代码用同一份
 MARK_BEGIN = "<<<RIGHTOFWAY_JSON>>>"
 MARK_END = "<<<RIGHTOFWAY_END>>>"
 

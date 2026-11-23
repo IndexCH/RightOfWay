@@ -14,33 +14,15 @@ I3 说的都是真的：告诉 Agent "已生效"的单元，场景里就是 Agen
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Optional
 
-from .blender.records import OBJECT, Records, describe_unit, display, is_deleted, split_unit, units
+from .blender.records import OBJECT, Records, describe_unit, display, split_unit, units
+from .core import invariants as CI
+from .core.invariants import I1, I2, I3, RULES, Violation, dedupe as _dedupe
+
+__all__ = ["I1", "I2", "I3", "RULES", "Violation", "check_ledger", "check_run", "check_session", "objects",
+           "summarize"]
 from .runtime import Runtime
-
-I1, I2, I3 = "I1", "I2", "I3"
-RULES = {
-    I1: "账本和场景不一致",
-    I2: "要保持的部分被改了，却没有记为违规",
-    I3: "告诉 Agent 的和实际不一致",
-}
-
-
-@dataclass(frozen=True)
-class Violation:
-    rule: str            # I1 | I2 | I3
-    unit: str            # 单元编号：对象编号，或"对象编号#面"
-    where: str           # 给人看的位置，例如"Leaf_3 的Location"
-    detail: str
-
-    def __str__(self) -> str:
-        return f"[{self.rule} {RULES[self.rule]}] {self.where}：{self.detail}"
-
-
-def _fp(u: Optional[dict]) -> Optional[str]:
-    return None if u is None else u.get("fp")
 
 
 def _where(uid: str, name: str, labels: Optional[dict]) -> str:
@@ -51,43 +33,30 @@ def _where(uid: str, name: str, labels: Optional[dict]) -> str:
 # I1
 # ---------------------------------------------------------------------------
 def check_ledger(rt: Runtime, scene: Records, granularity: str, labels: Optional[dict] = None) -> list[Violation]:
-    """账本里每个单元的最新版本，和场景里实际的单元比较。
+    """账本里每个单元的最新版本，和场景里实际的单元比较（core.invariants.check_ledger）。
     稀疏账本（design_v0.5.md 第 16 节）：没建记录的单元按基线（上次整份落盘时的样子）比，一样要和场景一致，
     所以接入层看到了变化、却没记进运行时，照样查得出来（不放宽）。"""
-    out: list[Violation] = []
     su = units(scene, granularity)
-    tracked = set()
 
-    def check(uid: str, led, author: str) -> None:
-        got = su.get(uid)
-        name = (display(led) if isinstance(led, dict) else None) or display(got, uid)
-        where = _where(uid, name, labels)
-        if is_deleted(led):
-            if got is not None:
-                out.append(Violation(I1, uid, where, "账本记为已删除，场景里还在"))
-        elif got is None:
-            out.append(Violation(I1, uid, where, f"账本里还在（最后由 {author} 写入），场景里没有"))
-        elif _fp(got) != _fp(led):
-            out.append(Violation(I1, uid, where, f"内容不一致（账本最后由 {author} 写入）"))
-
-    for uid, obj in sorted(rt.objects.items()):
-        if obj.retracted or (not obj.versions and obj.baseline is None):
-            continue
-        tracked.add(uid)
-        check(uid, obj.content, obj.versions[-1].author_id if obj.versions else f"基线（{obj.baseline_author}）")
-    if rt.sparse:
-        for uid in rt._base_units():
-            if uid in tracked or dict.__contains__(rt.objects, uid):
-                continue
-            led = rt._baseline_content(uid)
-            if led is None:
+    def ledger():
+        tracked = set()
+        for uid, obj in sorted(rt.objects.items()):
+            if obj.retracted or (not obj.versions and obj.baseline is None):
                 continue
             tracked.add(uid)
-            check(uid, led, "基线")
-    for uid, u in sorted(su.items()):
-        if uid not in tracked:
-            out.append(Violation(I1, uid, _where(uid, display(u, uid), labels), "场景里有，账本里没有"))
-    return out
+            yield uid, obj.content, (obj.versions[-1].author_id if obj.versions else f"基线（{obj.baseline_author}）")
+        if rt.sparse:
+            for uid in rt._base_units():
+                if uid in tracked or dict.__contains__(rt.objects, uid):
+                    continue
+                led = rt._baseline_content(uid)
+                if led is not None:
+                    tracked.add(uid)
+                    yield uid, led, "基线"
+
+    def where(uid: str, content: Any) -> str:
+        return _where(uid, (display(content) if isinstance(content, dict) else None) or display(su.get(uid), uid), labels)
+    return CI.check_ledger(ledger(), su, where)
 
 
 # ---------------------------------------------------------------------------
@@ -129,35 +98,11 @@ def check_run(rt: Runtime, report: Any, granularity: str, scene: Optional[Record
     def where(uid: str) -> str:
         return _where(uid, name_of(uid), labels)
 
-    # I2：许可要求保持的单元
+    # I2：许可要求保持的单元；I3：说"已生效"的、说"没有生效、保留了原来的"（core.invariants）
     if getattr(report, "protected", True):
-        for uid in _plan_units(report.plan or {}, before, granularity):
-            if uid in breach:
-                continue
-            if _fp(uf.get(uid)) != _fp(ub.get(uid)):
-                what = "被删掉了，没有恢复" if uid not in uf else "被改了，没有恢复"
-                out.append(Violation(I2, uid, where(uid), what))
-
-    # I3：说"已生效"的
-    for uid in report.committed:
-        want, got = ur.get(uid), uf.get(uid)
-        if want is None and got is not None:
-            out.append(Violation(I3, uid, where(uid), "说 Agent 的删除已生效，但场景里还在"))
-        elif want is not None and _fp(got) != _fp(want):
-            out.append(Violation(I3, uid, where(uid), "说 Agent 的修改已生效，但场景里不是它改成的样子"
-                                 + ("（场景里没有）" if got is None else "")))
-    # I3：说"没有生效、保留了原来的"
-    for s in report.skipped:
-        uid = s["id"]
-        was, got = ub.get(uid), uf.get(uid)
-        if uid in breach:
-            continue
-        if _fp(got) != _fp(was):
-            out.append(Violation(I3, uid, where(uid), f"说没有生效、保留了原来的（{s.get('reason')}），但场景里"
-                                 + ("没有了" if got is None else "已经变了")))
-        led = rt.content_of(uid)                    # 不建记录（基线单元按基线）
-        if led is not None and not is_deleted(led) and _fp(led) != _fp(was):
-            out.append(Violation(I3, uid, where(uid), "说保留了原来的，但账本里不是原来的"))
+        out += CI.check_kept(_plan_units(report.plan or {}, before, granularity), ub, uf, breach, where)
+    out += CI.check_said(report.committed, [(x["id"], x.get("reason")) for x in report.skipped], ub, ur, uf, breach,
+                         where, rt.content_of)                    # 账本里的内容：不建记录（基线单元按基线）
 
     if ledger:
         out += check_ledger(rt, final, granularity, labels)
@@ -174,15 +119,6 @@ def check_session(session: Any, report: Any = None, poll: bool = True) -> list[V
         session.poll()
     out += check_ledger(session.rt, session.view, session.granularity, session.labels)
     return _dedupe(out)
-
-
-def _dedupe(vs: list[Violation]) -> list[Violation]:
-    seen, out = set(), []
-    for v in vs:
-        if v not in seen:
-            seen.add(v)
-            out.append(v)
-    return out
 
 
 def objects(vs: list[Violation]) -> set[str]:
